@@ -1,0 +1,37 @@
+name: Nightly Health Check
+on:
+  schedule:
+    - cron: '0 3 * * *'   # 3 AM UTC daily
+  workflow_dispatch:
+
+jobs:
+  health:
+    runs-on: [self-hosted, legal-corpus-ingester]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        run: python3 --version
+
+      - name: Install
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install -e '.[dev]' 2>&1 | tail -5
+
+      - name: Run ingester status
+        run: |
+          source .venv/bin/activate
+          ingester status || true
+
+      - name: Run health check
+        run: |
+          source .venv/bin/activate
+          python scripts/health_check.py
+
+      - name: Upload health report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: health-report-${{ github.run_id }}
+          path: out/health/
