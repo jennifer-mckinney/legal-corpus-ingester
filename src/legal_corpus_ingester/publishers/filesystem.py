@@ -5,7 +5,7 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
@@ -37,7 +37,7 @@ def _atomic_write_bytes(data: bytes, final_path: Path) -> None:
         raise
 
 
-def _atomic_save_npy(array: np.ndarray, final_path: Path) -> None:
+def _atomic_save_npy(array: np.ndarray[Any, np.dtype[np.float32]], final_path: Path) -> None:
     """Save *array* as .npy to *final_path* atomically."""
     tmp_fd, tmp_name = tempfile.mkstemp(dir=final_path.parent, suffix=".npy")
     os.close(tmp_fd)  # np.save opens by path
@@ -101,7 +101,7 @@ class FilesystemPublisher:
         _written_files.append(npy_path)
 
         # --- 3. Write index/legal_kb_metadata.json atomically ---
-        metadata: list[dict] = [
+        metadata: list[dict[str, Any]] = [
             {
                 "source_name": chunk.provenance.source_name,
                 "section": chunk.section,
