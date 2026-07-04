@@ -59,6 +59,8 @@ unavailable). When the env-var override is used:
 - Follow up with a signed APPROVAL.yaml after the fact.
 - Remove the override flag from `.env` once the signed APPROVAL lands.
 
+**Audit logging requirement:** Any code that reads `INGESTER_LEGAL_REVIEW_APPROVED_*` MUST emit a structured log entry at `WARNING` level containing `source_id`, `override_env_var_name`, `timestamp`, and `run_id` before proceeding. This is enforced at P9 review time for Phase 0.1 Task 26.
+
 ## What NOT to put in `.env`
 
 - No personal filesystem paths. Use repo-relative paths (`./out`,

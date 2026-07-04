@@ -11,7 +11,7 @@
 #   1 - diff detected (drift)
 #   3 - sibling path does not exist
 
-set -u
+set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"

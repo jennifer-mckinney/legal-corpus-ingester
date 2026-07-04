@@ -29,7 +29,7 @@ The ingester is a local-data-only, open-source-only pipeline. Constraints are fi
 
 ## Locked ADRs
 
-All 14 ADRs are locked decisions. The full design rationale lives in `~/.claude/plans/delightful-humming-tome.md`.
+All 14 ADRs are locked decisions. Full ADR design rationale captured in the project planning session; contact maintainer for the source document. A summary will land in `docs/adr/` files at Phase 0.1.
 ADR markdown files land in `docs/adr/` during Phase 0.1.
 
 | ADR | Decision | Short title |

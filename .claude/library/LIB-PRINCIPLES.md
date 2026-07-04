@@ -1,7 +1,8 @@
 # LIB-PRINCIPLES — governance & working principles
 loads: auto
 scope: project
-xref: [[.claude/CLAUDE.md]] [[docs/BRD_Terms_Policies_Reviewer.md]] [[docs/PRD_Terms_Policies_Reviewer.md]] [[PRODUCT.md]] [[LIB-VOICE]] [[LIB-CONTEXT]] [[PEAS]] [[_AUTOMATION/CLAUDE.md#governance-rules]]
+xref: [[.claude/CLAUDE.md]] [[PEAS]] [[_AUTOMATION/CLAUDE.md#governance-rules]]
+note: P2, P3, P4, P6 references to BRD/PRD/PRODUCT docs are terms-analysis-specific; not applicable to legal-corpus-ingester
 
 ## principles
 

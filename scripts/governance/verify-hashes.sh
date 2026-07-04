@@ -11,13 +11,13 @@
 #
 # Output is intentionally compact so a Critic pass can read it without noise.
 
-set -u
+set -euo pipefail
 
 # Detect sha256 tool: prefer sha256sum (Linux/coreutils), fall back to shasum -a 256 (macOS default).
 if command -v sha256sum >/dev/null 2>&1; then
-    SHA_CMD="sha256sum"
+    SHA_CMD=(sha256sum)
 elif command -v shasum >/dev/null 2>&1; then
-    SHA_CMD="shasum -a 256"
+    SHA_CMD=(shasum -a 256)
 else
     echo "ERROR: neither sha256sum nor shasum available on PATH" >&2
     exit 2
@@ -30,6 +30,11 @@ MANIFEST="${REPO_ROOT}/.claude/_governance-manifest.json"
 
 if [ ! -f "${MANIFEST}" ]; then
     echo "MANIFEST MISSING: ${MANIFEST}"
+    exit 2
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "ERROR: python3 required to parse manifest" >&2
     exit 2
 fi
 
@@ -70,7 +75,7 @@ resolve_path() {
 # Compute SHA256 of a file using whichever tool we detected.
 compute_hash() {
     local f="$1"
-    ${SHA_CMD} "${f}" | awk '{print $1}'
+    "${SHA_CMD[@]}" "${f}" | awk '{print $1}'
 }
 
 # Compare current file size against recorded size as a drift hint.
@@ -79,6 +84,10 @@ compute_hash() {
 line_delta_note() {
     local current_file="$1"
     local expected_size="$2"
+    if [ -z "${expected_size}" ]; then
+        echo "expected size unknown"
+        return
+    fi
     local current_size
     current_size="$(wc -c < "${current_file}" | tr -d ' ')"
     if [ "${current_size}" = "${expected_size}" ]; then

@@ -13,12 +13,12 @@
 #   1 - user declined or a tracked file is missing
 #   2 - required tool unavailable
 
-set -u
+set -euo pipefail
 
 if command -v sha256sum >/dev/null 2>&1; then
-    SHA_CMD="sha256sum"
+    SHA_CMD=(sha256sum)
 elif command -v shasum >/dev/null 2>&1; then
-    SHA_CMD="shasum -a 256"
+    SHA_CMD=(shasum -a 256)
 else
     echo "ERROR: neither sha256sum nor shasum available on PATH" >&2
     exit 2
@@ -76,7 +76,7 @@ TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 PY_ARGS=("${MANIFEST}" "${TS}")
 for row in "${ENTRIES[@]}"; do
     IFS='|' read -r mpath fpath note <<< "${row}"
-    hash="$(${SHA_CMD} "${fpath}" | awk '{print $1}')"
+    hash="$("${SHA_CMD[@]}" "${fpath}" | awk '{print $1}')"
     size="$(wc -c < "${fpath}" | tr -d ' ')"
     PY_ARGS+=("${mpath}" "${hash}" "${size}" "${note}")
 done

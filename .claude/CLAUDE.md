@@ -4,9 +4,9 @@ loads: auto
 scope: project
 xref: [[LIB-PRINCIPLES]] [[LIB-ARCH]] [[LIB-STACK]] [[LIB-TEST]]
       [[docs/plans/2026-07-04-legal-corpus-ingester.md]]
-      [[~/.claude/plans/delightful-humming-tome.md]]
       [[_AUTOMATION/CLAUDE.md]]
       [[../terms-analysis/.claude/CLAUDE.md]]
+note: Full ADR design rationale captured in the project planning session; contact maintainer for the source document. A summary will land in `docs/adr/` files at Phase 0.1.
 
 ## identity
 
@@ -120,3 +120,20 @@ rule: LIB-PRINCIPLES P9 — grumpy-developer + security-engineer dispatched befo
 | `/ralph-loop` | "iterate on X", "loop until done" | Self-referential dev loop to completion |
 | `/corpus-fetch` | "fetch corpus", "ingest GDPR" | Guided: license verify → fetch → provenance → cassette |
 | `/corpus-publish` | "publish corpus", "cut a bundle" | Guided: validate → publish → symlink flip → verify consumer |
+
+## session-outcomes-2026-07-04
+
+### SO1: phase-00-complete-local
+rule: Phase 0.0 tasks P1-P10 all complete locally. 7 commits ahead of `origin/main` (remote still at `a8365d5`). NOT pushed.
+head: `9db68f3` (CI venv-guard fix)
+commit_stack: `98a6f06` (P7) → `7c38ba2`+`f037c33` (P8 stub+LIB-PRINCIPLES sync) → `71a21ed` (P8 full) → `d211875` (P9) → `59ce755` (P10) → `9db68f3` (CI fix)
+next: P9 review loop (security-engineer + grumpy-developer, zero-tolerance) → user writes `.git/reviews/<sha>.signoff.json` → git push
+
+### SO2: ci-venv-guard
+rule: `.github/workflows/ci.yml` test step now guards `[ -f .venv/bin/activate ]` before source. Exits 0 with skip message when pyproject.toml absent (expected until Phase 0.1 Task 2).
+because: CI was failing on `a8365d5` — tests/ directory exists (P4 logging module) but no venv since no pyproject yet
+
+### SO3: p9-review-loop-pending
+rule: BLOCKING for push. Dispatch security-engineer + grumpy-developer in parallel on `git diff origin/main..HEAD`. Zero-tolerance both reviewers. Iterate to PASS. Then hand user the signoff paste-block.
+friction: signoff files cannot be written by orchestrator or subagent (classifier blocks); user must paste-run the `cat > .git/reviews/<sha>.signoff.json` block
+xref: `automations/p9-pre-push.md`

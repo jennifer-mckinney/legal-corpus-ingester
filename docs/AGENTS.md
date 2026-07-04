@@ -9,7 +9,7 @@ Per `.claude/library/LIB-PRINCIPLES.md` P8 (agent separation of duties), every i
 | `general-purpose` | **Coder** — implements per task spec + writes own unit tests | One task at a time | None |
 | `general-purpose` (isolated) | **Test Helper** — writes spec-conformance tests from spec ONLY; no visibility into Coder's diff | Once per stage complete | None |
 | `general-purpose` (isolated) | **Critic** — runs Coder unit tests + Test Helper spec tests; reports pass/fail | After Coder + Test Helper return | None |
-| `grumpy-developer` | **Grumpy Reviewer** — adversarial code-quality review | Before every phase push | Push gate: HIGH/CRITICAL blocks |
+| `grumpy-developer` | **Grumpy Reviewer** — adversarial code-quality review | Before every phase push | Push gate: ANY finding blocks (zero-tolerance per P9) |
 | `security-engineer` | **Security Reviewer** — STRIDE review, zero-tolerance gate | Before every phase push | Push gate: ANY finding blocks |
 | `researcher` | **Researcher** — upstream source verification, license research | When adding a new source | None |
 | `Explore` (read-only) | **Explorer** — codebase exploration when scope is uncertain | Ad hoc | None |

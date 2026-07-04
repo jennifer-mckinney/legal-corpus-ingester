@@ -1,34 +1,34 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-07-04T04:23:56Z",
+  "generated_at": "2026-07-04T04:52:14Z",
   "note": "Baseline captured after governance change. Paths beginning with $HOME/ are resolved at verify time via shell expansion; project-relative paths are resolved from the repo root.",
   "entries": [
     {
       "path": ".claude/CLAUDE.md",
-      "sha256": "cd629aaa7d4ef436d983d1feaae81c0a465869184c271e871ab25fbe80a64b71",
-      "size_bytes": 5828,
-      "recorded_at": "2026-07-04T04:23:56Z",
+      "sha256": "0cd6ecffbf6bb67baa4df07b6c9e33dfa9a13fcc70c914c2b4f7066b2ca48a8d",
+      "size_bytes": 7245,
+      "recorded_at": "2026-07-04T04:52:14Z",
       "note": "Project governance charter."
     },
     {
       "path": ".claude/library/LIB-PRINCIPLES.md",
-      "sha256": "f9569fd20ac3e8342493e0f1f64e790e6e27bbc0ee18127a6ead2570d2cb3777",
+      "sha256": "3f183940c8c60a4fb4b458e6be19359923cfc244133ba0d76e996c434d52f3b4",
       "size_bytes": 14370,
-      "recorded_at": "2026-07-04T04:23:56Z",
+      "recorded_at": "2026-07-04T04:52:14Z",
       "note": "LIB-PRINCIPLES P8 v2 baseline; single source of truth for role principles."
     },
     {
       "path": "$HOME/.claude/CLAUDE.md",
       "sha256": "cde5efa39c3a2f91f6d536f9acac2d5e45584022c739803b586b0b8e704c1d11",
       "size_bytes": 14336,
-      "recorded_at": "2026-07-04T04:23:56Z",
+      "recorded_at": "2026-07-04T04:52:14Z",
       "note": "Global user CLAUDE.md; changes here affect every project session."
     },
     {
       "path": "$HOME/.claude/library/PEAS.md",
       "sha256": "3f9e58fe597e85e3602fe83ae63747261353d9f7051990befad0a3adeec9a45d",
       "size_bytes": 1175,
-      "recorded_at": "2026-07-04T04:23:56Z",
+      "recorded_at": "2026-07-04T04:52:14Z",
       "note": "PEAS agent design framework reference."
     }
   ]
