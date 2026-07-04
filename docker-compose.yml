@@ -1,0 +1,21 @@
+services:
+  ingester:
+    build: .
+    volumes:
+      - ./out:/app/out
+      - ./state:/app/state
+      - ./config:/app/config
+    environment:
+      INGESTER_LOCALAI_URL: http://localai:8080/v1
+      LOG_LEVEL: INFO
+      LOG_FORMAT: json
+    depends_on:
+      - localai
+  localai:
+    image: localai/localai:latest-aio-cpu
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/models
+    environment:
+      MODELS_PATH: /models
