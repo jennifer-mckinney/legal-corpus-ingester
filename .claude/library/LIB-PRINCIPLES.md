@@ -1,11 +1,4 @@
 # LIB-PRINCIPLES — governance & working principles
-
-> **Mirrored from terms-analysis/.claude/library/LIB-PRINCIPLES.md**
-> at 2026-07-04. Keep in sync via manual review; the full sync script
-> lands at Phase 0.0 Task P9 (`scripts/governance/sync-lib-principles.sh`).
-> Any divergence between this file and the terms-analysis version MUST
-> be justified by an ADR under `docs/adr/`.
-
 loads: auto
 scope: project
 xref: [[.claude/CLAUDE.md]] [[docs/BRD_Terms_Policies_Reviewer.md]] [[docs/PRD_Terms_Policies_Reviewer.md]] [[PRODUCT.md]] [[LIB-VOICE]] [[LIB-CONTEXT]] [[PEAS]] [[_AUTOMATION/CLAUDE.md#governance-rules]]
