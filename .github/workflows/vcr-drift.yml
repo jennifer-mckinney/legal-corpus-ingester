@@ -1,0 +1,61 @@
+name: VCR Drift Canary
+on:
+  schedule:
+    - cron: '0 4 * * 0'   # Sunday 4 AM UTC
+  workflow_dispatch:        # allow manual trigger for testing
+
+concurrency:
+  group: vcr-drift
+  cancel-in-progress: false  # never cancel a drift check mid-run
+
+jobs:
+  drift:
+    runs-on: [self-hosted, legal-corpus-ingester]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        run: python3 --version
+
+      - name: Install
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install -e '.[dev]' 2>&1 | tail -5
+
+      - name: Stash committed cassettes
+        run: |
+          mkdir -p /tmp/vcr-baseline
+          cp -r tests/fixtures/cassettes/ /tmp/vcr-baseline/
+
+      - name: Re-record cassettes (live fetch)
+        run: |
+          source .venv/bin/activate
+          pytest tests/integration/ --vcr-record=all -v 2>&1 | tail -40
+
+      - name: Generate drift report
+        run: |
+          source .venv/bin/activate
+          python scripts/vcr_drift_report.py \
+            --baseline /tmp/vcr-baseline/cassettes \
+            --current tests/fixtures/cassettes \
+            --output drift-report.md
+
+      - name: Upload drift report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: vcr-drift-report-${{ github.run_id }}
+          path: drift-report.md
+
+      - name: Open issue on drift
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -f drift-report.md ]; then
+            gh issue create \
+              --title "VCR drift detected $(date -u +%Y-%m-%d)" \
+              --body-file drift-report.md \
+              --label "corpus-drift,needs-review"
+          fi
