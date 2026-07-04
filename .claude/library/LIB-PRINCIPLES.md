@@ -120,10 +120,21 @@ review_agents:
   security-engineer: STRIDE-style threat-model review — auth, secrets, user input, RLS, CSP, dependencies, session/cookie state, migration safety, endpoint deprecation contract
   grumpy-developer: blunt code-quality review — swallowed errors, dead code, brittle assumptions, missed edges, tautological tests, dispatch-boundary artifacts from multi-Doer sessions
 custom: reviewer prompts MUST be customized to the actual diff and session context, not defaults
-gate: security-engineer findings of ANY severity (CRITICAL / HIGH / MEDIUM / LOW / NIT) block push and MUST be fixed — zero tolerance, no follow-up-issue path; grumpy-developer findings of CRITICAL or HIGH block push, MEDIUM / LOW / NIT can be filed as follow-up issues; either gate resolves via (a) fix-Coder + re-verify, or (b) explicit user override in-session per P8 override_authority
+gate: security-engineer AND grumpy-developer findings of ANY severity (CRITICAL / HIGH / MEDIUM / LOW / NIT) block push and MUST be fixed — zero tolerance for BOTH per 2026-07-04 user directive, no follow-up-issue path; either gate resolves via (a) fix-Coder + re-verify (the loop-pattern below), or (b) explicit user override in-session per P8 override_authority via `override.used=true` in the signoff JSON
 security_findings_zero_tolerance: user directive 2026-07-03 — every security-engineer finding is a fix-now item regardless of severity; codified after F1-F7 review where two MEDIUMs would have shipped as follow-ups under prior gate
 because: local pytest + orchestrator spot-check is not sufficient for pushed code; two independent adversarial reviewers catch what dispatch Coders and orchestrator miss; especially load-bearing after multi-agent sessions where domain boundaries were crossed
 enforcement: prompt-based today; automation follow-up: pre-push git hook that refuses push until a signed reviewer-log exists for the current HEAD
+loop_pattern: (amendment 2026-07-04) every push runs this fixed-point loop until convergence
+  1. Coder(s) implement the change → commit LOCALLY (no push)
+  2. Orchestrator dispatches security-engineer + grumpy-developer IN PARALLEL on the delta
+  3. If EITHER reviewer returns findings of ANY severity → dispatch fix-Coder scoped to those findings → commit locally → GOTO 2
+  4. If BOTH reviewers return zero findings → orchestrator writes `.git/reviews/<HEAD-SHA>.signoff.json` → push
+automation: `.githooks/pre-push` (both repos) enforces the signoff schema; missing or non-PASS signoff hard-refuses push. See `automations/p9-pre-push.md`
+whack_a_mole_avoidance: when a name-based deny-list / exact-match rule keeps growing across rounds (each round finds another edge case), switch to a STRUCTURAL fix — pattern-based rules, schema-driven ordering, input normalization. Structural fixes close classes of attack instead of individual names. Two structural-fix wins on 2026-07-04:
+  - terms-analysis grumpy F2: switched `_ACTION_ITEMS_BY_CHIP.items()` iteration → `typing.get_args(ContextChip)` schema-driven order
+  - ingester rounds 6-9 logging redaction: added `_REDACT_SUFFIXES` + `_normalize_key(camelCase→snake_case)` instead of growing exact-name list further
+loop_failure_mode: if the loop does NOT converge after 3-4 rounds on the same axis, PAUSE and ask user whether to keep patching or switch to a structural fix. Silent iteration is a Coder-role violation.
+retro_anchor: codified 2026-07-03 (security zero-tolerance) then extended 2026-07-04 (grumpy zero-tolerance + loop_pattern + whack_a_mole guidance)
 xref: [[P8]] [[LIB-TEST]]
 
 ## enforcement-summary
