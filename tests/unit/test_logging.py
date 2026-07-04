@@ -143,10 +143,46 @@ def test_configure_logging_redacts_round2_secret_names(key_name):
     )
 
 
+@pytest.mark.parametrize(
+    "key_name",
+    [
+        "signing_key",
+        "SIGNING_KEY",
+        "signing-key",
+        "Signing-Key",
+        "hmac_secret",
+        "HMAC_SECRET",
+        "client_secret",
+        "CLIENT_SECRET",
+        "oauth_token",
+        "OAUTH_TOKEN",
+        "id_token",
+        "ID_TOKEN",
+    ],
+)
+def test_configure_logging_redacts_round4_secret_names(key_name):
+    # SecF1'' (round-4): signing_key / signing-key were left uncovered when the
+    # bare "key" substring was dropped in round-3. `hmac_secret`,
+    # `client_secret`, `oauth_token`, `id_token` are explicit entries as
+    # defense-in-depth against future refactors of `_REDACT_SUBSTRINGS`. All
+    # must redact regardless of case.
+    stream = io.StringIO()
+    configure_logging(level="INFO", stream=stream, output_format="json")
+    log = logging.getLogger("test.redact.round4")
+    log.info("secret-shape", extra={key_name: "should-not-leak"})
+    line = stream.getvalue().strip().splitlines()[-1]
+    record = json.loads(line)
+    assert record[key_name] == "[REDACTED]", (
+        f"expected {key_name!r} to be redacted, got {record.get(key_name)!r}"
+    )
+
+
 def test_configure_logging_passes_through_key_lookalikes():
     # G2' (round-2): bare "key" was dropped from _REDACT_SUBSTRINGS because it
     # over-matched debuggability-critical extras. These MUST pass through with
     # their original values.
+    # Round-4: `foreign_key` and `db_key` added — the exact false-positive
+    # class the round-3 substring drop was meant to fix.
     stream = io.StringIO()
     configure_logging(level="INFO", stream=stream, output_format="json")
     log = logging.getLogger("test.redact.negatives")
@@ -156,6 +192,8 @@ def test_configure_logging_passes_through_key_lookalikes():
             "keyword": "gdpr",
             "cache_key_prefix": "eurlex:v2",
             "stakeholders": "legal-team",
+            "foreign_key": "docs.source_id",
+            "db_key": "primary",
         },
     )
     line = stream.getvalue().strip().splitlines()[-1]
@@ -163,6 +201,8 @@ def test_configure_logging_passes_through_key_lookalikes():
     assert record["keyword"] == "gdpr"
     assert record["cache_key_prefix"] == "eurlex:v2"
     assert record["stakeholders"] == "legal-team"
+    assert record["foreign_key"] == "docs.source_id"
+    assert record["db_key"] == "primary"
 
 
 def test_configure_logging_is_idempotent():

@@ -19,6 +19,14 @@ _REDACT_KEYS = frozenset({
     # heuristic misses. Case-insensitive comparison happens against .lower().
     "jwt", "pat", "personal_access_token", "access_token", "refresh_token",
     "private_token", "x-api-key", "x_api_key",
+    # SecF1'' (round-4): dropping the bare "key" substring in round-3 left
+    # `signing_key` / `signing-key` uncovered. Add explicit entries for real-
+    # world signing/OAuth/OIDC secret names. `client_secret`/`hmac_secret`/
+    # `oauth_token`/`id_token` are already caught by the `secret`/`token`
+    # substring safety net; listing them explicitly is defense-in-depth against
+    # future refactors of `_REDACT_SUBSTRINGS`.
+    "signing_key", "signing-key", "hmac_secret", "client_secret",
+    "oauth_token", "id_token",
 })
 # G2' (round-2): bare "key" removed. It over-matched debuggability-critical
 # extras like `keyword`, `foreign_key`, `cache_key_prefix`, `stakeholders`.

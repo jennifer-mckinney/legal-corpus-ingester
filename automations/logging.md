@@ -80,17 +80,25 @@ literal string `"[REDACTED]"`.
 
 `password`, `passwd`, `secret`, `token`, `authorization`, `api_key`, `apikey`,
 `access_key`, `private_key`, `cookie`, `set-cookie`, `session`, `bearer`,
-`email`, `auth`, `credentials`
+`email`, `auth`, `credentials`, `jwt`, `pat`, `personal_access_token`,
+`access_token`, `refresh_token`, `private_token`, `x-api-key`, `x_api_key`,
+`signing_key`, `signing-key`, `hmac_secret`, `client_secret`, `oauth_token`,
+`id_token`
 
 **Redacted (case-insensitive) substrings anywhere in the key:**
 
-`password`, `secret`, `token`, `key`. That means `user_api_key`, `auth_token`,
-`refresh_secret`, and `signing_key` are all redacted.
+`password`, `secret`, `token`. That means `user_password`, `auth_token`, and
+`refresh_secret` are all redacted. The bare `key` substring was intentionally
+removed because it over-matched debuggability-critical extras like `keyword`,
+`foreign_key`, `cache_key_prefix`, and `db_key`; explicit `*_key` secret names
+(`api_key`, `private_key`, `access_key`, `signing_key`, `signing-key`,
+`x-api-key`, `x_api_key`) stay covered via the exact-match set above.
 
 Fields listed in the "Consistent LogRecord fields" table above are safe: none
-of them match the deny-list. If a new operational field could collide with the
-substring rule (for example a key literally named `key`), rename it or embed
-the value inside a non-matching key like `identifier`.
+of them match the deny-list. If a new operational field is a real credential
+but does not match an existing exact-match entry or substring, add it to
+`_REDACT_KEYS` in `src/legal_corpus_ingester/utils/logging.py` and cover it
+with a redaction test.
 
 ## Rotation
 
