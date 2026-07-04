@@ -1,0 +1,30 @@
+# Jurisdiction: GDPR
+# Law: General Data Protection Regulation (GDPR) — PLACEHOLDER CORPUS
+# Source: PENDING — real fetch blocked this session, see issue #6 (WebFetch returned 403 on eur-lex.europa.eu, gdpr-info.eu, privacy-regulation.eu)
+# Effective Date: PENDING
+# Status: PLACEHOLDER
+# Disclaimer: THIS FILE IS SYNTHETIC PLACEHOLDER TEXT, NOT REAL STATUTE TEXT. It exists only to exercise the legal-KB chunking/embedding/retrieval pipeline end-to-end. Do NOT use for compliance decisions. Replace with real GDPR article text (fetched per .claude/skills/legal-kb/SKILL.md) before this corpus is relied upon by analyze_text().
+
+## Article 5 — Principles relating to processing of personal data
+[PLACEHOLDER] Personal data must be processed lawfully, fairly, and transparently; collected for specified, explicit, and legitimate purposes; adequate, relevant, and limited to what is necessary; accurate and kept up to date; kept in a form permitting identification for no longer than necessary; and processed with appropriate security.
+
+## Article 6 — Lawfulness of processing
+[PLACEHOLDER] Processing is lawful only if at least one legal basis applies, such as consent, contract necessity, legal obligation, vital interests, public interest, or legitimate interests of the controller.
+
+## Article 7 — Conditions for consent
+[PLACEHOLDER] Where processing is based on consent, the controller must be able to demonstrate the data subject consented. Consent requests must be clearly distinguishable, in plain language, and consent must be as easy to withdraw as to give.
+
+## Article 15 — Right of access
+[PLACEHOLDER] The data subject has the right to obtain confirmation of whether their personal data is being processed, and access to that data along with specified information about the processing.
+
+## Article 17 — Right to erasure
+[PLACEHOLDER] The data subject has the right to obtain erasure of personal data without undue delay under specified grounds, such as the data no longer being necessary for its original purpose or withdrawal of consent.
+
+## Article 22 — Automated individual decision-making, including profiling
+[PLACEHOLDER] The data subject has the right not to be subject to a decision based solely on automated processing, including profiling, which produces legal effects or similarly significantly affects them, subject to specified exceptions.
+
+## Article 32 — Security of processing
+[PLACEHOLDER] The controller and processor must implement appropriate technical and organisational measures to ensure a level of security appropriate to the risk.
+
+## Article 33 — Notification of a personal data breach to the supervisory authority
+[PLACEHOLDER] In the case of a personal data breach, the controller must notify the competent supervisory authority without undue delay, and where feasible within 72 hours of becoming aware of it.
