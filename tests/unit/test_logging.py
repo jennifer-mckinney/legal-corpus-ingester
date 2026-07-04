@@ -112,6 +112,59 @@ def test_configure_logging_reads_env_defaults(monkeypatch):
     assert not out.strip().startswith("{")
 
 
+@pytest.mark.parametrize(
+    "key_name",
+    [
+        "JWT",
+        "jwt",
+        "pat",
+        "PAT",
+        "x-api-key",
+        "X-API-KEY",
+        "refresh_token",
+        "REFRESH_TOKEN",
+        "private_token",
+        "personal_access_token",
+        "access_token",
+        "x_api_key",
+    ],
+)
+def test_configure_logging_redacts_round2_secret_names(key_name):
+    # SecF1' (round-2): shorthand secret key names must be redacted regardless
+    # of case. Redaction path normalizes via .lower() before matching.
+    stream = io.StringIO()
+    configure_logging(level="INFO", stream=stream, output_format="json")
+    log = logging.getLogger("test.redact.round2")
+    log.info("secret-shape", extra={key_name: "should-not-leak"})
+    line = stream.getvalue().strip().splitlines()[-1]
+    record = json.loads(line)
+    assert record[key_name] == "[REDACTED]", (
+        f"expected {key_name!r} to be redacted, got {record.get(key_name)!r}"
+    )
+
+
+def test_configure_logging_passes_through_key_lookalikes():
+    # G2' (round-2): bare "key" was dropped from _REDACT_SUBSTRINGS because it
+    # over-matched debuggability-critical extras. These MUST pass through with
+    # their original values.
+    stream = io.StringIO()
+    configure_logging(level="INFO", stream=stream, output_format="json")
+    log = logging.getLogger("test.redact.negatives")
+    log.info(
+        "innocent-extras",
+        extra={
+            "keyword": "gdpr",
+            "cache_key_prefix": "eurlex:v2",
+            "stakeholders": "legal-team",
+        },
+    )
+    line = stream.getvalue().strip().splitlines()[-1]
+    record = json.loads(line)
+    assert record["keyword"] == "gdpr"
+    assert record["cache_key_prefix"] == "eurlex:v2"
+    assert record["stakeholders"] == "legal-team"
+
+
 def test_configure_logging_is_idempotent():
     # G1 + SecF2: repeated calls are no-ops; second call must not reset handlers.
     stream_a = io.StringIO()

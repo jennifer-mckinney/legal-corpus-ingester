@@ -15,8 +15,16 @@ _REDACT_KEYS = frozenset({
     "password", "passwd", "secret", "token", "authorization", "api_key",
     "apikey", "access_key", "private_key", "cookie", "set-cookie",
     "session", "bearer", "email", "auth", "credentials",
+    # SecF1' (round-2): explicit shorthand secret names that the substring
+    # heuristic misses. Case-insensitive comparison happens against .lower().
+    "jwt", "pat", "personal_access_token", "access_token", "refresh_token",
+    "private_token", "x-api-key", "x_api_key",
 })
-_REDACT_SUBSTRINGS = ("password", "secret", "token", "key")
+# G2' (round-2): bare "key" removed. It over-matched debuggability-critical
+# extras like `keyword`, `foreign_key`, `cache_key_prefix`, `stakeholders`.
+# Explicit variants (api_key, private_key, access_key, x-api-key, x_api_key)
+# remain covered by _REDACT_KEYS above.
+_REDACT_SUBSTRINGS = ("password", "secret", "token")
 
 # Stdlib LogRecord attributes that must never appear as top-level payload fields.
 # G8: `taskName` added for Python 3.12+ (asyncio task name attribute).
