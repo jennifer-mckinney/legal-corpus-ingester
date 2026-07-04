@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# P9 pre-push gate - LIB-PRINCIPLES P9 enforcement
+# Refuses push unless a signed reviewer-log exists for HEAD.
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+HEAD_SHA="$(git rev-parse HEAD)"
+SIGNOFF_DIR="${REPO_ROOT}/.git/reviews"
+SIGNOFF="${SIGNOFF_DIR}/${HEAD_SHA}.signoff.json"
+
+if [ ! -f "${SIGNOFF}" ]; then
+    cat >&2 <<EOF
+P9 pre-push gate: signoff not found for HEAD ${HEAD_SHA:0:12}
+
+Expected signoff: ${SIGNOFF#${REPO_ROOT}/}
+
+To satisfy P9: ask Claude to dispatch security-engineer + grumpy-developer
+review, then write the signoff. Example prompt:
+    "run p9 review on HEAD and write signoff"
+
+Emergency override (records who + why): write a signoff with
+override.used = true. See automations/p9-pre-push.md for schema.
+EOF
+    exit 1
+fi
+
+# Validate signoff shape
+if ! python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+assert d['head_sha'] == sys.argv[2], f'head_sha mismatch: {d[\"head_sha\"]} != {sys.argv[2]}'
+override = d.get('override', {}).get('used', False)
+sec_pass = d.get('security_engineer', {}).get('verdict') == 'PASS'
+gru_pass = d.get('grumpy_developer', {}).get('verdict') == 'PASS'
+if not override:
+    assert sec_pass, 'security_engineer.verdict != PASS'
+    assert gru_pass, 'grumpy_developer.verdict != PASS'
+" "${SIGNOFF}" "${HEAD_SHA}" 2>/dev/null; then
+    python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception as e:
+    print(f'P9 pre-push gate: signoff not valid JSON for HEAD {sys.argv[2][:12]}: {e}', file=sys.stderr)
+    sys.exit(0)
+print(f'P9 pre-push gate: signoff invalid for HEAD {sys.argv[2][:12]}', file=sys.stderr)
+if d.get('head_sha') != sys.argv[2]:
+    print(f'  head_sha mismatch: {d.get(\"head_sha\")}', file=sys.stderr)
+override = d.get('override', {}).get('used', False)
+if not override:
+    if d.get('security_engineer', {}).get('verdict') != 'PASS':
+        print(f'  security_engineer verdict: {d.get(\"security_engineer\", {}).get(\"verdict\")}', file=sys.stderr)
+    if d.get('grumpy_developer', {}).get('verdict') != 'PASS':
+        print(f'  grumpy_developer verdict: {d.get(\"grumpy_developer\", {}).get(\"verdict\")}', file=sys.stderr)
+" "${SIGNOFF}" "${HEAD_SHA}"
+    exit 1
+fi
+
+# Announce override if active
+python3 -c "
+import json, sys
+d = json.load(open(sys.argv[1]))
+o = d.get('override', {})
+if o.get('used'):
+    reason = o.get('reason', '(no reason)')
+    who = o.get('authorized_by', '(unknown)')
+    print(f'P9 OVERRIDE ACTIVE: {reason} (authorized by {who})', file=sys.stderr)
+" "${SIGNOFF}"
+
+echo "P9 pre-push gate: signoff OK for ${HEAD_SHA:0:12}"
+exit 0
