@@ -46,7 +46,8 @@ if [ -f "${LICENSE_HASHES}" ]; then
   python3 - "${LICENSE_HASHES}" <<'PYEOF'
 import json, sys
 path = sys.argv[1]
-data = json.load(open(path))
+with open(path) as fh:
+    data = json.load(fh)
 drifted = [k for k, v in data.items() if isinstance(v, dict) and v.get("status") in ("DRIFT", "SPDX_DRIFT")]
 if drifted:
     for k in drifted:

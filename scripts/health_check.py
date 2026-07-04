@@ -40,7 +40,10 @@ def _checkpoint_info(state_dir: Path, source: str) -> tuple[str, str, float | No
     if not checkpoint.exists():
         return "never", "-", None
 
-    mtime = os.path.getmtime(checkpoint)
+    try:
+        mtime = os.path.getmtime(checkpoint)
+    except OSError:
+        return "never", "-", None
     last_run_dt = datetime.fromtimestamp(mtime, tz=UTC)
     last_run_utc = last_run_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 

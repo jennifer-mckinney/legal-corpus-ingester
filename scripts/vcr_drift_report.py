@@ -30,6 +30,8 @@ def load_cassette(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     try:
         with path.open("r", encoding="utf-8") as fh:
             data = yaml.safe_load(fh)
+        if data is None:
+            return None, "Empty or whitespace-only YAML file"
         return data, None
     except yaml.YAMLError as exc:
         return None, f"YAML parse error: {exc}"
@@ -100,6 +102,23 @@ def diff_cassette(
                 f" ({len(b_body)} bytes -> {len(c_body)} bytes)\n"
                 f"    diff snippet:\n"
                 + "\n".join(f"    {line}" for line in snippet.splitlines())
+            )
+
+        b_status = (b_ix.get("response") or {}).get("status", {}).get("code")
+        c_status = (c_ix.get("response") or {}).get("status", {}).get("code")
+        if b_status != c_status:
+            uri_drift += 1
+            details.append(
+                f"  interaction {idx}: status code changed"
+                f" from {b_status} to {c_status}"
+            )
+
+        b_method = (b_ix.get("request") or {}).get("method", "")
+        c_method = (c_ix.get("request") or {}).get("method", "")
+        if b_method != c_method:
+            details.append(
+                f"  interaction {idx}: method changed"
+                f" from {b_method!r} to {c_method!r}"
             )
 
     # Interaction count mismatch
@@ -198,7 +217,7 @@ def generate_report(
             parse_errors.append((f"current/{rel}", c_err))
             continue
 
-        summary = diff_cassette(b_data, c_data)  # type: ignore[arg-type]
+        summary = diff_cassette(b_data, c_data)
         if summary["changed"]:
             changed.append((rel, summary))
         else:
