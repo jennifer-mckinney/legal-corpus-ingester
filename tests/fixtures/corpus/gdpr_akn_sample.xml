@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<akomaNtoso xmlns="http://docs.oasis-open.org/legaldocml/ns/akn/3.0">
+  <act name="regulation">
+    <meta>
+      <identification source="#EU">
+        <FRBRWork><FRBRthis value="CELEX:32016R0679"/></FRBRWork>
+      </identification>
+    </meta>
+    <body>
+      <section eId="sec_1">
+        <heading>Article 1 — Subject-matter and objectives</heading>
+        <content>
+          <p>This Regulation lays down rules relating to the protection of natural persons with regard to the processing of personal data.</p>
+        </content>
+      </section>
+      <section eId="sec_2">
+        <heading>Article 2 — Material scope</heading>
+        <content>
+          <p>This Regulation applies to the processing of personal data wholly or partly by automated means.</p>
+        </content>
+      </section>
+    </body>
+  </act>
+</akomaNtoso>
