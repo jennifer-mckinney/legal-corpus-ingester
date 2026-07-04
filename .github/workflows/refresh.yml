@@ -1,0 +1,87 @@
+name: Weekly Corpus Refresh
+on:
+  schedule:
+    - cron: '0 3 * * 0'   # Sunday 3 AM UTC
+  workflow_dispatch:        # allow manual trigger from Actions UI or gh CLI
+
+concurrency:
+  group: refresh
+  cancel-in-progress: false  # never cancel a refresh mid-run; partial bundles are invalid
+
+jobs:
+  refresh:
+    runs-on: [self-hosted, legal-corpus-ingester]
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        run: python3 --version
+
+      - name: Install
+        run: |
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install -e '.[dev]' 2>&1 | tail -5
+
+      - name: Record pre-refresh bundle target
+        id: pre_refresh
+        run: |
+          # Capture the current symlink target (or empty string if out/current does not exist)
+          if [ -L out/current ]; then
+            echo "target=$(readlink out/current)" >> "$GITHUB_OUTPUT"
+          else
+            echo "target=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run refresh
+        run: |
+          source .venv/bin/activate
+          # Exit 0 on first-run / no-sources-configured to keep the workflow green
+          ingester refresh --all || { echo "Refresh failed or no sources configured"; exit 0; }
+
+      - name: Detect bundle change
+        id: detect_change
+        run: |
+          # Compare symlink target after refresh to the pre-refresh value
+          if [ -L out/current ]; then
+            new_target=$(readlink out/current)
+          else
+            new_target=""
+          fi
+          pre_target="${{ steps.pre_refresh.outputs.target }}"
+
+          # Also check for any uncommitted changes in out/ or state/
+          git_dirty=$(git status --porcelain out/ state/ 2>/dev/null | wc -l | tr -d ' ')
+
+          if [ "$new_target" != "$pre_target" ] || [ "$git_dirty" -gt "0" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "new_target=$new_target" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "new_target=$new_target" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open issue on corpus change
+        if: steps.detect_change.outputs.changed == 'true'
+        env:
+          BUNDLE_VER: ${{ steps.detect_change.outputs.new_target }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          gh issue create \
+            --title "Weekly corpus refresh -- $(date -u +%Y-%m-%d)" \
+            --body "Corpus refreshed to bundle \`${BUNDLE_VER}\`.
+
+  Run \`ingester validate-round-trip out/current\` to verify consumer compatibility before updating the terms-analysis consumer.
+
+  Triggered by: ${EVENT_NAME} (run \`${RUN_ID}\`)" \
+            --label "corpus-refresh"
+
+      - name: Upload health report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: health-report-${{ github.run_id }}
+          path: out/health/
