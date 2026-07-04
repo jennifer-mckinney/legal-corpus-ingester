@@ -1,0 +1,5 @@
+source_id: "sg-sso-terms"
+signed_artifact_sha256: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+expiry: "2027-01-01"
+approved_by: "legal@example.com"
+approved_at: "2026-06-01"
