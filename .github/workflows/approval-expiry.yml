@@ -4,11 +4,13 @@ on:
     - cron: '0 6 * * *'   # 6 AM UTC daily
   workflow_dispatch:        # allow manual trigger from Actions UI or gh CLI
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   approval-expiry:
     runs-on: [self-hosted, legal-corpus-ingester]
-    env:
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
@@ -29,15 +31,11 @@ jobs:
       - name: Run approval check
         id: approval_check
         run: |
-          set +e
+          source .venv/bin/activate
           python scripts/check_approvals.py --approvals-dir config/approvals
-          rc=$?
-          set -e
-          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
-          exit $rc
 
       - name: Open issue on expiry
-        if: failure() && steps.approval_check.outputs.exit_code == '1'
+        if: failure()
         run: |
           gh issue create \
             --title "Approval expiry alert -- $(date -u +%Y-%m-%d)" \

@@ -116,7 +116,9 @@ def check_approvals_dir(
             continue
 
         status = classify_approval(expiry_date, today, warn_days)
-        days_remaining: str | int = (expiry_date - today).days
+        raw_days = (expiry_date - today).days
+        # For EXPIRED entries, store absolute days past expiry (positive integer).
+        days_remaining: str | int = abs(raw_days) if status == "EXPIRED" else raw_days
 
         if status == "EXPIRED":
             any_expired = True
@@ -141,8 +143,8 @@ def check_approvals_dir(
 def _render_table(rows: list[dict[str, str | int]]) -> str:
     """Render rows as a markdown table string."""
     header = (
-        "| source_id | status | expiry | days_remaining |\n"
-        "|-----------|--------|--------|----------------|\n"
+        "| source_id | status | expiry | days_remaining (EXPIRED=days past) |\n"
+        "|-----------|--------|--------|------------------------------------|\n"
     )
     lines: list[str] = []
     for row in rows:
@@ -178,6 +180,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    # Validate --warn-days is non-negative before proceeding.
+    if args.warn_days < 0:
+        parser.error("--warn-days must be a non-negative integer")
+
     approvals_dir = Path(args.approvals_dir)
     warn_days: int = args.warn_days
     today = date.today()
@@ -197,7 +203,7 @@ def main(argv: list[str] | None = None) -> int:
     print(_render_table(rows))
 
     if any_expired:
-        print("ERROR: one or more approvals are EXPIRED.", file=sys.stderr)
+        print("ERROR: one or more approvals are EXPIRED or invalid.", file=sys.stderr)
         return 1
 
     return 0

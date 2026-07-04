@@ -4,6 +4,10 @@ on:
     - cron: '0 3 * * 0'   # Sunday 3 AM UTC
   workflow_dispatch:        # allow manual trigger from Actions UI or gh CLI
 
+permissions:
+  contents: read
+  issues: write
+
 concurrency:
   group: refresh
   cancel-in-progress: false  # never cancel a refresh mid-run; partial bundles are invalid
@@ -30,7 +34,7 @@ jobs:
         run: |
           # Capture the current symlink target (or empty string if out/current does not exist)
           if [ -L out/current ]; then
-            echo "target=$(readlink out/current)" >> "$GITHUB_OUTPUT"
+            echo "target=$(readlink out/current | tr -d '\n\r')" >> "$GITHUB_OUTPUT"
           else
             echo "target=" >> "$GITHUB_OUTPUT"
           fi
@@ -46,7 +50,7 @@ jobs:
         run: |
           # Compare symlink target after refresh to the pre-refresh value
           if [ -L out/current ]; then
-            new_target=$(readlink out/current)
+            new_target=$(readlink out/current | tr -d '\n\r')
           else
             new_target=""
           fi
