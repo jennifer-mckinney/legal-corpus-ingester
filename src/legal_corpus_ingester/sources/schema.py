@@ -1,6 +1,7 @@
 from __future__ import annotations
 import re
 from typing import Literal
+from urllib.parse import urlparse
 from pydantic import BaseModel, field_validator
 
 # Extracted from terms-analysis::schemas.py Jurisdiction Literal — keep in sync
@@ -50,6 +51,19 @@ Cadence = Literal["weekly", "monthly", "quarterly", "event-driven"]
 class LicenseConfig(BaseModel):
     spdx: str
     url: str = ""
+
+    @field_validator("url")
+    @classmethod
+    def url_must_be_https(cls, v: str) -> str:
+        # Enforce HTTPS-only to prevent SSRF via http:// or file:// license URLs (HR4)
+        if not v:
+            return v
+        parsed = urlparse(v)
+        if parsed.scheme not in ("https",):
+            raise ValueError(
+                f"license.url must use https:// scheme, got {parsed.scheme!r}"
+            )
+        return v
 
 
 class RefreshConfig(BaseModel):

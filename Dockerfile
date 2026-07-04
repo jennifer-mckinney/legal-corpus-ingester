@@ -8,9 +8,10 @@ RUN python -m venv /venv && \
     /venv/bin/pip install --upgrade pip && \
     /venv/bin/pip install -e .
 
+# Test stage: extends builder with dev extras + full source tree for CI.
 FROM builder AS test
-RUN /venv/bin/pip install -e '.[dev]'
 COPY . .
+RUN /venv/bin/pip install -e '.[dev]'
 
 FROM python:3.12-slim@sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf AS runtime
 RUN useradd --create-home --shell /bin/bash ingester

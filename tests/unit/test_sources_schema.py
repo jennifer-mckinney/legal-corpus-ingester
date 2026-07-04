@@ -67,3 +67,31 @@ def test_unsafe_source_name_raises() -> None:
             "refresh": {"cadence": "weekly"},
             "pipeline": {"fetcher": "fetchers.fake.FakeFetcher"},
         })
+
+
+# ---------------------------------------------------------------------------
+# LicenseConfig URL scheme validator tests (Security MEDIUM — Fix 8)
+# ---------------------------------------------------------------------------
+
+def test_license_config_https_url_accepted() -> None:
+    from legal_corpus_ingester.sources.schema import LicenseConfig
+    cfg = LicenseConfig(spdx="CC-BY-4.0", url="https://example.com/license")
+    assert cfg.url == "https://example.com/license"
+
+
+def test_license_config_empty_url_accepted() -> None:
+    from legal_corpus_ingester.sources.schema import LicenseConfig
+    cfg = LicenseConfig(spdx="CC-BY-4.0", url="")
+    assert cfg.url == ""
+
+
+def test_license_config_http_url_rejected() -> None:
+    from legal_corpus_ingester.sources.schema import LicenseConfig
+    with pytest.raises(ValidationError):
+        LicenseConfig(spdx="CC-BY-4.0", url="http://169.254.169.254/latest/meta-data/")
+
+
+def test_license_config_file_url_rejected() -> None:
+    from legal_corpus_ingester.sources.schema import LicenseConfig
+    with pytest.raises(ValidationError):
+        LicenseConfig(spdx="CC-BY-4.0", url="file:///etc/passwd")

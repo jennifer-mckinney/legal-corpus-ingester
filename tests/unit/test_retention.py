@@ -214,3 +214,20 @@ class TestPlan:
         # Both are within top-4 recency window (only 2 bundles total)
         assert "2026.07.0" in keep_names
         assert "2026.07.1" in keep_names
+
+    def test_plan_symlink_named_bundle_excluded(self, tmp_path: Path) -> None:
+        """Symlinks whose names match calver pattern must not appear in keep or prune."""
+        out = tmp_path / "out"
+        out.mkdir()
+        # Real bundles
+        for ver in ["2025.01.0", "2025.02.0", "2025.03.0", "2025.04.0", "2025.05.0"]:
+            (out / ver).mkdir()
+        # Symlink with a calver name pointing elsewhere
+        target = tmp_path / "elsewhere"
+        target.mkdir()
+        (out / "2024.06.1").symlink_to(target)
+
+        keep, prune = plan(out)
+        all_names = {p.name for p in keep} | {p.name for p in prune}
+        # The symlink must be invisible to the retention planner
+        assert "2024.06.1" not in all_names

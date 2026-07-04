@@ -53,6 +53,8 @@ def plan(
     # Collect all calver bundle dirs: (path, date, patch)
     entries: list[tuple[Path, date, int]] = []
     for child in out_dir.iterdir():
+        if child.is_symlink():  # skip symlinks — rmtree refuses them
+            continue
         if not child.is_dir():
             continue
         d = _parse_calver(child.name)

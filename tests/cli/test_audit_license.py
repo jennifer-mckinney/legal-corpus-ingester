@@ -186,6 +186,43 @@ def test_audit_license_spdx_drift(tmp_path: Path, monkeypatch: Any) -> None:
     assert "SPDX_DRIFT" in result.output
 
 
+def test_audit_license_update_baseline_refused_on_spdx_drift(tmp_path: Path, monkeypatch: Any) -> None:
+    """--update-baseline must be refused when SPDX drift is detected."""
+    monkeypatch.chdir(tmp_path)
+    sources_dir = tmp_path / "config" / "sources"
+    _write_source_config(sources_dir)
+
+    # State file with different SPDX (simulate SPDX drift)
+    state_file = tmp_path / "state" / "license-hashes.json"
+    state_file.parent.mkdir(parents=True)
+    state_file.write_text(
+        json.dumps({"test-src": {"hash": "anyhash", "spdx": "MIT"}}),
+        encoding="utf-8",
+    )
+
+    mock_response = _make_mock_response()
+    monkeypatch.setattr(
+        "legal_corpus_ingester.cli.httpx.get",
+        lambda url, **kw: mock_response,
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "audit-license",
+            "test-src",
+            "--sources-dir",
+            str(sources_dir),
+            "--state-file",
+            str(state_file),
+            "--update-baseline",
+        ],
+    )
+    assert result.exit_code == 1
+    # Error message must appear (CliRunner mixes stdout+stderr by default)
+    assert "cannot update baseline" in result.output
+
+
 def test_audit_license_update_baseline(tmp_path: Path, monkeypatch: Any) -> None:
     """--update-baseline with NEW status writes to state file."""
     monkeypatch.chdir(tmp_path)

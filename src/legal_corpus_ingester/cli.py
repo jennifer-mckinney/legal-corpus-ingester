@@ -9,6 +9,12 @@ import typer
 
 from legal_corpus_ingester.sources.registry import load_all
 from legal_corpus_ingester.pipeline.state import CheckpointStore
+from legal_corpus_ingester.provenance.license_audit import (
+    hash_content,
+    check_license_drift,
+    record_license_baseline,
+    DriftStatus,
+)
 
 # Main app
 app = typer.Typer(
@@ -208,13 +214,6 @@ def audit_license(
         raise typer.Exit(code=1)
 
     # Hash + compare against baseline
-    from legal_corpus_ingester.provenance.license_audit import (
-        hash_content,
-        check_license_drift,
-        record_license_baseline,
-        DriftStatus,
-    )
-
     current_hash = hash_content(response.text)
     drift_status = check_license_drift(source, current_hash, spdx, state_file)
 
@@ -234,8 +233,15 @@ def audit_license(
     typer.echo(f"status     : {drift_status.value} -- {status_label}")
     typer.echo(f"hash[:12]  : {hash_short}")
 
-    # Optionally record as new baseline
+    # Optionally record as new baseline — blocked when drift is already detected
     if update_baseline:
+        if drift_status in (DriftStatus.DRIFT, DriftStatus.SPDX_DRIFT):
+            typer.echo(
+                "error: cannot update baseline while drift is detected; "
+                "resolve the drift first.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
         record_license_baseline(source, current_hash, spdx, state_file)
         typer.echo("baseline updated.")
 
@@ -347,8 +353,11 @@ def prune(
         typer.echo("Use --dry-run to preview or --force to delete.")
         return
 
-    # --force: delete each prunable bundle tree
+    # --force: delete each prunable bundle tree (symlinks are never rmtree'd)
     for p in prune_list:
+        if p.is_symlink():
+            typer.echo(f"  skipped symlink: {p.name}", err=True)
+            continue
         shutil.rmtree(p)
         typer.echo(f"  pruned: {p.name}")
 
