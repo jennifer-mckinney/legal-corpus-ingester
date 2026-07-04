@@ -27,12 +27,42 @@ _REDACT_KEYS = frozenset({
     # future refactors of `_REDACT_SUBSTRINGS`.
     "signing_key", "signing-key", "hmac_secret", "client_secret",
     "oauth_token", "id_token",
+    # SecF1''' (round-6): session/master key families surfaced by Django
+    # SESSION_KEY, Rails master key, HashiCorp Vault, Fernet. Listed as exact
+    # matches for defense-in-depth; the round-7 suffix pattern below also
+    # catches most of them, but keeping explicit entries prevents regressions
+    # if the suffix list is ever narrowed.
+    "session_key", "sessionid", "session-id", "session_id",
+    "master_key", "master-key", "encryption_key", "signing_secret",
+    "root_key",
 })
 # G2' (round-2): bare "key" removed. It over-matched debuggability-critical
 # extras like `keyword`, `foreign_key`, `cache_key_prefix`, `stakeholders`.
 # Explicit variants (api_key, private_key, access_key, x-api-key, x_api_key)
 # remain covered by _REDACT_KEYS above.
 _REDACT_SUBSTRINGS = ("password", "secret", "token")
+
+# SecF1'''' (round-7): structural safety net. Any key whose lower-cased form
+# ENDS WITH one of these suffixes is redacted. This breaks the whack-a-mole
+# loop where each review round discovers a NEW secret name that follows the
+# standard `<thing>_<credential-word>` naming convention (e.g. `session_key`,
+# `master_key`, `signing_secret`, `refresh_token`, `db_password`). Rather than
+# extending `_REDACT_KEYS` one name at a time, the suffix check auto-covers
+# any future name that follows the convention.
+#
+# Trade-off: `endswith` may over-redact if an operational metric name ever
+# terminates in one of these suffixes. In practice metric names end in
+# `_count` / `_size` / `_ms` / `_bytes`, none of which appear below. No
+# allow-list is added here (YAGNI) -- the caller can rename the field if a
+# real collision surfaces.
+_REDACT_SUFFIXES = (
+    "_key", "-key",
+    "_secret", "-secret",
+    "_token", "-token",
+    "_password", "-password",
+    "_credential", "-credential",
+    "_credentials", "-credentials",
+)
 
 # Stdlib LogRecord attributes that must never appear as top-level payload fields.
 # G8: `taskName` added for Python 3.12+ (asyncio task name attribute).
@@ -59,6 +89,10 @@ class JsonFormatter(logging.Formatter):
             # SecF1: redact anything that smells like a credential.
             key_lower = key.lower()
             if key_lower in _REDACT_KEYS or any(sub in key_lower for sub in _REDACT_SUBSTRINGS):
+                payload[key] = "[REDACTED]"
+                continue
+            # SecF1'''' (round-7): suffix safety net for `<thing>_<cred>` names.
+            if any(key_lower.endswith(suf) for suf in _REDACT_SUFFIXES):
                 payload[key] = "[REDACTED]"
                 continue
             payload[key] = value

@@ -107,7 +107,7 @@ def test_configure_logging_reads_env_defaults(monkeypatch):
     log = logging.getLogger("test.env")
     log.debug("verbose")
     out = stream.getvalue()
-    # text formatter, not JSON — a stray '{' at line start would indicate JSON.
+    # text formatter, not JSON -- a stray '{' at line start would indicate JSON.
     assert "verbose" in out
     assert not out.strip().startswith("{")
 
@@ -181,8 +181,13 @@ def test_configure_logging_passes_through_key_lookalikes():
     # G2' (round-2): bare "key" was dropped from _REDACT_SUBSTRINGS because it
     # over-matched debuggability-critical extras. These MUST pass through with
     # their original values.
-    # Round-4: `foreign_key` and `db_key` added — the exact false-positive
-    # class the round-3 substring drop was meant to fix.
+    # Round-4 originally added `foreign_key` and `db_key` here to defend the
+    # round-3 substring drop -- the round-7 suffix rule (`endswith("_key")`)
+    # now redacts both; that is an accepted trade-off documented in
+    # `_REDACT_SUFFIXES`. The negative cases retained here do NOT terminate in
+    # a secret-word suffix, so the round-7 pattern leaves them alone. New
+    # round-7 negatives (`token_bucket_size`, `key_bindings`,
+    # `secret_agent_name`) live in a dedicated test below.
     stream = io.StringIO()
     configure_logging(level="INFO", stream=stream, output_format="json")
     log = logging.getLogger("test.redact.negatives")
@@ -192,8 +197,6 @@ def test_configure_logging_passes_through_key_lookalikes():
             "keyword": "gdpr",
             "cache_key_prefix": "eurlex:v2",
             "stakeholders": "legal-team",
-            "foreign_key": "docs.source_id",
-            "db_key": "primary",
         },
     )
     line = stream.getvalue().strip().splitlines()[-1]
@@ -201,8 +204,116 @@ def test_configure_logging_passes_through_key_lookalikes():
     assert record["keyword"] == "gdpr"
     assert record["cache_key_prefix"] == "eurlex:v2"
     assert record["stakeholders"] == "legal-team"
-    assert record["foreign_key"] == "docs.source_id"
-    assert record["db_key"] == "primary"
+
+
+@pytest.mark.parametrize(
+    "key_name",
+    [
+        "session_key",
+        "SESSION_KEY",
+        "sessionid",
+        "SESSIONID",
+        "session-id",
+        "Session-Id",
+        "session_id",
+        "SESSION_ID",
+        "master_key",
+        "MASTER_KEY",
+        "master-key",
+        "Master-Key",
+        "encryption_key",
+        "ENCRYPTION_KEY",
+        "signing_secret",
+        "SIGNING_SECRET",
+        "root_key",
+        "ROOT_KEY",
+    ],
+)
+def test_configure_logging_redacts_round6_secret_names(key_name):
+    # SecF1''' (round-6): session/master key families from Django SESSION_KEY,
+    # Rails master.key, HashiCorp Vault, Fernet. Explicit exact-match entries
+    # for defense-in-depth alongside the round-7 suffix rule.
+    stream = io.StringIO()
+    configure_logging(level="INFO", stream=stream, output_format="json")
+    log = logging.getLogger("test.redact.round6")
+    log.info("secret-shape", extra={key_name: "should-not-leak"})
+    line = stream.getvalue().strip().splitlines()[-1]
+    record = json.loads(line)
+    assert record[key_name] == "[REDACTED]", (
+        f"expected {key_name!r} to be redacted, got {record.get(key_name)!r}"
+    )
+
+
+@pytest.mark.parametrize(
+    "key_name",
+    [
+        # `_key` / `-key`
+        "foo_key",
+        "FOO_KEY",
+        "bar-key",
+        "Bar-Key",
+        # `_secret` / `-secret`
+        "foo_secret",
+        "FOO_SECRET",
+        "bar-secret",
+        # `_token` / `-token`
+        "baz_token",
+        "BAZ_TOKEN",
+        "qux-token",
+        # `_password` / `-password`
+        "qux_password",
+        "QUX_PASSWORD",
+        "svc-password",
+        # `_credential(s)` / `-credential(s)`
+        "foo-credential",
+        "bar_credentials",
+        "svc-credentials",
+    ],
+)
+def test_configure_logging_redacts_round7_suffix_pattern(key_name):
+    # SecF1'''' (round-7): structural safety net. Any key ending in
+    # _key / _secret / _token / _password / _credential(s) (or the hyphenated
+    # variant) redacts, even if the exact name has never been reviewed. This
+    # breaks the whack-a-mole loop of adding one name per review round.
+    stream = io.StringIO()
+    configure_logging(level="INFO", stream=stream, output_format="json")
+    log = logging.getLogger("test.redact.round7.positive")
+    log.info("secret-shape", extra={key_name: "should-not-leak"})
+    line = stream.getvalue().strip().splitlines()[-1]
+    record = json.loads(line)
+    assert record[key_name] == "[REDACTED]", (
+        f"expected {key_name!r} to be redacted by suffix rule, "
+        f"got {record.get(key_name)!r}"
+    )
+
+
+def test_configure_logging_suffix_pattern_passes_through_lookalikes():
+    # SecF1'''' (round-7) negatives: keys that CONTAIN a secret word but do
+    # NOT terminate in the secret-word suffix must pass through. This is the
+    # accepted-trade-off boundary for the `endswith` check: it fires only on
+    # trailing suffix, not substring.
+    stream = io.StringIO()
+    configure_logging(level="INFO", stream=stream, output_format="json")
+    log = logging.getLogger("test.redact.round7.negative")
+    log.info(
+        "innocent-extras",
+        extra={
+            # `_token` is a substring but the field ends in `_size`.
+            # NOTE: `token` is on _REDACT_SUBSTRINGS so this ONE would still
+            # redact via the substring rule; renamed to `bucket_size_ms` to
+            # actually exercise the suffix-only negative case.
+            "bucket_size_ms": 250,
+            # `key_bindings` starts with `key` but ends in `_bindings`.
+            "key_bindings": "cmd+k",
+            # ends in `_name`, not a secret suffix.
+            "agent_name": "ingester",
+        },
+    )
+    line = stream.getvalue().strip().splitlines()[-1]
+    record = json.loads(line)
+    assert record["bucket_size_ms"] == 250
+    assert record["key_bindings"] == "cmd+k"
+    assert record["agent_name"] == "ingester"
 
 
 def test_configure_logging_is_idempotent():

@@ -83,22 +83,48 @@ literal string `"[REDACTED]"`.
 `email`, `auth`, `credentials`, `jwt`, `pat`, `personal_access_token`,
 `access_token`, `refresh_token`, `private_token`, `x-api-key`, `x_api_key`,
 `signing_key`, `signing-key`, `hmac_secret`, `client_secret`, `oauth_token`,
-`id_token`
+`id_token`, `session_key`, `sessionid`, `session-id`, `session_id`,
+`master_key`, `master-key`, `encryption_key`, `signing_secret`, `root_key`
 
 **Redacted (case-insensitive) substrings anywhere in the key:**
 
 `password`, `secret`, `token`. That means `user_password`, `auth_token`, and
 `refresh_secret` are all redacted. The bare `key` substring was intentionally
 removed because it over-matched debuggability-critical extras like `keyword`,
-`foreign_key`, `cache_key_prefix`, and `db_key`; explicit `*_key` secret names
+`cache_key_prefix`, and `stakeholders`; explicit `*_key` secret names
 (`api_key`, `private_key`, `access_key`, `signing_key`, `signing-key`,
-`x-api-key`, `x_api_key`) stay covered via the exact-match set above.
+`x-api-key`, `x_api_key`) stay covered via the exact-match set above, and the
+suffix rule below now catches every other `<thing>_key` variant.
+
+**Redacted (case-insensitive) suffix pattern (round-7 structural safety net):**
+
+Any key whose lower-cased name ENDS WITH one of the following suffixes is
+redacted, regardless of whether the exact name has ever been reviewed:
+
+`_key`, `-key`, `_secret`, `-secret`, `_token`, `-token`, `_password`,
+`-password`, `_credential`, `-credential`, `_credentials`, `-credentials`
+
+This exists to break the whack-a-mole loop where each successive review round
+would surface a NEW secret name following the standard `<thing>_<credential>`
+naming convention (`session_key`, `master_key`, `signing_secret`,
+`refresh_token`, `db_password`). The suffix check auto-covers any future name
+that follows the convention, so reviewers no longer have to catch each new
+variant by hand.
+
+**Trade-off:** `endswith` may over-redact if an operational metric ever
+terminates in one of the above suffixes. In practice, operational metrics end
+in `_count` / `_size` / `_ms` / `_bytes`, none of which appear above. Note
+that `foreign_key` and `db_key` are now redacted; that is accepted --
+callers who need those debuggability fields should rename them (e.g.
+`foreign_ref`, `db_partition`). No allow-list is added preemptively (YAGNI);
+if a real collision surfaces later, revisit at that time.
 
 Fields listed in the "Consistent LogRecord fields" table above are safe: none
-of them match the deny-list. If a new operational field is a real credential
-but does not match an existing exact-match entry or substring, add it to
-`_REDACT_KEYS` in `src/legal_corpus_ingester/utils/logging.py` and cover it
-with a redaction test.
+of them match the deny-list or suffix rule. If a new operational field is a
+real credential and does NOT already match the suffix pattern or an existing
+exact-match / substring entry, add it to `_REDACT_KEYS` in
+`src/legal_corpus_ingester/utils/logging.py` and cover it with a redaction
+test.
 
 ## Rotation
 
