@@ -1,15 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import warnings
 from pathlib import Path
 from typing import Protocol
 
 import numpy as np
 
-from legal_corpus_ingester.errors import EmbedEndpointError
+from legal_corpus_ingester.errors import EmbedEndpointError, LicenseDriftError
 from legal_corpus_ingester.pipeline.manifest import Manifest
 from legal_corpus_ingester.pipeline.state import CheckpointState, CheckpointStore
+from legal_corpus_ingester.provenance.license_audit import (
+    DriftStatus,
+    check_license_drift,
+    hash_content,
+    record_license_baseline,
+)
 from legal_corpus_ingester.publishers.base import PublishReceipt, PublishTarget
 from legal_corpus_ingester.types import Chunk, CleanedDocument, Corpus, FetchResult
 
@@ -62,6 +70,7 @@ class Orchestrator:
         state_dir: Path,
         corpus_version: str = "2026.07.0",
         chunker_version: str = "v1.0.0",
+        license_state_file: Path | None = None,
     ) -> None:
         self._fetcher = fetcher
         self._cleaner = cleaner
@@ -72,6 +81,7 @@ class Orchestrator:
         self._store = CheckpointStore(state_dir)
         self._corpus_version = corpus_version
         self._chunker_version = chunker_version
+        self._license_state_file = license_state_file
 
     def run(self, source_name: str, source_config: object) -> PublishReceipt:
         """Execute the full pipeline for *source_name*.
@@ -102,6 +112,39 @@ class Orchestrator:
         self._store.save(CheckpointState(source_name, "chunk", self._corpus_version))
         chunks: list[Chunk] = self._chunker.chunk(doc)
 
+        # --- license-drift gate (optional) ---
+        # Runs after chunking so the doc text is available for hashing.
+        drift_status: DriftStatus | None = None
+        if self._license_state_file is not None:
+            content_hash = hash_content(doc.text)
+            license_spdx = result.provenance.license
+            drift_status = check_license_drift(
+                source_name, content_hash, license_spdx, self._license_state_file
+            )
+            if drift_status == DriftStatus.SPDX_DRIFT:
+                # Read the old SPDX from the baseline file for the error message.
+                old_spdx = "unknown"
+                if self._license_state_file.exists():
+                    try:
+                        baseline = json.loads(self._license_state_file.read_text(encoding="utf-8"))
+                        old_spdx = baseline.get(source_name, {}).get("spdx", "unknown")
+                    except (json.JSONDecodeError, OSError):
+                        pass
+
+                # Write ALERTS.md to the publish target directory.
+                alert_path = self._target.path / "ALERTS.md"
+                alert_path.parent.mkdir(parents=True, exist_ok=True)
+                alert_path.write_text(
+                    f"# LICENSE DRIFT ALERT\n\nSource: {source_name}\nSPDX changed.\n",
+                    encoding="utf-8",
+                )
+                raise LicenseDriftError(source_name, old_spdx=old_spdx, new_spdx=license_spdx)
+            elif drift_status == DriftStatus.DRIFT:
+                warnings.warn(
+                    f"License text changed for {source_name} (same SPDX)",
+                    stacklevel=2,
+                )
+
         # --- embed ---
         self._store.save(CheckpointState(source_name, "embed", self._corpus_version))
         try:
@@ -129,6 +172,15 @@ class Orchestrator:
             chunk_count=len(chunks),
         )
         receipt = self._publisher.publish(corpus, self._target, manifest)
+
+        # Record license baseline after a successful publish (NEW or DRIFT — not SPDX_DRIFT).
+        if self._license_state_file is not None and drift_status != DriftStatus.SPDX_DRIFT:
+            record_license_baseline(
+                source_name,
+                hash_content(doc.text),
+                result.provenance.license,
+                self._license_state_file,
+            )
 
         self._store.save(CheckpointState(source_name, "done", self._corpus_version))
         logger.info("Pipeline complete for %r: %d chunks published.", source_name, len(chunks))
