@@ -24,7 +24,9 @@ class SectionedChunker:
                 chunks.append(Chunk(
                     text=text,
                     section=title,
-                    metadata={"chunk_index": chunk_index},
+                    # Merge doc.headers into metadata so downstream consumers
+                    # (publishers, LegalKnowledgeBase) can access jurisdiction etc.
+                    metadata={"chunk_index": chunk_index, **doc.headers},
                     provenance=doc.provenance,
                     offset_start=global_offset,
                     offset_end=end,

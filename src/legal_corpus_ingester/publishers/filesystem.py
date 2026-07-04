@@ -101,13 +101,18 @@ class FilesystemPublisher:
         _written_files.append(npy_path)
 
         # --- 3. Write index/legal_kb_metadata.json atomically ---
+        # Include chunk.text so LegalKnowledgeBase can run BM25 scoring, and
+        # spread chunk.metadata (which now carries jurisdiction from doc.headers)
+        # so retrieve() can filter and return jurisdiction-tagged results.
         metadata: list[dict[str, Any]] = [
             {
-                "source_name": chunk.provenance.source_name,
+                "text": chunk.text,
                 "section": chunk.section,
+                "source_name": chunk.provenance.source_name,
                 "offset_start": chunk.offset_start,
                 "offset_end": chunk.offset_end,
                 "license": chunk.provenance.license,
+                **chunk.metadata,
             }
             for chunk in corpus.chunks
         ]

@@ -10,9 +10,17 @@ interactions:
     uri: https://eur-lex.europa.eu/legal-content/EN/TXT/XML/?uri=CELEX:32016R0679
   response:
     body:
-      string: '<?xml version="1.0" encoding="UTF-8"?><akomaNtoso><act><body><section
-        id="s1"><heading>GDPR</heading><content><p>Regulation (EU) 2016/679 of the
-        European Parliament and of the Council.</p></content></section></body></act></akomaNtoso>'
+      string: '<?xml version="1.0" encoding="UTF-8"?><akomaNtoso xmlns="http://docs.oasis-open.org/legaldocml/ns/akn/3.0"><act
+        name="regulation"><body><section eId="art_5"><heading>Article 5 &#x2014; Principles
+        relating to processing</heading><content><p>Personal data shall be processed
+        lawfully, fairly and in a transparent manner in relation to the data subject.</p></content></section><section
+        eId="art_6"><heading>Article 6 &#x2014; Lawfulness of processing</heading><content><p>Processing
+        shall be lawful only if the data subject has given consent to the processing
+        of his or her personal data for one or more specific purposes. Consent must
+        be freely given, specific, informed and unambiguous.</p></content></section><section
+        eId="art_7"><heading>Article 7 &#x2014; Conditions for consent</heading><content><p>Where
+        processing is based on consent, the controller shall demonstrate that the data
+        subject has consented to processing of his or her personal data.</p></content></section></body></act></akomaNtoso>'
     headers:
       Content-Type:
       - application/xml; charset=UTF-8

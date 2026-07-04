@@ -10,6 +10,7 @@ venv/
 
 # OS
 .DS_Store
+*.swp
 
 # Env
 .env

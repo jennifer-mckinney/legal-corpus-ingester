@@ -17,7 +17,9 @@ class PlainChunker:
             chunks.append(Chunk(
                 text=text,
                 section="",
-                metadata={"chunk_index": i},
+                # Merge doc.headers into metadata so downstream consumers
+                # (publishers, LegalKnowledgeBase) can access jurisdiction etc.
+                metadata={"chunk_index": i, **doc.headers},
                 provenance=doc.provenance,
                 offset_start=char_offset,
                 offset_end=end,
