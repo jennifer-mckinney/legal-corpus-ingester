@@ -73,6 +73,7 @@ def diff_cassette(
 
     uri_drift = 0
     body_drift = 0
+    method_drift = 0
     details: list[str] = []
 
     # Compare interaction by interaction (zip stops at shorter list)
@@ -116,6 +117,7 @@ def diff_cassette(
         b_method = (b_ix.get("request") or {}).get("method", "")
         c_method = (c_ix.get("request") or {}).get("method", "")
         if b_method != c_method:
+            method_drift += 1
             details.append(
                 f"  interaction {idx}: method changed"
                 f" from {b_method!r} to {c_method!r}"
@@ -128,12 +130,13 @@ def diff_cassette(
             f" {len(baseline_ix)} -> {len(current_ix)}"
         )
 
-    changed = bool(uri_drift or body_drift or len(baseline_ix) != len(current_ix))
+    changed = bool(uri_drift or body_drift or method_drift or len(baseline_ix) != len(current_ix))
 
     return {
         "changed": changed,
         "uri_drift": uri_drift,
         "body_drift": body_drift,
+        "method_drift": method_drift,
         "interaction_count_baseline": len(baseline_ix),
         "interaction_count_current": len(current_ix),
         "details": details,

@@ -62,6 +62,8 @@ class TestDiffCassette:
         b = _cassette([_make_interaction(method="GET")])
         c = _cassette([_make_interaction(method="POST")])
         result = diff_cassette(b, c)
+        assert result["changed"] is True
+        assert result["method_drift"] == 1
         assert any("method" in d for d in result["details"])
 
     def test_count_mismatch(self):
@@ -132,3 +134,14 @@ class TestGenerateReport:
         report, any_drift = generate_report(b, c)
         assert any_drift is True
         assert "Changed" in report
+
+    def test_parse_error_triggers_drift(self, tmp_path):
+        b = tmp_path / "baseline"
+        c = tmp_path / "current"
+        b.mkdir()
+        c.mkdir()
+        (b / "bad.yaml").write_text(": : invalid\n")
+        (c / "bad.yaml").write_text(": : invalid\n")
+        report, any_drift = generate_report(b, c)
+        assert any_drift is True
+        assert "Parse errors" in report
