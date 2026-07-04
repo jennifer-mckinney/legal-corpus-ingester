@@ -27,8 +27,10 @@ jobs:
       - name: Run health check
         run: |
           source .venv/bin/activate
+          set +e
           python scripts/health_check.py
           exit_code=$?
+          set -e
           if [ $exit_code -gt 1 ]; then exit $exit_code; fi
 
       - name: Upload health report
