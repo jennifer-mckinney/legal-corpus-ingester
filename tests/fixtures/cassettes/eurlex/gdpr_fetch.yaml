@@ -1,0 +1,23 @@
+interactions:
+- request:
+    body: null
+    headers:
+      Accept:
+      - application/xml, text/xml;q=0.9
+      User-Agent:
+      - python-httpx/0.27.0
+    method: GET
+    uri: https://eur-lex.europa.eu/legal-content/EN/TXT/XML/?uri=CELEX:32016R0679
+  response:
+    body:
+      string: '<?xml version="1.0" encoding="UTF-8"?><akomaNtoso><act><body><section
+        id="s1"><heading>GDPR</heading><content><p>Regulation (EU) 2016/679 of the
+        European Parliament and of the Council.</p></content></section></body></act></akomaNtoso>'
+    headers:
+      Content-Type:
+      - application/xml; charset=UTF-8
+    status:
+      code: 200
+      message: OK
+    url: https://eur-lex.europa.eu/legal-content/EN/TXT/XML/?uri=CELEX:32016R0679
+version: 1

@@ -1,0 +1,65 @@
+from __future__ import annotations
+import hashlib
+from datetime import datetime, timezone
+from legal_corpus_ingester.fetchers.base import BaseFetcher
+from legal_corpus_ingester.types import FetchResult, ProvenanceRecord
+
+EURLEX_BASE_URL = "https://eur-lex.europa.eu"
+EURLEX_LICENSE = "CC-BY-4.0"
+
+
+class EurLexFetcher(BaseFetcher):
+    """Fetches EU law documents from EUR-Lex by CELEX ID."""
+
+    def __init__(self) -> None:
+        super().__init__(rate_limit_rps=0.5, max_retries=3, backoff_base=2.0)
+
+    async def fetch(self, celex_id: str) -> FetchResult:
+        """Fetch a CELEX document and return a FetchResult."""
+        # Try XML first (Akoma Ntoso), fall back to HTML
+        xml_url = (
+            f"{EURLEX_BASE_URL}/legal-content/EN/TXT/XML/"
+            f"?uri=CELEX:{celex_id}"
+        )
+        try:
+            response = await self._fetch_with_retry(
+                xml_url,
+                headers={"Accept": "application/xml, text/xml;q=0.9"},
+                timeout=30.0,
+                follow_redirects=True,
+            )
+            mime_type = "application/xml"
+        except Exception:
+            # Fall back to HTML
+            html_url = (
+                f"{EURLEX_BASE_URL}/legal-content/EN/TXT/HTML/"
+                f"?uri=CELEX:{celex_id}"
+            )
+            response = await self._fetch_with_retry(
+                html_url,
+                timeout=30.0,
+                follow_redirects=True,
+            )
+            mime_type = "text/html"
+
+        raw_bytes = response.content
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        sha256 = hashlib.sha256(raw_bytes).hexdigest()
+
+        provenance = ProvenanceRecord(
+            source_url=str(response.url) if hasattr(response, "url") else xml_url,
+            fetch_timestamp=ts,
+            license=EURLEX_LICENSE,
+            upstream_version=celex_id,
+            content_sha256=sha256,
+            source_name="eurlex",
+            fetcher_class="fetchers.eurlex.EurLexFetcher",
+        )
+
+        return FetchResult(
+            source_name="eurlex",
+            raw_bytes=raw_bytes,
+            mime_type=mime_type,
+            upstream_metadata={"celex_id": celex_id},
+            provenance=provenance,
+        )
