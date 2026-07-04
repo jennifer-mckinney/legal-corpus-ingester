@@ -94,7 +94,7 @@ def test_e2e_round_trip_gdpr(tmp_path: Path) -> None:
 
     # --- Step 1: Fetch GDPR via VCR cassette (replay only, no live network) ---
     with vcrpy.VCR().use_cassette(_CASSETTE, record_mode="none"):
-        fetch_result = asyncio.run(EurLexFetcher().fetch(celex_id=_CELEX_ID))
+        fetch_result = asyncio.run(EurLexFetcher().fetch(_CELEX_ID))
 
     # --- Step 2: Clean with AKNXMLCleaner ------------------------------------
     # AKNXMLCleaner.clean() now takes a FetchResult (Protocol-conformant).

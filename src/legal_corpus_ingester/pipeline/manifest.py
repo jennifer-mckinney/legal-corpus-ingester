@@ -1,9 +1,13 @@
 from __future__ import annotations
+import re
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import yaml
 
 MANIFEST_FILENAME = "MANIFEST.yaml"
+
+# YYYY.MM.PATCH calver — rejects path traversal strings like "../../../tmp/evil".
+_CALVER_RE = re.compile(r"^\d{4}\.\d{1,2}\.\d+$")
 
 
 class ManifestError(Exception):
@@ -18,6 +22,13 @@ class Manifest:
     embedder_revision: str       # SHA256 of model identifier per L6
     sources: list[str]           # source names included in this bundle
     chunk_count: int             # total chunks across all sources
+
+    def __post_init__(self) -> None:
+        if not _CALVER_RE.fullmatch(self.corpus_version):
+            raise ValueError(
+                f"corpus_version {self.corpus_version!r} is not a valid calver "
+                "(expected YYYY.MM.PATCH, e.g. '2026.07.0')"
+            )
 
     def write(self, bundle_dir: Path) -> None:
         """Write MANIFEST.yaml to bundle_dir."""

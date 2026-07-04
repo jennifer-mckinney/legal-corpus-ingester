@@ -108,11 +108,23 @@ class Orchestrator:
 
         # --- clean ---
         self._store.save(CheckpointState(source_name, "clean", self._corpus_version))
-        doc: CleanedDocument = self._cleaner.clean(result)
+        try:
+            doc: CleanedDocument = self._cleaner.clean(result)
+        except Exception as exc:
+            self._store.save(
+                CheckpointState(source_name, "clean_failed", self._corpus_version, error=str(exc))
+            )
+            raise
 
         # --- chunk ---
         self._store.save(CheckpointState(source_name, "chunk", self._corpus_version))
-        chunks: list[Chunk] = self._chunker.chunk(doc)
+        try:
+            chunks: list[Chunk] = self._chunker.chunk(doc)
+        except Exception as exc:
+            self._store.save(
+                CheckpointState(source_name, "chunk_failed", self._corpus_version, error=str(exc))
+            )
+            raise
 
         # --- license-drift gate (optional) ---
         # Runs after chunking so the doc text is available for hashing.

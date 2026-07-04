@@ -24,7 +24,7 @@ def test_eurlex_fetcher_returns_fetch_result() -> None:
     from legal_corpus_ingester.types import FetchResult
 
     fetcher = EurLexFetcher()
-    result = asyncio.run(fetcher.fetch(celex_id="32016R0679"))
+    result = asyncio.run(fetcher.fetch("32016R0679"))
     assert isinstance(result, FetchResult)
     assert result.mime_type in {"application/xml", "text/html", "text/plain"}
     assert result.provenance.source_name == "eurlex"

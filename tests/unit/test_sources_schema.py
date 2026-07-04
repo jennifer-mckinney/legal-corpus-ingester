@@ -54,3 +54,16 @@ def test_invalid_cadence_raises() -> None:
             "refresh": {"cadence": "daily"},  # not in allowed set
             "pipeline": {"fetcher": "fetchers.fake.FakeFetcher"},
         })
+
+
+def test_unsafe_source_name_raises() -> None:
+    from legal_corpus_ingester.sources.schema import SourceConfig
+    with pytest.raises(ValidationError):
+        SourceConfig.model_validate({
+            "name": "../evil",
+            "jurisdiction": "EU",
+            "base_url": "https://example.com",
+            "license": {"spdx": "CC-BY-4.0"},
+            "refresh": {"cadence": "weekly"},
+            "pipeline": {"fetcher": "fetchers.fake.FakeFetcher"},
+        })

@@ -58,6 +58,7 @@ class RefreshConfig(BaseModel):
 
 class PipelineConfig(BaseModel):
     fetcher: str  # dotted class path, e.g. "fetchers.eurlex.EurLexFetcher"
+    celex_id: str | None = None  # CELEX document ID for EUR-Lex fetcher
 
 
 class SourceConfig(BaseModel):

@@ -27,11 +27,13 @@ class BaseFetcher:
             for attempt in range(self._max_retries + 1):
                 response = await client.get(url, **kwargs)  # type: ignore[arg-type]
                 if response.status_code == 200:
-                    # Size cap check: reject oversized responses before buffering body.
-                    cl = response.headers.get("content-length")
-                    if cl and int(cl) > MAX_RESPONSE_BYTES:
+                    # Check actual body size regardless of Content-Length header presence.
+                    # Covers chunked TE responses that omit the header (the prior
+                    # header-only check silently skipped those cases).
+                    if len(response.content) > MAX_RESPONSE_BYTES:
                         raise UpstreamNotFoundError(
-                            f"Response too large ({cl} bytes, limit {MAX_RESPONSE_BYTES}): {url}"
+                            f"Response body too large ({len(response.content)} bytes, "
+                            f"limit {MAX_RESPONSE_BYTES}): {url}"
                         )
                     return response
                 if response.status_code == 404:

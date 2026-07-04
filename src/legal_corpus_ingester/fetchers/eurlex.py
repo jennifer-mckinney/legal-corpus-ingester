@@ -18,8 +18,27 @@ class EurLexFetcher(BaseFetcher):
     def __init__(self) -> None:
         super().__init__(rate_limit_rps=0.5, max_retries=3, backoff_base=2.0)
 
-    async def fetch(self, celex_id: str) -> FetchResult:
-        """Fetch a CELEX document and return a FetchResult."""
+    async def fetch(self, source_config: object) -> FetchResult:
+        """Fetch a CELEX document and return a FetchResult.
+
+        source_config may be a bare CELEX ID string (e.g. "32016R0679") for
+        direct/test usage, or a SourceConfig whose pipeline.celex_id carries
+        the identifier when called through the Orchestrator.
+        """
+        if isinstance(source_config, str):
+            celex_id: str = source_config
+        else:
+            try:
+                celex_id = source_config.pipeline.celex_id  # type: ignore[attr-defined]
+            except AttributeError as exc:
+                raise TypeError(
+                    "EurLexFetcher.fetch: expected a CELEX ID string or a SourceConfig "
+                    f"with pipeline.celex_id, got {type(source_config)}"
+                ) from exc
+            if not celex_id:
+                raise TypeError(
+                    "EurLexFetcher.fetch: SourceConfig.pipeline.celex_id is empty or None"
+                )
         # Try XML first (Akoma Ntoso), fall back to HTML
         xml_url = (
             f"{EURLEX_BASE_URL}/legal-content/EN/TXT/XML/"

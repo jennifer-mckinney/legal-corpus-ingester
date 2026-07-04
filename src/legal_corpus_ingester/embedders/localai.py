@@ -21,16 +21,29 @@ class LocalAIEmbedder:
 
     async def embed(self, chunks: list[Chunk]) -> np.ndarray:  # type: ignore[type-arg]
         """Embed chunks in batches. Returns float32 matrix shape (n, DIM), L2-normalized."""
+        if not chunks:
+            return np.empty((0, self.DIM), dtype=np.float32)
         texts = [c.text for c in chunks]
         all_embeddings: list[list[float]] = []
+        from legal_corpus_ingester.errors import EmbedEndpointError
         async with httpx.AsyncClient(timeout=60.0) as client:
             for i in range(0, len(texts), self._batch_size):
                 batch = texts[i : i + self._batch_size]
-                response = await client.post(
-                    f"{self._url}/embeddings",
-                    json={"model": self._model, "input": batch},
-                )
-                response.raise_for_status()
+                try:
+                    response = await client.post(
+                        f"{self._url}/embeddings",
+                        json={"model": self._model, "input": batch},
+                    )
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    raise EmbedEndpointError(
+                        f"LocalAI returned {exc.response.status_code}: "
+                        f"{exc.response.text[:200]}"
+                    ) from exc
+                except httpx.HTTPError as exc:
+                    raise EmbedEndpointError(
+                        f"LocalAI request failed: {exc}"
+                    ) from exc
                 data = response.json()
                 sorted_data = sorted(data["data"], key=lambda x: x["index"])
                 all_embeddings.extend(item["embedding"] for item in sorted_data)

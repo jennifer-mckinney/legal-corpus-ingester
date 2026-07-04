@@ -57,7 +57,12 @@ class TermsAnalysisPublisher:
         out_dir.mkdir(parents=True, exist_ok=True)
 
         bundle_name = manifest.corpus_version  # e.g. "2026.07.0"
-        bundle_dir = out_dir / bundle_name
+        bundle_dir = (out_dir / bundle_name).resolve()
+        if not bundle_dir.is_relative_to(out_dir.resolve()):
+            raise ValueError(
+                f"corpus_version {bundle_name!r} would escape out_dir; "
+                "path traversal blocked"
+            )
 
         # --- 1. Write full bundle via FilesystemPublisher ---
         bundle_target = PublishTarget(kind="filesystem", path=bundle_dir)

@@ -44,7 +44,7 @@ def _make_corpus(n: int = 2) -> Corpus:
     return Corpus(chunks=chunks, embeddings=embeddings, corpus_files=["gdpr.html"])
 
 
-def _make_manifest(version: str = "2026.07.0"):
+def _make_manifest(version: str = "2026.07.0", chunk_count: int = 2):
     from legal_corpus_ingester.pipeline.manifest import Manifest
 
     return Manifest(
@@ -53,7 +53,7 @@ def _make_manifest(version: str = "2026.07.0"):
         embedder_model="apertus-8b-instruct",
         embedder_revision="sha256:abc123",
         sources=["gdpr"],
-        chunk_count=2,
+        chunk_count=chunk_count,
     )
 
 
@@ -134,8 +134,7 @@ def test_round_trip_npy(tmp_path: Path) -> None:
     n = 3
     out_dir = tmp_path / "out"
     corpus = _make_corpus(n)
-    manifest = _make_manifest("2026.07.0")
-    manifest.chunk_count = n  # keep manifest consistent with n
+    manifest = _make_manifest("2026.07.0", chunk_count=n)
 
     TarballPublisher().publish(corpus, PublishTarget("tarball", out_dir), manifest)
 
