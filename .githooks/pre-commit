@@ -39,11 +39,25 @@ source "${VENV}/bin/activate"
 echo "pre-commit: ruff check"
 ruff check .
 
+# License-hashes audit - fail if any tracked source has drift recorded.
+LICENSE_HASHES="${REPO_ROOT}/state/license-hashes.json"
+if [ -f "${LICENSE_HASHES}" ]; then
+  echo "pre-commit: license-hashes audit"
+  python3 - "${LICENSE_HASHES}" <<'PYEOF'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path))
+drifted = [k for k, v in data.items() if isinstance(v, dict) and v.get("status") in ("DRIFT", "SPDX_DRIFT")]
+if drifted:
+    for k in drifted:
+        print(f"pre-commit: DRIFT detected for source: {k}", file=sys.stderr)
+    sys.exit(1)
+PYEOF
+  echo "pre-commit: license-hashes clean"
+fi
+
 echo "pre-commit: mypy src/"
-# TODO(task-1): remove the `|| { ... }` guard so mypy failures block commits.
-mypy src/ 2>&1 || {
-  echo "pre-commit: mypy failed (non-blocking during Phase 0.0 - will block after Task 1)"
-}
+mypy src/
 
 echo "pre-commit: pytest unit"
 pytest tests/unit -q 2>&1 | tail -20 || {

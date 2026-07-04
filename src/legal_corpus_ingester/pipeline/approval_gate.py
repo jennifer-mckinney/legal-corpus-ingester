@@ -23,7 +23,7 @@ def load_approval(approval_file: Path) -> dict:  # type: ignore[type-arg]
     data = yaml.safe_load(approval_file.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise LegalReviewGateError(f"APPROVAL.yaml malformed: {approval_file}")
-    return data  # type: ignore[return-value]
+    return data
 
 
 def check_approval(

@@ -56,7 +56,7 @@ class LocalAIEmbedder:
         # L2-normalize each row; guard against zero-norm vectors
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
         norms = np.where(norms == 0, 1.0, norms)
-        return (matrix / norms).astype(np.float32)
+        return (matrix / norms).astype(np.float32)  # type: ignore[no-any-return]
 
     async def health_check(self) -> bool:
         """Return True if LocalAI endpoint is reachable and responding."""
