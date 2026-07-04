@@ -53,7 +53,7 @@ The Dockerfile copies `pyproject.toml*` before the rest of the source. This mean
 
 ## Image size
 
-Expect the runtime image to land around 150 to 220 MB. Slim base is roughly 45 MB, the venv adds the rest, dominated by whatever the `dev` extras pull in (pytest, mypy, ruff). If the image drifts materially past 250 MB, that is a signal to audit the `dev` extras or move some of them to a separate `test` extras group so they do not ship in the runtime.
+Expect the runtime image to land around 100 to 150 MB. Slim base is roughly 45 MB, the venv adds the rest, now dominated by runtime deps only (httpx, typer, pydantic, etc.). Dev tools (pytest, mypy, ruff) ship only in the `test` stage and never enter the `runtime` stage. If the image drifts past 200 MB, audit what pulled into the runtime extras.
 
 LocalAI's `latest-aio-cpu` image is much larger, roughly 2 GB, because it bundles model runtimes. That is expected. It is pulled once and cached locally.
 
@@ -114,5 +114,5 @@ Model filenames referenced in configs MUST match `^[a-zA-Z0-9_.-]+$` to prevent 
 
 ## Known Phase 0.0 gaps
 
-- **Runtime image ships `dev` extras.** The builder stage runs `pip install -e '.[dev]'` which pulls pytest, mypy, and ruff into `/venv`. Because the runtime stage copies `/venv` verbatim, those tools ride along into production images. This is fine for now because `pyproject.toml` does not yet exist and the `.[dev]` branch is not exercised. Tracked as SecF8. Task 2 will land `pyproject.toml`; at that point split extras so `runtime` installs only the runtime deps and a separate `test` stage installs `.[dev]` for CI. TODO comment lives in `Dockerfile`.
-- **Empty-venv builder branch.** Without `pyproject.toml` the builder falls through to `python -m venv /venv` and produces an empty venv. The image builds green but has no `ingester` console script. `docker-entrypoint.sh` guards this by printing a clear diagnostic and exiting 1 (G7).
+- **SecF8 resolved (Task 39).** The builder stage now installs runtime deps only (`pip install -e .`). A separate `test` stage extends the builder with `.[dev]` for CI use. The runtime image no longer ships pytest, mypy, or ruff. The `TODO(task-2)` comment and the Phase 0.0 conditional install branch have been removed.
+- **Empty-venv builder branch removed.** The Phase 0.0 grace-path (`if [ -f pyproject.toml ]`) is gone now that `pyproject.toml` exists. The builder always runs the install. `docker-entrypoint.sh` still guards against a missing `ingester` console script and prints a clear diagnostic rather than an opaque error (G7).
