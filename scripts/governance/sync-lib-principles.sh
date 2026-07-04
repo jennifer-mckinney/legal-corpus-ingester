@@ -37,7 +37,7 @@ if [ ! -f "${LOCAL}" ]; then
     exit 3
 fi
 
-DIFF_OUTPUT="$(diff "${LOCAL}" "${AUTHORITATIVE}")"
+DIFF_OUTPUT="$(diff "${LOCAL}" "${AUTHORITATIVE}" || true)"
 
 if [ -z "${DIFF_OUTPUT}" ]; then
     echo "LIB-PRINCIPLES in sync with terms-analysis"
