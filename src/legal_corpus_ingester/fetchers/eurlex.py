@@ -2,6 +2,7 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone
 from urllib.parse import urlparse
+import httpx
 from legal_corpus_ingester.fetchers.base import BaseFetcher
 from legal_corpus_ingester.errors import UpstreamNotFoundError
 from legal_corpus_ingester.types import FetchResult, ProvenanceRecord
@@ -59,8 +60,8 @@ class EurLexFetcher(BaseFetcher):
             mime_type = "application/xml"
         except UpstreamNotFoundError:
             raise
-        except Exception:
-            # Fall back to HTML
+        except (httpx.HTTPError, OSError):
+            # Fall back to HTML on network/OS errors only; other exceptions propagate
             html_url = (
                 f"{EURLEX_BASE_URL}/legal-content/EN/TXT/HTML/"
                 f"?uri=CELEX:{celex_id}"

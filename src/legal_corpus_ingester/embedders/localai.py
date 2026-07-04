@@ -44,9 +44,14 @@ class LocalAIEmbedder:
                     raise EmbedEndpointError(
                         f"LocalAI request failed: {exc}"
                     ) from exc
-                data = response.json()
-                sorted_data = sorted(data["data"], key=lambda x: x["index"])
-                all_embeddings.extend(item["embedding"] for item in sorted_data)
+                try:
+                    data = response.json()
+                    sorted_data = sorted(data["data"], key=lambda x: x["index"])
+                    all_embeddings.extend(item["embedding"] for item in sorted_data)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise EmbedEndpointError(
+                        f"LocalAI response malformed: {exc} — body: {response.text[:200]}"
+                    ) from exc
         matrix = np.array(all_embeddings, dtype=np.float32)
         # L2-normalize each row; guard against zero-norm vectors
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
