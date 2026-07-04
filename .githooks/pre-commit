@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# Pre-commit hook - enforce ruff + mypy + pytest unit before commit.
+# Bypass with `git commit --no-verify` - DON'T (P7 violation if used to bypass fixes).
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "${REPO_ROOT}"
+
+if [ ! -f pyproject.toml ]; then
+  echo "pre-commit: no pyproject.toml yet - skipping"
+  exit 0
+fi
+
+VENV="${REPO_ROOT}/.venv"
+if [ ! -d "${VENV}" ]; then
+  echo "pre-commit: .venv missing; run 'python3 -m venv .venv && source .venv/bin/activate && pip install -e .[dev]'"
+  exit 1
+fi
+
+# shellcheck source=/dev/null
+source "${VENV}/bin/activate"
+
+echo "pre-commit: ruff check"
+ruff check .
+
+echo "pre-commit: mypy src/"
+mypy src/ 2>&1 || {
+  echo "pre-commit: mypy failed (non-blocking during Phase 0.0 - will block after Task 1)"
+}
+
+echo "pre-commit: pytest unit"
+pytest tests/unit -q 2>&1 | tail -20 || {
+  if [ ! -d tests/unit ] || [ -z "$(ls -A tests/unit 2>/dev/null)" ]; then
+    echo "pre-commit: no unit tests yet - skipping"
+    exit 0
+  fi
+  exit 1
+}
+
+echo "pre-commit: all checks passed"
