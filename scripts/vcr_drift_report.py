@@ -260,6 +260,7 @@ def generate_report(
             lines.append(f"### `{rel}`\n")
             uri_d = summary["uri_drift"]
             body_d = summary["body_drift"]
+            method_d = summary.get("method_drift", 0)
             b_count = summary["interaction_count_baseline"]
             c_count = summary["interaction_count_current"]
             parts: list[str] = []
@@ -267,6 +268,8 @@ def generate_report(
                 parts.append(f"URI drift in {uri_d} interaction(s)")
             if body_d:
                 parts.append(f"body structure drift in {body_d} interaction(s)")
+            if method_d:
+                parts.append(f"method drift in {method_d} interaction(s)")
             if b_count != c_count:
                 parts.append(
                     f"interaction count changed ({b_count} -> {c_count})"
