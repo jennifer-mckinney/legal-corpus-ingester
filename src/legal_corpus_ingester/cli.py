@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import shutil
 from pathlib import Path
 
 import httpx
@@ -306,3 +307,49 @@ def validate_round_trip(
         f" chunker={manifest.chunker_version},"
         f" chunks={manifest.chunk_count})"
     )
+
+
+@app.command()
+def prune(
+    out_dir: Path = typer.Option(
+        Path("out"),
+        "--out-dir",
+        help="Directory containing versioned bundles.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print what would be pruned without deleting.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Actually delete prunable bundles (required to delete).",
+    ),
+) -> None:
+    """Apply retention policy to bundle output directory."""
+    from legal_corpus_ingester.pipeline.retention import plan
+
+    keep, prune_list = plan(out_dir)
+
+    typer.echo(f"{len(keep)} bundle(s) to keep, {len(prune_list)} to prune.")
+
+    if not prune_list:
+        typer.echo("Nothing to prune.")
+        return
+
+    if dry_run:
+        for p in prune_list:
+            typer.echo(f"  would prune: {p}")
+        return
+
+    if not force:
+        typer.echo("Use --dry-run to preview or --force to delete.")
+        return
+
+    # --force: delete each prunable bundle tree
+    for p in prune_list:
+        shutil.rmtree(p)
+        typer.echo(f"  pruned: {p.name}")
+
+    typer.echo("Done.")
