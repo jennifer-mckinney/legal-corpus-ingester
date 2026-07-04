@@ -1,1 +1,2 @@
-"""legal_corpus_ingester — pipeline for ingesting legal source texts into the RAG corpus."""
+"""Legal corpus ingester — fetches, cleans, chunks, embeds, publishes legal corpus."""
+__version__ = "0.1.0"
