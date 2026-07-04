@@ -11,35 +11,44 @@ jobs:
     runs-on: [self-hosted, legal-corpus-ingester]
     steps:
       - uses: actions/checkout@v4
+
       - name: Set up Python
+        run: python3 --version
+
+      - name: Install
         run: |
-          python3 --version
-      - name: Install (if pyproject exists)
+          python3 -m venv .venv
+          source .venv/bin/activate
+          pip install -e '.[dev]' 2>&1 | tail -5
+
+      - name: Lint
         run: |
-          if [ -f pyproject.toml ]; then
-            python3 -m venv .venv
-            source .venv/bin/activate
-            pip install -e '.[dev]' 2>&1 | tail -5
-          else
-            echo "pyproject.toml not present yet — skipping install"
-          fi
-      - name: Lint (if ruff configured)
+          source .venv/bin/activate
+          ruff check .
+
+      - name: Type check
         run: |
-          if [ -f pyproject.toml ] && grep -q "^\[tool.ruff\]" pyproject.toml; then
-            source .venv/bin/activate
-            ruff check .
-          else
-            echo "ruff not configured yet — skipping"
-          fi
-      - name: Test (if tests exist)
+          source .venv/bin/activate
+          mypy src/
+
+      - name: Unit tests
         run: |
-          if [ -d tests ] && [ -n "$(ls -A tests 2>/dev/null)" ]; then
-            if [ ! -f .venv/bin/activate ]; then
-              echo "no venv yet — skipping tests"
-              exit 0
-            fi
-            source .venv/bin/activate
-            pytest --cov-fail-under=0 2>&1 | tail -20
-          else
-            echo "no tests yet — skipping"
-          fi
+          source .venv/bin/activate
+          pytest tests/unit tests/snapshot tests/cli -v --cov=src/legal_corpus_ingester --cov-report=xml --cov-fail-under=0 2>&1 | tail -30
+
+      - name: Integration tests
+        run: |
+          source .venv/bin/activate
+          pytest tests/integration -v 2>&1 | tail -30
+
+      - name: E2E tests
+        run: |
+          source .venv/bin/activate
+          pytest tests/e2e -v 2>&1 | tail -20
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report-${{ github.run_id }}
+          path: coverage.xml

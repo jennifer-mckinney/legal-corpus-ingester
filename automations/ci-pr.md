@@ -1,7 +1,6 @@
 # CI workflow
 
-Baseline continuous integration for `legal-corpus-ingester`. Kept intentionally
-minimal at this stage; steps activate as the relevant scaffolding lands.
+Continuous integration for `legal-corpus-ingester`. Runs lint, type checking, and the full test suite on every pull request and push to main.
 
 ## Trigger
 
@@ -20,30 +19,17 @@ note below.
 
 ## Steps
 
-The single `test` job runs sequentially:
+The single `test` job runs these steps sequentially:
 
-1. `actions/checkout@v4` pulls the ref under test.
-2. `python3 --version` confirms the runner's Python is reachable.
-3. Conditional install: if `pyproject.toml` is present, create `.venv` and
-   `pip install -e '.[dev]'`. Otherwise the step logs that install is skipped.
-4. Conditional lint: if `pyproject.toml` contains a `[tool.ruff]` section, run
-   `ruff check .`. Otherwise skipped.
-5. Conditional test: if `tests/` exists and is non-empty, run
-   `pytest --cov-fail-under=0`. Otherwise skipped.
-
-The conditionals let the workflow pass green before code exists. As each
-gating file appears in later tasks, the corresponding step becomes active on
-its own; no workflow edit is required to turn steps on.
-
-## Adding steps as the codebase grows
-
-Edit `.github/workflows/ci.yml` directly. Two patterns are worth keeping:
-
-- Keep new steps guarded by a file-existence check until their prerequisite
-  lands, so intermediate commits do not break CI.
-- Preserve the `runs-on: [self-hosted, legal-corpus-ingester]` label pair.
-  Adding or removing labels here without matching the runner registration
-  will leave jobs queued indefinitely.
+1. `actions/checkout@v4` - pulls the ref under test.
+2. `Set up Python` - runs `python3 --version` to confirm the runner's Python is reachable.
+3. `Install` - creates `.venv` and runs `pip install -e '.[dev]'`. Output is tail-truncated to 5 lines.
+4. `Lint` - runs `ruff check .` against the full codebase. Failures block the job.
+5. `Type check` - runs `mypy src/`. Failures block the job.
+6. `Unit tests` - runs `pytest tests/unit tests/snapshot tests/cli` with coverage collection. Coverage XML is written for the upload step. Output is tail-truncated to 30 lines.
+7. `Integration tests` - runs `pytest tests/integration`. Output is tail-truncated to 30 lines.
+8. `E2E tests` - runs `pytest tests/e2e`. Output is tail-truncated to 20 lines.
+9. `Upload coverage` - uploads `coverage.xml` as a GitHub Actions artifact named `coverage-report-<run_id>`. Runs even if earlier steps fail (`if: always()`).
 
 ## Concurrency
 
@@ -79,9 +65,11 @@ For a live tail while a run is in progress, add `--watch` to `gh run view`.
   Look for the runner in the response and confirm its `status` is `online`
   and its `labels` include both `self-hosted` and `legal-corpus-ingester`.
 
-- **Job fails on a conditional step**: read the step log; the first line of
-  each conditional step logs whether it ran or skipped, which narrows the
-  investigation quickly.
+- **Job fails on lint or type check**: ruff or mypy found a violation. Read the
+  step log for the exact file and line number, fix locally, and push again.
+
+- **Job fails on a test step**: the step log shows the pytest summary. Run the
+  same pytest command locally with `.venv` activated to reproduce.
 
 - **Cancelled by concurrency**: expected if a newer commit lands on the same
   ref while a run is active. Rerun manually only if the newer run also
