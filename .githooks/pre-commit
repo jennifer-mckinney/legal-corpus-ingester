@@ -6,8 +6,14 @@ set -euo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "${REPO_ROOT}"
 
+# Audit-log helper: append run to .git/pre-commit.log on success (SecF7)
+_pre_commit_audit() {
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) pre-commit ran to completion" >> "${REPO_ROOT}/.git/pre-commit.log"
+}
+
 if [ ! -f pyproject.toml ]; then
   echo "pre-commit: no pyproject.toml yet - skipping"
+  _pre_commit_audit
   exit 0
 fi
 
@@ -17,6 +23,16 @@ if [ ! -d "${VENV}" ]; then
   exit 1
 fi
 
+# Refuse to source .venv/bin/activate if it's a symlink or is tracked in git (SecF6)
+if [ -L "${VENV}/bin/activate" ]; then
+    echo "pre-commit: refusing to source symlinked .venv activate (SecF6)" >&2
+    exit 1
+fi
+if git ls-files --error-unmatch "${VENV}/bin/activate" >/dev/null 2>&1; then
+    echo "pre-commit: refusing to source tracked .venv activate (SecF6)" >&2
+    exit 1
+fi
+
 # shellcheck source=/dev/null
 source "${VENV}/bin/activate"
 
@@ -24,6 +40,7 @@ echo "pre-commit: ruff check"
 ruff check .
 
 echo "pre-commit: mypy src/"
+# TODO(task-1): remove the `|| { ... }` guard so mypy failures block commits.
 mypy src/ 2>&1 || {
   echo "pre-commit: mypy failed (non-blocking during Phase 0.0 - will block after Task 1)"
 }
@@ -32,9 +49,12 @@ echo "pre-commit: pytest unit"
 pytest tests/unit -q 2>&1 | tail -20 || {
   if [ ! -d tests/unit ] || [ -z "$(ls -A tests/unit 2>/dev/null)" ]; then
     echo "pre-commit: no unit tests yet - skipping"
+    _pre_commit_audit
     exit 0
   fi
   exit 1
 }
 
 echo "pre-commit: all checks passed"
+_pre_commit_audit
+exit 0

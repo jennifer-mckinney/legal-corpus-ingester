@@ -76,3 +76,21 @@ pip install -e '.[dev]'
 ```
 
 This installs the project in editable mode along with the dev extras (ruff, mypy, pytest, and pytest plugins).
+
+The hook also refuses to source `.venv/bin/activate` if the file is a symlink or is tracked in git (SecF6). `.venv/` is gitignored, but `git add -f .venv/bin/activate` could force-track a malicious activate script. The two guards run before `source` and abort the commit with a clear message. If a legitimate workflow ever needs a tracked activate script, remove the guards deliberately in a reviewed change rather than working around them.
+
+## Auditability
+
+`--no-verify` skips the hook entirely, and the pre-push hook cannot tell whether pre-commit ran. To make bypasses observable, the hook appends a timestamp to `.git/pre-commit.log` at every successful completion (SecF7). The log lives inside `.git/`, so it is untracked and per-clone.
+
+To verify pre-commit ran for a given commit, check `.git/pre-commit.log`. The last timestamp should be within seconds of the commit's authored time. A gap indicates a `--no-verify` bypass.
+
+```bash
+tail .git/pre-commit.log
+```
+
+This is a material auditability improvement, not a cryptographic proof. A stronger scheme would use a `prepare-commit-msg` hook to inject a `Verified-by: pre-commit` commit trailer that ties the audit record to the commit hash. That is tracked as a follow-up.
+
+## Known Phase 0.0 gaps
+
+- **G3 mypy silent-swallow**: the `mypy src/` block is wrapped in `|| { echo ... }` so failures print a warning but do not block. A `TODO(task-1)` marker sits directly above the block. Task 1 removes the guard so mypy failures block commits.
