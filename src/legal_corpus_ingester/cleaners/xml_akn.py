@@ -1,15 +1,33 @@
 from __future__ import annotations
 from lxml import etree
-from legal_corpus_ingester.types import CleanedDocument, ProvenanceRecord
+from legal_corpus_ingester.types import CleanedDocument, FetchResult, ProvenanceRecord
 
 AKN_NS = "http://docs.oasis-open.org/legaldocml/ns/akn/3.0"
+
+MAX_XML_BYTES = 20 * 1024 * 1024  # 20 MB — DoS guard (security finding 3)
 
 
 class AKNXMLCleaner:
     """Cleans Akoma Ntoso XML from EUR-Lex into a CleanedDocument."""
 
-    def clean(self, raw_bytes: bytes, provenance: ProvenanceRecord) -> CleanedDocument:
-        root = etree.fromstring(raw_bytes)
+    def clean(self, result: FetchResult) -> CleanedDocument:
+        """Protocol-conformant entry point: accepts FetchResult."""
+        return self._clean(result.raw_bytes, result.provenance)
+
+    def _clean(self, raw_bytes: bytes, provenance: ProvenanceRecord) -> CleanedDocument:
+        # Size guard before parsing — prevents DoS via huge XML payloads.
+        if len(raw_bytes) > MAX_XML_BYTES:
+            from legal_corpus_ingester.errors import SchemaDriftError
+            raise SchemaDriftError(
+                f"XML document too large ({len(raw_bytes)} bytes); limit is {MAX_XML_BYTES}"
+            )
+        # Hardened parser: no entity expansion, no network access, no huge_tree.
+        parser = etree.XMLParser(
+            resolve_entities=False,
+            no_network=True,
+            huge_tree=False,
+        )
+        root = etree.fromstring(raw_bytes, parser)
         ns = {"akn": AKN_NS}
 
         sections = root.findall(".//akn:section", ns)
@@ -48,9 +66,6 @@ class AKNXMLCleaner:
 
 def _celex_to_jurisdiction(celex_id: str) -> str:
     """Infer jurisdiction label from CELEX prefix. Defaults to 'EU'."""
-    # GDPR: 32016R0679
-    # EU-AI-Act: 32024R1689
-    # For now: all EUR-Lex documents are GDPR/EU jurisdiction
     _CELEX_MAP: dict[str, str] = {
         "32016R0679": "GDPR",
         "32024R1689": "EU-AI-ACT",

@@ -84,7 +84,12 @@ class FilesystemPublisher:
             idx = source_chunk_count.get(source_name, 0)
             source_chunk_count[source_name] = idx + 1
 
-            chunk_dir = root / "corpus" / source_name
+            # Traversal guard: resolve and confirm path stays inside corpus dir.
+            chunk_dir = (root / "corpus" / source_name).resolve()
+            if not chunk_dir.is_relative_to((root / "corpus").resolve()):
+                raise ValueError(
+                    f"source_name {source_name!r} would escape corpus dir; path traversal blocked"
+                )
             chunk_dir.mkdir(parents=True, exist_ok=True)
 
             txt_path = chunk_dir / f"{idx:06d}.txt"
@@ -104,15 +109,17 @@ class FilesystemPublisher:
         # Include chunk.text so LegalKnowledgeBase can run BM25 scoring, and
         # spread chunk.metadata (which now carries jurisdiction from doc.headers)
         # so retrieve() can filter and return jurisdiction-tagged results.
+        # chunk.metadata is spread first (lowest precedence) so that provenance
+        # fields (source_name, license, etc.) always win on key collision.
         metadata: list[dict[str, Any]] = [
             {
+                **chunk.metadata,           # lowest precedence — must come first
                 "text": chunk.text,
                 "section": chunk.section,
                 "source_name": chunk.provenance.source_name,
                 "offset_start": chunk.offset_start,
                 "offset_end": chunk.offset_end,
                 "license": chunk.provenance.license,
-                **chunk.metadata,
             }
             for chunk in corpus.chunks
         ]

@@ -3,6 +3,10 @@ import asyncio
 import httpx
 from legal_corpus_ingester.errors import UpstreamNotFoundError
 
+# Maximum response body size accepted before buffering — prevents DoS via
+# oversized upstream payloads.
+MAX_RESPONSE_BYTES = 50 * 1024 * 1024  # 50 MB
+
 
 class BaseFetcher:
     """Base HTTP fetcher with retry-on-429 and exponential backoff."""
@@ -23,6 +27,12 @@ class BaseFetcher:
             for attempt in range(self._max_retries + 1):
                 response = await client.get(url, **kwargs)  # type: ignore[arg-type]
                 if response.status_code == 200:
+                    # Size cap check: reject oversized responses before buffering body.
+                    cl = response.headers.get("content-length")
+                    if cl and int(cl) > MAX_RESPONSE_BYTES:
+                        raise UpstreamNotFoundError(
+                            f"Response too large ({cl} bytes, limit {MAX_RESPONSE_BYTES}): {url}"
+                        )
                     return response
                 if response.status_code == 404:
                     raise UpstreamNotFoundError(f"404 Not Found: {url}")

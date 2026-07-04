@@ -17,6 +17,13 @@ _BACKEND_PATH = Path(__file__).resolve().parents[3] / "terms-analysis" / "src" /
 
 
 def _ensure_backend_on_path() -> None:
+    # Skip guard: if terms-analysis backend is absent, skip E2E (not a failure).
+    if not _BACKEND_PATH.is_dir():
+        import pytest
+        pytest.skip(
+            f"terms-analysis backend not found at expected sibling path {_BACKEND_PATH}; "
+            "skipping E2E round-trip test"
+        )
     p = str(_BACKEND_PATH)
     if p not in sys.path:
         sys.path.insert(0, p)
@@ -90,9 +97,8 @@ def test_e2e_round_trip_gdpr(tmp_path: Path) -> None:
         fetch_result = asyncio.run(EurLexFetcher().fetch(celex_id=_CELEX_ID))
 
     # --- Step 2: Clean with AKNXMLCleaner ------------------------------------
-    # AKNXMLCleaner.clean() takes (raw_bytes, provenance) — not FetchResult —
-    # so we call it directly rather than routing through the Orchestrator.
-    doc = AKNXMLCleaner().clean(fetch_result.raw_bytes, fetch_result.provenance)
+    # AKNXMLCleaner.clean() now takes a FetchResult (Protocol-conformant).
+    doc = AKNXMLCleaner().clean(fetch_result)
     assert len(doc.text) > 0, (
         "AKNXMLCleaner produced empty text — cassette XML may lack AKN namespace"
     )

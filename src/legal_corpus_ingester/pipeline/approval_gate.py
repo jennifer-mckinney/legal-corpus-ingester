@@ -64,7 +64,18 @@ def check_approval(
         )
 
     # --- expiry check ---
-    expiry = date.fromisoformat(str(data.get("expiry", "")))
+    # Missing expiry is a hard gate failure, not a raw ValueError.
+    raw_expiry = data.get("expiry")
+    if not raw_expiry:
+        raise LegalReviewGateError(
+            f"APPROVAL.yaml missing required 'expiry' field: {approval_file}"
+        )
+    try:
+        expiry = date.fromisoformat(str(raw_expiry))
+    except ValueError as exc:
+        raise LegalReviewGateError(
+            f"APPROVAL.yaml 'expiry' is not a valid ISO date in {approval_file}: {raw_expiry!r}"
+        ) from exc
     if today >= expiry:
         raise LegalReviewGateError(f"Approval for {source_id} expired on {expiry}")
 

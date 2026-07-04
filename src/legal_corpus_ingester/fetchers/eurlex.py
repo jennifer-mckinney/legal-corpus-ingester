@@ -1,11 +1,15 @@
 from __future__ import annotations
 import hashlib
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 from legal_corpus_ingester.fetchers.base import BaseFetcher
+from legal_corpus_ingester.errors import UpstreamNotFoundError
 from legal_corpus_ingester.types import FetchResult, ProvenanceRecord
 
 EURLEX_BASE_URL = "https://eur-lex.europa.eu"
 EURLEX_LICENSE = "CC-BY-4.0"
+# Same-origin enforcement: redirects must stay on this host.
+_EURLEX_HOST = "eur-lex.europa.eu"
 
 
 class EurLexFetcher(BaseFetcher):
@@ -28,7 +32,14 @@ class EurLexFetcher(BaseFetcher):
                 timeout=30.0,
                 follow_redirects=True,
             )
+            # Same-origin check: reject responses that redirected outside EUR-Lex.
+            if urlparse(str(response.url)).netloc != _EURLEX_HOST:
+                raise UpstreamNotFoundError(
+                    f"Redirect led outside EUR-Lex: {response.url}"
+                )
             mime_type = "application/xml"
+        except UpstreamNotFoundError:
+            raise
         except Exception:
             # Fall back to HTML
             html_url = (
@@ -40,6 +51,11 @@ class EurLexFetcher(BaseFetcher):
                 timeout=30.0,
                 follow_redirects=True,
             )
+            # Same-origin check on HTML fallback response as well.
+            if urlparse(str(response.url)).netloc != _EURLEX_HOST:
+                raise UpstreamNotFoundError(
+                    f"Redirect led outside EUR-Lex: {response.url}"
+                )
             mime_type = "text/html"
 
         raw_bytes = response.content

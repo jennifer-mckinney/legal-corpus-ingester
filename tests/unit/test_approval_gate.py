@@ -57,6 +57,31 @@ def test_blocks_on_source_id_mismatch(approval_fixture: Path) -> None:
         check_approval(approval_fixture, "wrong-source", VALID_SHA, today=date(2026, 7, 4))
 
 
+def test_gate_blocks_on_missing_expiry(tmp_path: Path) -> None:
+    """check_approval raises LegalReviewGateError when 'expiry' field is absent."""
+    approval_file = tmp_path / "no_expiry.yaml"
+    approval_file.write_text(
+        "source_id: sg-sso-terms\n"
+        f"signed_artifact_sha256: {VALID_SHA}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(LegalReviewGateError, match="expiry"):
+        check_approval(approval_file, "sg-sso-terms", VALID_SHA, today=date(2026, 7, 4))
+
+
+def test_gate_blocks_on_invalid_expiry_format(tmp_path: Path) -> None:
+    """check_approval raises LegalReviewGateError when 'expiry' is not ISO date format."""
+    approval_file = tmp_path / "bad_expiry.yaml"
+    approval_file.write_text(
+        "source_id: sg-sso-terms\n"
+        f"signed_artifact_sha256: {VALID_SHA}\n"
+        "expiry: not-a-date\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(LegalReviewGateError, match="not a valid ISO date"):
+        check_approval(approval_file, "sg-sso-terms", VALID_SHA, today=date(2026, 7, 4))
+
+
 def test_warns_within_60_days(tmp_path: Path) -> None:
     """check_approval emits a UserWarning when expiry is within EXPIRY_WARNING_DAYS."""
     # Expiry 30 days from our 'today'

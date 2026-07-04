@@ -23,7 +23,14 @@ class CheckpointStore:
         self._dir = state_dir
 
     def _path(self, source_name: str) -> Path:
-        return self._dir / f"{source_name}.checkpoint.json"
+        # Resolve before returning to catch any path traversal attempts via
+        # source_name values like "../../../etc/passwd".
+        p = (self._dir / f"{source_name}.checkpoint.json").resolve()
+        if not p.is_relative_to(self._dir.resolve()):
+            raise ValueError(
+                f"source_name {source_name!r} would escape state_dir; path traversal blocked"
+            )
+        return p
 
     def save(self, state: CheckpointState) -> None:
         """Persist *state* to disk, creating the state directory if needed."""

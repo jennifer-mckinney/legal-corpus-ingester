@@ -70,6 +70,7 @@ class Orchestrator:
         state_dir: Path,
         corpus_version: str = "2026.07.0",
         chunker_version: str = "v1.0.0",
+        embedder_model: str = "apertus-8b-instruct",
         license_state_file: Path | None = None,
     ) -> None:
         self._fetcher = fetcher
@@ -81,6 +82,7 @@ class Orchestrator:
         self._store = CheckpointStore(state_dir)
         self._corpus_version = corpus_version
         self._chunker_version = chunker_version
+        self._embedder_model = embedder_model
         self._license_state_file = license_state_file
 
     def run(self, source_name: str, source_config: object) -> PublishReceipt:
@@ -166,7 +168,7 @@ class Orchestrator:
         manifest = Manifest(
             corpus_version=self._corpus_version,
             chunker_version=self._chunker_version,
-            embedder_model=source_name,
+            embedder_model=self._embedder_model,
             embedder_revision=self._embedder.revision(),
             sources=[source_name],
             chunk_count=len(chunks),

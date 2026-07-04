@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 from typing import Literal
 from pydantic import BaseModel, field_validator
 
@@ -66,6 +67,18 @@ class SourceConfig(BaseModel):
     license: LicenseConfig
     refresh: RefreshConfig
     pipeline: PipelineConfig
+
+    @field_validator("name")
+    @classmethod
+    def name_is_safe(cls, v: str) -> str:
+        # Reject path separators and other unsafe chars — prevents path traversal
+        # when source_name is used to construct filesystem paths in state/ and corpus/.
+        if not re.fullmatch(r"[a-z0-9_-]+", v):
+            raise ValueError(
+                f"source name {v!r} contains unsafe characters; "
+                "only lowercase letters, digits, hyphens, and underscores are allowed"
+            )
+        return v
 
     @field_validator("jurisdiction")
     @classmethod
