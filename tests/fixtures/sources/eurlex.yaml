@@ -1,0 +1,10 @@
+name: eurlex
+jurisdiction: EU
+base_url: https://eur-lex.europa.eu
+license:
+  spdx: CC-BY-4.0
+  url: https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:32016R0679
+refresh:
+  cadence: weekly
+pipeline:
+  fetcher: fetchers.eurlex.EurLexFetcher
