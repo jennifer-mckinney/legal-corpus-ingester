@@ -37,6 +37,7 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --cov=src/legal_corpus_ingester --cov-report=term-missing"
+pythonpath = ["src"]
 
 [tool.coverage.report]
 show_missing = true
