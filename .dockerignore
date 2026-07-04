@@ -1,10 +1,49 @@
+# Deny-list approach (current). Consider migrating to allow-list flavor:
+# *
+# !src/
+# !pyproject.toml
+# !README.md
+# !LICENSE
+
+# Virtual environments
 .venv/
+.venv*
+.venv-*-scratch/
+
+# Python caches
 __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# VCS + tooling metadata
 .git/
+.github/
+.claude/
+
+# Runtime artifacts (produced, not shipped)
 out/
 state/*.json
+
+# Test fixtures / cassettes
 tests/fixtures/cassettes/
+
+# Secrets and env files (never bake into image)
 .env
+.env.*
+.env.local
+.env.production
+**/*.pem
+**/id_rsa*
+**/credentials*
+
+# OS junk
+.DS_Store
+
+# Dev-only artifacts do not belong in the runtime image
+docs/
+automations/
+SESSION_HANDOFF_*.md
+
+# Bind mount, not part of image
+models/

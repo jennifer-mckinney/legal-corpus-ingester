@@ -12,7 +12,7 @@ The `Dockerfile` is multi-stage.
 
 **Stage 2 (`runtime`)** is a fresh `python:3.12-slim`. It creates a non-root `ingester` user, copies the venv from the builder stage, then copies the source tree with `--chown=ingester:ingester`. `PATH` is prepended with `/venv/bin` so `ingester` (the console script from `pyproject.toml`) resolves without any activation step. Environment variables `INGESTER_OUT_DIR`, `INGESTER_STATE_DIR`, and `INGESTER_CONFIG_DIR` point at the three declared `VOLUME`s.
 
-`ENTRYPOINT ["ingester"]` with `CMD ["--help"]` means `docker run legal-corpus-ingester:dev` prints usage by default. Overriding the command (`docker run ... run --config config/us.yaml`) passes through to the CLI.
+`ENTRYPOINT` is a small wrapper script (`docker-entrypoint.sh`) that checks whether the `ingester` console script actually exists in the venv. If it does, it `exec`s `ingester "$@"` — so `docker run legal-corpus-ingester:dev` prints usage by default and `docker run ... run --config config/us.yaml` passes through to the CLI unchanged. If the script is missing (Phase 0.0 grace-path build, no `pyproject.toml`), the wrapper prints a clear diagnostic and exits 1 rather than the opaque `exec: "ingester": executable file not found` that plain `ENTRYPOINT ["ingester"]` would emit. This is the G7 fix.
 
 ## Why non-root
 
@@ -86,3 +86,33 @@ If it does not come up within a few minutes, check Docker Desktop's own UI. The 
 | Stand up ingester + LocalAI | `docker compose up` |
 | Tear down | `docker compose down` |
 | Inspect image size | `docker images legal-corpus-ingester:dev` |
+
+## Base image digest pins
+
+Both base images are pinned by SHA256 digest rather than floating tag. This closes the SecF4 / G6 supply-chain risk: a compromised or silently-rotated upstream tag cannot land in a rebuild without a matching source-tree change. Digests refreshed 2026-07-03:
+
+| Image | Tag when pulled | Digest |
+|-------|-----------------|--------|
+| `python:3.12-slim` | `3.12-slim` | `sha256:423ed6ab25b1921a477529254bfeeabf5855151dc2c3141699a1bfc852199fbf` |
+| `localai/localai` | `latest-aio-cpu` | `sha256:4cbc20c59558ed6c1cae9bc3f6ae34d75d390b370aa8ac62a59327089fa56cec` (multi-arch index) |
+
+To refresh:
+
+```
+docker pull python:3.12-slim
+docker inspect --format '{{index .RepoDigests 0}}' python:3.12-slim
+docker buildx imagetools inspect localai/localai:latest-aio-cpu | head
+```
+
+Update the `FROM` lines in `Dockerfile` and the `image:` field in `docker-compose.yml`, then update the table above with the new digest and the pull date.
+
+## Model directory and path traversal
+
+`./models` is a bind mount owned by LocalAI, not by the ingester service. The ingester does not mount `./models` at all — LocalAI is the only writer. A `models/.gitkeep` is tracked so the directory exists with the correct perms on a fresh checkout. If a future service needs to read model metadata, mount it read-only (`- ./models:/models:ro`) so writes remain a LocalAI-only capability (SecF5).
+
+Model filenames referenced in configs MUST match `^[a-zA-Z0-9_.-]+$` to prevent path traversal. Enforcement is added at config load time in Task 7 (P7). This constraint is surfaced here so config authors know the shape before the enforcement code lands.
+
+## Known Phase 0.0 gaps
+
+- **Runtime image ships `dev` extras.** The builder stage runs `pip install -e '.[dev]'` which pulls pytest, mypy, and ruff into `/venv`. Because the runtime stage copies `/venv` verbatim, those tools ride along into production images. This is fine for now because `pyproject.toml` does not yet exist and the `.[dev]` branch is not exercised. Tracked as SecF8. Task 2 will land `pyproject.toml`; at that point split extras so `runtime` installs only the runtime deps and a separate `test` stage installs `.[dev]` for CI. TODO comment lives in `Dockerfile`.
+- **Empty-venv builder branch.** Without `pyproject.toml` the builder falls through to `python -m venv /venv` and produces an empty venv. The image builds green but has no `ingester` console script. `docker-entrypoint.sh` guards this by printing a clear diagnostic and exiting 1 (G7).

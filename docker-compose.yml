@@ -12,9 +12,14 @@ services:
     depends_on:
       - localai
   localai:
-    image: localai/localai:latest-aio-cpu
+    # Digest-pinned 2026-07-03 (SecF4/G6). Multi-arch index digest.
+    # Refresh via: docker buildx imagetools inspect localai/localai:latest-aio-cpu
+    image: localai/localai@sha256:4cbc20c59558ed6c1cae9bc3f6ae34d75d390b370aa8ac62a59327089fa56cec
     ports:
       - "8080:8080"
+    # SecF5: LocalAI is the only writer of /models. The ingester service does
+    # NOT mount ./models. If a future service needs to read model metadata,
+    # mount it read-only: `- ./models:/models:ro`.
     volumes:
       - ./models:/models
     environment:
