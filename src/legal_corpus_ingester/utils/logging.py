@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from typing import IO, Optional
@@ -64,6 +65,47 @@ _REDACT_SUFFIXES = (
     "_credentials", "-credentials",
 )
 
+# SecF1''''' (round-9): camelCase / PascalCase secret names (e.g. `sessionKey`,
+# `masterKey`, `privateKey`, `accessKey`) bypassed the round-7 suffix rule
+# because `endswith("_key")` requires the underscore separator. Normalize the
+# key name to snake_case BEFORE any of the three redaction checks so that
+# `sessionKey` -> `session_key` matches the exact list, `sshKey` -> `ssh_key`
+# matches the suffix pattern, and camel/pascal/snake variants converge to a
+# single canonical form. Trade-off: `foreignKey` (camelCase) now redacts, same
+# as `foreign_key`; that mirrors the round-7 accepted trade-off documented in
+# `_REDACT_SUFFIXES` below.
+#
+# Two-pass regex is the widely-accepted idiom for camel-to-snake because a
+# single `(?=[A-Z])` lookahead shreds all-uppercase names (SESSION_KEY becomes
+# s_e_s_s_i_o_n__k_e_y). Pass 1 splits a run of caps followed by a
+# Capitalized+lowercase word (`HTTPServer` -> `HTTP_Server`). Pass 2 splits a
+# lowercase-or-digit followed by an uppercase letter (`sessionKey` ->
+# `session_Key`, `SESSION_KEY` unchanged since `_` is not lowercase/digit).
+# Final `.lower()` produces the canonical snake_case form.
+_CAMEL_TO_SNAKE_PASS1 = re.compile(r'([A-Z]+)([A-Z][a-z])')
+_CAMEL_TO_SNAKE_PASS2 = re.compile(r'([a-z0-9])([A-Z])')
+
+
+def _normalize_key(name: str) -> str:
+    """Normalize camelCase / PascalCase to snake_case for consistent redaction.
+
+    Examples:
+
+        "sessionKey"      -> "session_key"
+        "MasterKey"       -> "master_key"
+        "sshKey"          -> "ssh_key"
+        "APIKey"          -> "api_key"        (multi-cap run handled cleanly)
+        "HTTPServer"      -> "http_server"
+        "SESSION_KEY"     -> "session_key"    (already upper-snake -> lowered)
+        "already_snake"   -> "already_snake"  (unchanged aside from lowercasing)
+        "kebab-case-key"  -> "kebab-case-key" (hyphens preserved; suffix rule
+                                               already covers `-key`)
+    """
+    step1 = _CAMEL_TO_SNAKE_PASS1.sub(r'\1_\2', name)
+    step2 = _CAMEL_TO_SNAKE_PASS2.sub(r'\1_\2', step1)
+    return step2.lower()
+
+
 # Stdlib LogRecord attributes that must never appear as top-level payload fields.
 # G8: `taskName` added for Python 3.12+ (asyncio task name attribute).
 _STDLIB_RECORD_FIELDS = frozenset({
@@ -86,13 +128,18 @@ class JsonFormatter(logging.Formatter):
         for key, value in record.__dict__.items():
             if key in _STDLIB_RECORD_FIELDS:
                 continue
+            # SecF1''''' (round-9): normalize camelCase/PascalCase to snake_case
+            # before every redaction check. This closes the `_key` asymmetry
+            # gap where `sessionKey` / `masterKey` / `privateKey` bypassed the
+            # suffix rule (which requires the `_` separator). Snake_case names
+            # are unchanged by the normalizer, so existing behavior is preserved.
+            key_normalized = _normalize_key(key)
             # SecF1: redact anything that smells like a credential.
-            key_lower = key.lower()
-            if key_lower in _REDACT_KEYS or any(sub in key_lower for sub in _REDACT_SUBSTRINGS):
+            if key_normalized in _REDACT_KEYS or any(sub in key_normalized for sub in _REDACT_SUBSTRINGS):
                 payload[key] = "[REDACTED]"
                 continue
             # SecF1'''' (round-7): suffix safety net for `<thing>_<cred>` names.
-            if any(key_lower.endswith(suf) for suf in _REDACT_SUFFIXES):
+            if any(key_normalized.endswith(suf) for suf in _REDACT_SUFFIXES):
                 payload[key] = "[REDACTED]"
                 continue
             payload[key] = value

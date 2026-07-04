@@ -186,8 +186,8 @@ def test_configure_logging_passes_through_key_lookalikes():
     # now redacts both; that is an accepted trade-off documented in
     # `_REDACT_SUFFIXES`. The negative cases retained here do NOT terminate in
     # a secret-word suffix, so the round-7 pattern leaves them alone. New
-    # round-7 negatives (`token_bucket_size`, `key_bindings`,
-    # `secret_agent_name`) live in a dedicated test below.
+    # round-7 negatives (`bucket_size_ms`, `key_bindings`, `agent_name`) live
+    # in a dedicated test below.
     stream = io.StringIO()
     configure_logging(level="INFO", stream=stream, output_format="json")
     log = logging.getLogger("test.redact.negatives")
@@ -314,6 +314,77 @@ def test_configure_logging_suffix_pattern_passes_through_lookalikes():
     assert record["bucket_size_ms"] == 250
     assert record["key_bindings"] == "cmd+k"
     assert record["agent_name"] == "ingester"
+
+
+@pytest.mark.parametrize(
+    "key_name",
+    [
+        # camelCase `_key` family — bypassed round-7 suffix rule pre-round-9
+        # because `endswith("_key")` requires the underscore separator.
+        "sessionKey",
+        "masterKey",
+        "privateKey",
+        "accessKey",
+        "signingKey",
+        "encryptionKey",
+        "rootKey",
+        "sshKey",
+        "licenseKey",
+        # PascalCase equivalents — same class of risk.
+        "SessionKey",
+        "MasterKey",
+        # camelCase `_token` / `_secret` / `_password` — already caught by
+        # substring rule pre-round-9 (`token` / `secret` / `password` are on
+        # `_REDACT_SUBSTRINGS`), but lock the behavior via the normalizer path
+        # so future refactors of the substring set do not silently regress.
+        "refreshToken",
+        "clientSecret",
+        "dbPassword",
+    ],
+)
+def test_configure_logging_redacts_camelcase_secret_names(key_name):
+    # SecF1''''' (round-9): camelCase / PascalCase secret names must redact
+    # after being normalized to snake_case. Closes the `_key` asymmetry gap
+    # surfaced by the round-8 P9 security review.
+    stream = io.StringIO()
+    configure_logging(level="INFO", stream=stream, output_format="json")
+    log = logging.getLogger("test.redact.round9")
+    log.info("secret-shape", extra={key_name: "should-not-leak"})
+    line = stream.getvalue().strip().splitlines()[-1]
+    record = json.loads(line)
+    assert record[key_name] == "[REDACTED]", (
+        f"expected {key_name!r} to be redacted after camelCase normalization, "
+        f"got {record.get(key_name)!r}"
+    )
+
+
+def test_configure_logging_camelcase_lookalikes_pass_through():
+    # SecF1''''' (round-9) negatives: camelCase / PascalCase names that
+    # normalize to snake_case forms which do NOT match any redaction rule
+    # must pass through with their original values. Guards against the
+    # normalizer over-redacting benign fields.
+    stream = io.StringIO()
+    configure_logging(level="INFO", stream=stream, output_format="json")
+    log = logging.getLogger("test.redact.round9.negative")
+    log.info(
+        "innocent-extras",
+        extra={
+            # `keyword` -> `keyword`; no `_key` suffix, no secret substring.
+            "keyword": "gdpr",
+            # `Keyword` -> `keyword`; PascalCase normalizes but still safe.
+            "Keyword": "gdpr",
+            # `stakeholder` -> `stakeholder`; safe.
+            "stakeholder": "legal-team",
+            # `Stakeholders` -> `stakeholders`; safe.
+            "Stakeholders": "legal-team",
+        },
+    )
+    line = stream.getvalue().strip().splitlines()[-1]
+    record = json.loads(line)
+    assert record["keyword"] == "gdpr"
+    assert record["Keyword"] == "gdpr"
+    assert record["stakeholder"] == "legal-team"
+    assert record["Stakeholders"] == "legal-team"
 
 
 def test_configure_logging_is_idempotent():

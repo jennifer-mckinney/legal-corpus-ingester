@@ -72,9 +72,35 @@ work without a schema-per-module.
 ## Secret redaction (extras deny-list)
 
 To prevent credentials from leaking into aggregated logs, the JSON formatter
-redacts any `extra=` key whose lower-cased name matches the deny-list or
-contains a sensitive substring. The value in the emitted record becomes the
-literal string `"[REDACTED]"`.
+redacts any `extra=` key whose **normalized** name (camelCase / PascalCase
+split into snake_case, then lowercased) matches the deny-list, contains a
+sensitive substring, or ends with a sensitive suffix. The value in the emitted
+record becomes the literal string `"[REDACTED]"`.
+
+### camelCase / PascalCase normalization (round-9)
+
+Every incoming key name is first normalized to a canonical snake_case form
+before the three redaction checks fire:
+
+| Input             | Normalized form   |
+|-------------------|-------------------|
+| `sessionKey`      | `session_key`     |
+| `MasterKey`       | `master_key`      |
+| `APIKey`          | `api_key`         |
+| `HTTPServer`      | `http_server`     |
+| `SESSION_KEY`     | `session_key`     |
+| `already_snake`   | `already_snake`   |
+| `kebab-case-key`  | `kebab-case-key`  |
+
+This closes the `_key` asymmetry gap. Pre-round-9, `endswith("_key")` required
+the underscore separator, so camelCase names like `sessionKey`, `masterKey`,
+`privateKey`, and `accessKey` bypassed all three checks. With normalization,
+both `access_key` and `accessKey` redact via the same code path.
+
+The `_token` / `_secret` / `_password` families were already caught by the
+substring rule (`token` / `secret` / `password` are on `_REDACT_SUBSTRINGS`),
+so `refreshToken`, `clientSecret`, and `dbPassword` were never at risk; the
+normalizer just makes their behavior symmetric with the `_key` family.
 
 **Redacted (case-insensitive) exact matches:**
 
@@ -116,8 +142,10 @@ terminates in one of the above suffixes. In practice, operational metrics end
 in `_count` / `_size` / `_ms` / `_bytes`, none of which appear above. Note
 that `foreign_key` and `db_key` are now redacted; that is accepted --
 callers who need those debuggability fields should rename them (e.g.
-`foreign_ref`, `db_partition`). No allow-list is added preemptively (YAGNI);
-if a real collision surfaces later, revisit at that time.
+`foreign_ref`, `db_partition`). With round-9 camelCase normalization,
+`foreignKey` (camelCase) also redacts -- same accepted trade-off. No
+allow-list is added preemptively (YAGNI); if a real collision surfaces later,
+revisit at that time.
 
 Fields listed in the "Consistent LogRecord fields" table above are safe: none
 of them match the deny-list or suffix rule. If a new operational field is a
