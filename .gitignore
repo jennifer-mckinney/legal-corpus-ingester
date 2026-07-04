@@ -13,3 +13,18 @@ venv/
 
 # Env
 .env
+
+# Build / coverage
+.coverage
+coverage.xml
+htmlcov/
+out/
+.mypy_cache/
+.ruff_cache/
+
+# State files (runtime, not tracked)
+state/*.json
+!state/.gitkeep
+
+# VCR cassette PII scrub logs
+tests/fixtures/cassettes/*/pii-scrub.log
