@@ -10,3 +10,6 @@ venv/
 
 # OS
 .DS_Store
+
+# Env
+.env
