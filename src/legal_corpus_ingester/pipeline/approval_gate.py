@@ -11,6 +11,9 @@ from legal_corpus_ingester.errors import LegalReviewGateError
 # Number of days before expiry at which a warning is emitted.
 EXPIRY_WARNING_DAYS = 60
 
+# Placeholder SHA256 used in unsigned APPROVAL.yaml templates; ingest is blocked until replaced.
+_PLACEHOLDER_SHA = "0" * 64
+
 
 def load_approval(approval_file: Path) -> dict:  # type: ignore[type-arg]
     """Load and return the raw APPROVAL.yaml dict.
@@ -58,7 +61,14 @@ def check_approval(
         )
 
     # --- SHA256 check ---
-    if data.get("signed_artifact_sha256") != artifact_sha256:
+    stored_sha = data.get("signed_artifact_sha256", "")
+    # Reject the all-zeros placeholder that appears in unsigned APPROVAL.yaml templates.
+    if stored_sha == _PLACEHOLDER_SHA:
+        raise LegalReviewGateError(
+            f"Approval for {source_id!r} is not yet signed: replace the all-zeros "
+            "placeholder SHA256 with the real artifact hash before ingest"
+        )
+    if stored_sha != artifact_sha256:
         raise LegalReviewGateError(
             f"SHA256 mismatch for {source_id}: approval is for a different artifact"
         )

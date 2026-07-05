@@ -82,6 +82,23 @@ def test_gate_blocks_on_invalid_expiry_format(tmp_path: Path) -> None:
         check_approval(approval_file, "sg-sso-terms", VALID_SHA, today=date(2026, 7, 4))
 
 
+def test_check_approval_rejects_placeholder_sha256(tmp_path: Path) -> None:
+    """check_approval raises LegalReviewGateError when signed_artifact_sha256 is the all-zeros placeholder."""
+    from datetime import date, timedelta
+
+    approval = tmp_path / "test.yaml"
+    future = (date.today() + timedelta(days=365)).isoformat()
+    approval.write_text(yaml.dump({
+        "source_id": "test-source",
+        "signed_artifact_sha256": "0" * 64,
+        "expiry": future,
+        "approved_by": "test@example.com",
+        "approved_at": "2026-01-01",
+    }))
+    with pytest.raises(LegalReviewGateError, match="not yet signed"):
+        check_approval(approval, "test-source", "0" * 64)
+
+
 def test_warns_within_60_days(tmp_path: Path) -> None:
     """check_approval emits a UserWarning when expiry is within EXPIRY_WARNING_DAYS."""
     # Expiry 30 days from our 'today'

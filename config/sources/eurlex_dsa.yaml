@@ -1,0 +1,13 @@
+name: eurlex_dsa
+jurisdiction: EU
+base_url: https://eur-lex.europa.eu
+license:
+  spdx: CC-BY-4.0
+  url: https://eur-lex.europa.eu/content/legal-notice/legal-notice.html
+refresh:
+  cadence: weekly
+pipeline:
+  fetcher: fetchers.eurlex.EurLexFetcher
+  celex_id: 32022R2065
+  cleaner: cleaners.xml_akn.AKNXMLCleaner
+  chunker: chunkers.sectioned.SectionedChunker

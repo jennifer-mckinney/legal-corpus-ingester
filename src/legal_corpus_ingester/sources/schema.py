@@ -4,6 +4,11 @@ from typing import Literal
 from urllib.parse import urlparse
 from pydantic import BaseModel, field_validator
 
+# Validates dotted class paths like "module.sub.ClassName"; rejects bare names and empty strings.
+_DOTTED_PATH_RE: re.Pattern[str] = re.compile(
+    r"^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+\.[A-Z][a-zA-Z0-9]+$"
+)
+
 # Extracted from terms-analysis::schemas.py Jurisdiction Literal — keep in sync
 # via scripts/sync_jurisdictions.py (Task 11).
 # "EU" is added here as the ingester-native aggregate code for all EU instruments
@@ -73,6 +78,19 @@ class RefreshConfig(BaseModel):
 class PipelineConfig(BaseModel):
     fetcher: str  # dotted class path, e.g. "fetchers.eurlex.EurLexFetcher"
     celex_id: str | None = None  # CELEX document ID for EUR-Lex fetcher
+    cleaner: str | None = None  # dotted class path for the cleaner, e.g. "cleaners.xml_akn.AKNXMLCleaner"
+    chunker: str | None = None  # dotted class path for the chunker, e.g. "chunkers.sectioned.SectionedChunker"
+
+    @field_validator("fetcher", "cleaner", "chunker")
+    @classmethod
+    def validate_dotted_class_path(cls, v: str | None) -> str | None:
+        # Enforce dotted module.ClassName format to prevent arbitrary string injection
+        # into dynamic class loading (HR1, HR3).
+        if v is not None and not _DOTTED_PATH_RE.fullmatch(v):
+            raise ValueError(
+                f"expected a dotted class path (e.g. 'module.sub.ClassName'), got {v!r}"
+            )
+        return v
 
 
 class SourceConfig(BaseModel):
@@ -82,6 +100,19 @@ class SourceConfig(BaseModel):
     license: LicenseConfig
     refresh: RefreshConfig
     pipeline: PipelineConfig
+
+    @field_validator("base_url")
+    @classmethod
+    def base_url_must_be_https(cls, v: str) -> str:
+        # Enforce HTTPS-only on base_url to prevent SSRF via http:// or file:// URLs (HR4).
+        if not v:
+            return v
+        parsed = urlparse(v)
+        if parsed.scheme not in ("https",):
+            raise ValueError(
+                f"base_url must use https:// scheme, got {parsed.scheme!r}"
+            )
+        return v
 
     @field_validator("name")
     @classmethod
