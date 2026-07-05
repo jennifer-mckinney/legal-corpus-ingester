@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -172,3 +173,129 @@ def test_prune_force_deletes(tmp_path: Path, monkeypatch: object) -> None:
     # At least 4 bundles must remain (the 4-most-recent recency rule)
     remaining = [d for d in out.iterdir() if d.is_dir()]
     assert len(remaining) >= 4
+
+
+# ---------------------------------------------------------------------------
+# validate-round-trip — C1: retrieve returns [None, None] exits 1 (Issue #6)
+# ---------------------------------------------------------------------------
+
+
+def test_cli_validate_round_trip_retrieve_returns_none_list_exits_1(tmp_path: Path, monkeypatch: object) -> None:
+    """retrieve() returning [None, None] should exit 1 (garbage result)."""
+    import types
+
+    # Build a minimal valid bundle directory
+    bundle = tmp_path / "2026.07.001"
+    bundle.mkdir()
+    (bundle / "corpus").mkdir()
+    (bundle / "index").mkdir()
+    (bundle / "provenance").mkdir()
+
+    # MANIFEST.yaml uses corpus_version (not bundle_version) and requires
+    # corpus_version, chunker_version, embedder_model, embedder_revision,
+    # sources, chunk_count — matching the Manifest dataclass exactly.
+    manifest_yaml = (
+        "corpus_version: '2026.07.001'\n"
+        "embedder_model: apertus-8b\n"
+        "embedder_revision: abc123\n"
+        "chunker_version: 1.0.0\n"
+        "chunk_count: 0\n"
+        "sources: []\n"
+    )
+    (bundle / "MANIFEST.yaml").write_text(manifest_yaml, encoding="utf-8")
+
+    # Stub a legal_kb module whose retrieve() returns [None, None]
+    stub_mod = types.ModuleType("backend")
+    stub_app = types.ModuleType("backend.app")
+    stub_services = types.ModuleType("backend.app.services")
+    stub_legal_kb = types.ModuleType("backend.app.services.legal_kb")
+
+    class _KB:
+        def load_from_bundle(self, bundle_dir: Path) -> None:
+            pass
+
+        def retrieve(self, query: str) -> list[object]:
+            return [None, None]
+
+    stub_legal_kb.LegalKnowledgeBase = _KB  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "backend", stub_mod)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "backend.app", stub_app)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "backend.app.services", stub_services)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "backend.app.services.legal_kb", stub_legal_kb)  # type: ignore[attr-defined]
+
+    result = runner.invoke(app, ["validate-round-trip", str(bundle)])
+    assert result.exit_code == 1
+    assert "empty result" in result.output
+
+
+# ---------------------------------------------------------------------------
+# audit-license --offline (Issue #7 / Fix C2)
+# ---------------------------------------------------------------------------
+
+# Minimal valid source config matching the current SourceConfig schema:
+# - name must be lowercase/digits/hyphens/underscores only (no "EUR-Lex")
+# - refresh and pipeline are required fields
+_EURLEX_YAML = (
+    "name: eurlex\n"
+    "jurisdiction: EU\n"
+    "base_url: https://eur-lex.europa.eu/\n"
+    "license:\n"
+    "  spdx: CC-BY-4.0\n"
+    "  url: https://eur-lex.europa.eu/content/legal-notice/legal-notice.html\n"
+    "refresh:\n"
+    "  cadence: weekly\n"
+    "pipeline:\n"
+    "  fetcher: fetchers.eurlex.EurLexFetcher\n"
+)
+
+
+def test_cli_audit_license_offline_reads_baseline(tmp_path: Path) -> None:
+    """--offline flag should read stored baseline and skip live fetch."""
+    import json
+
+    # Set up minimal sources dir with a source that has a license URL
+    sources_dir = tmp_path / "sources"
+    sources_dir.mkdir()
+    (sources_dir / "eurlex.yaml").write_text(_EURLEX_YAML, encoding="utf-8")
+
+    # Pre-populate a state file
+    state_file = tmp_path / "license-hashes.json"
+    state_file.write_text(
+        json.dumps({
+            "eurlex": {
+                "hash": "deadbeef12345678",
+                "spdx": "CC-BY-4.0",
+                "recorded_at": "2026-07-04T00:00:00Z",
+            }
+        }),
+        encoding="utf-8",
+    )
+
+    result = runner.invoke(app, [
+        "audit-license", "eurlex",
+        "--sources-dir", str(sources_dir),
+        "--state-file", str(state_file),
+        "--offline",
+    ])
+    assert result.exit_code == 0
+    assert "BASELINE_ONLY" in result.output
+    assert "deadbeef1234" in result.output
+
+
+def test_cli_audit_license_offline_no_baseline(tmp_path: Path) -> None:
+    """--offline with no stored baseline should exit 0 with NO_BASELINE message."""
+    sources_dir = tmp_path / "sources"
+    sources_dir.mkdir()
+    (sources_dir / "eurlex.yaml").write_text(_EURLEX_YAML, encoding="utf-8")
+
+    state_file = tmp_path / "empty-hashes.json"
+    state_file.write_text("{}", encoding="utf-8")
+
+    result = runner.invoke(app, [
+        "audit-license", "eurlex",
+        "--sources-dir", str(sources_dir),
+        "--state-file", str(state_file),
+        "--offline",
+    ])
+    assert result.exit_code == 0
+    assert "NO_BASELINE" in result.output

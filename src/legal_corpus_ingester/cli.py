@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import shutil
 from pathlib import Path
 
@@ -15,6 +16,9 @@ from legal_corpus_ingester.provenance.license_audit import (
     record_license_baseline,
     DriftStatus,
 )
+
+# Exit codes for refresh — distinguishes "no sources" from real failure
+EXIT_NO_SOURCES: int = 2
 
 # Main app
 app = typer.Typer(
@@ -162,6 +166,35 @@ def fetch(
     typer.echo("(Full fetch pipeline not yet wired — use orchestrator directly.)")
 
 
+@app.command()
+def refresh(
+    all_sources: bool = typer.Option(
+        False,
+        "--all",
+        help="Refresh all configured sources.",
+    ),
+    sources_dir: Path = typer.Option(
+        Path("config/sources"),
+        "--sources-dir",
+        help="Directory containing *.yaml source configs.",
+    ),
+) -> None:
+    """Refresh corpus bundles for all configured sources (or a single source)."""
+    try:
+        registry = load_all(sources_dir)
+    except Exception as exc:
+        typer.echo(f"Error loading sources: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    if not registry:
+        typer.echo("No sources configured; nothing to refresh.")
+        raise typer.Exit(code=EXIT_NO_SOURCES)
+
+    # Full pipeline orchestration not yet wired — placeholder for Phase 1.
+    typer.echo(f"Refreshing {len(registry)} source(s): {', '.join(registry)}")
+    typer.echo("(Full refresh pipeline not yet wired — use orchestrator directly.)")
+
+
 @app.command("audit-license")
 def audit_license(
     source: str = typer.Argument(..., help="Name of the source to audit."),
@@ -179,6 +212,11 @@ def audit_license(
         False,
         "--update-baseline",
         help="Record current hash as new baseline.",
+    ),
+    offline: bool = typer.Option(
+        False,
+        "--offline",
+        help="Skip live fetch; compare stored baseline only (for restricted-egress CI).",
     ),
 ) -> None:
     """Check license drift for a source against the stored baseline."""
@@ -203,6 +241,38 @@ def audit_license(
     # No license URL configured — nothing to audit
     if not license_url:
         typer.echo(f"No license URL configured for {source!r}.")
+        return
+
+    if offline:
+        # --offline: read stored baseline only; skip live fetch.
+        stored: dict[str, object] = {}
+        if state_file.exists():
+            try:
+                stored = json.loads(state_file.read_text(encoding="utf-8"))
+            except Exception as exc:
+                typer.echo(f"Error reading state file {state_file}: {exc}", err=True)
+                raise typer.Exit(code=1)
+        entry = stored.get(source, {})
+        if not entry:
+            typer.echo(f"source     : {source}")
+            typer.echo(f"spdx       : {spdx}")
+            typer.echo("status     : NO_BASELINE -- no stored entry (run without --offline to record)")
+            typer.echo("hash[:12]  : n/a")
+            return
+        # Guard: entry must be a dict; non-dict values indicate state file corruption.
+        if not isinstance(entry, dict):
+            typer.echo(
+                f"Error: state file entry for {source!r} is not a dict (got {type(entry).__name__!r}).",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        entry_dict: dict[str, object] = entry
+        stored_hash = str(entry_dict.get("hash", ""))
+        stored_spdx = str(entry_dict.get("spdx", spdx))
+        typer.echo(f"source     : {source}")
+        typer.echo(f"spdx       : {stored_spdx}")
+        typer.echo("status     : BASELINE_ONLY -- offline mode; stored hash shown")
+        typer.echo(f"hash[:12]  : {stored_hash[:12]}")
         return
 
     # Fetch the license content synchronously
@@ -294,11 +364,13 @@ def validate_round_trip(
         kb = kb_cls()
         kb.load_from_bundle(bundle_dir)
         result = kb.retrieve("test query")
-        if not result:
+        if not result or not any(getattr(r, "text", r) for r in result):
             typer.echo("X-Corpus-Mismatch: terms-analysis retrieve returned empty result")
             raise typer.Exit(code=1)
         typer.echo(f"terms-analysis round-trip: OK ({len(result)} chunks returned)")
-    except ImportError:
+    except ModuleNotFoundError:
+        # ModuleNotFoundError (not ImportError) so module-level errors in a partially-installed
+        # terms-analysis raise through to the broad except below instead of being silenced.
         typer.echo("terms-analysis not installed; skipping consumer round-trip check.")
     except typer.Exit:
         raise

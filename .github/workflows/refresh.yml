@@ -18,7 +18,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Set up Python
         run: python3 --version
@@ -42,8 +42,15 @@ jobs:
       - name: Run refresh
         run: |
           source .venv/bin/activate
-          # Exit 0 on first-run / no-sources-configured to keep the workflow green
-          ingester refresh --all || { echo "Refresh failed or no sources configured"; exit 0; }
+          ingester refresh --all; rc=$?
+          # Exit 2 = no sources configured (fresh install) — not a failure.
+          # Exit 0 = success. Any other code is a real error; propagate it.
+          if [ $rc -eq 2 ]; then
+            echo "No sources configured; skipping refresh."
+          elif [ $rc -ne 0 ]; then
+            echo "ingester refresh failed with exit code $rc" >&2
+            exit $rc
+          fi
 
       - name: Detect bundle change
         id: detect_change
@@ -59,6 +66,11 @@ jobs:
           # Also check for any uncommitted changes in out/ or state/
           git_dirty=$(git status --porcelain out/ state/ 2>/dev/null | wc -l | tr -d ' ')
 
+          # Validate bundle version format (YYYY.M.PATCH) to prevent injection into issue body.
+          if [ -n "$new_target" ] && ! echo "$new_target" | grep -qE '^[0-9]{4}\.[0-9]+\.[0-9]+$'; then
+            echo "Unexpected bundle version format: '$new_target'" >&2
+            exit 1
+          fi
           if [ "$new_target" != "$pre_target" ] || [ "$git_dirty" -gt "0" ]; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "new_target=$new_target" >> "$GITHUB_OUTPUT"
@@ -73,18 +85,27 @@ jobs:
           BUNDLE_VER: ${{ steps.detect_change.outputs.new_target }}
           RUN_ID: ${{ github.run_id }}
           EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          gh issue create \
-            --title "Weekly corpus refresh -- $(date -u +%Y-%m-%d)" \
-            --body "Corpus refreshed to bundle \`${BUNDLE_VER}\`.
+          open_count=$(gh issue list --label "corpus-refresh" --state open --json number --jq 'length') || {
+            echo "Warning: gh issue list failed; creating issue unconditionally." >&2
+            open_count=0
+          }
+          if [ "$open_count" -eq 0 ]; then
+            gh issue create \
+              --title "Weekly corpus refresh -- $(date -u +%Y-%m-%d)" \
+              --body "Corpus refreshed to bundle \`${BUNDLE_VER}\`.
 
   Run \`ingester validate-round-trip out/current\` to verify consumer compatibility before updating the terms-analysis consumer.
 
   Triggered by: ${EVENT_NAME} (run \`${RUN_ID}\`)" \
-            --label "corpus-refresh"
+              --label "corpus-refresh"
+          else
+            echo "Corpus refresh issue already open; skipping duplicate."
+          fi
 
       - name: Upload health report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
         if: always()
         with:
           name: health-report-${{ github.run_id }}

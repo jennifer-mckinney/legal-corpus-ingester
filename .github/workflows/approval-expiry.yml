@@ -12,7 +12,7 @@ jobs:
   approval-expiry:
     runs-on: [self-hosted, legal-corpus-ingester]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Set up Python
         run: python3 --version
@@ -31,19 +31,31 @@ jobs:
       - name: Run approval check
         id: approval_check
         run: |
-          source .venv/bin/activate
+          if [ -f .venv/bin/activate ]; then
+            source .venv/bin/activate
+          fi
           python scripts/check_approvals.py --approvals-dir config/approvals
 
       - name: Open issue on expiry
         if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          gh issue create \
-            --title "Approval expiry alert -- $(date -u +%Y-%m-%d)" \
-            --body "One or more APPROVAL.yaml files have expired or are expiring soon.
+          open_count=$(gh issue list --label "approval-expiry" --state open --json number --jq 'length') || {
+            echo "Warning: gh issue list failed; creating issue unconditionally." >&2
+            open_count=0
+          }
+          if [ "$open_count" -eq 0 ]; then
+            gh issue create \
+              --title "Approval expiry alert -- $(date -u +%Y-%m-%d)" \
+              --body "One or more APPROVAL.yaml files have expired or are expiring soon.
 
   Run 'python scripts/check_approvals.py' to see the full status table.
 
   Expired approvals block ingest for gated sources (HR9). Review each
   affected source, obtain renewed approval, and update the APPROVAL.yaml
   before the next ingester refresh." \
-            --label "approval-expiry"
+              --label "approval-expiry"
+          else
+            echo "Approval expiry issue already open (#${open_count} open); skipping duplicate."
+          fi

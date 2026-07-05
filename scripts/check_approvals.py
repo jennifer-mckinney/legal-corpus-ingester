@@ -11,6 +11,7 @@ Exit 1: one or more approvals are EXPIRED.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from datetime import date
 from pathlib import Path
@@ -109,6 +110,31 @@ def check_approvals_dir(
                     "source_id": source_id,
                     "status": "ERROR",
                     "expiry": f"invalid date: {raw_expiry!r}",
+                    "days_remaining": "-",
+                }
+            )
+            any_expired = True
+            continue
+
+        # HR9: signed_artifact_sha256 must be present, non-empty, and valid hex format.
+        sha256 = str(data.get("signed_artifact_sha256", "")).strip()
+        if not sha256:
+            rows.append(
+                {
+                    "source_id": source_id,
+                    "status": "ERROR",
+                    "expiry": f"sha256-missing (expiry={expiry_date})",
+                    "days_remaining": "-",
+                }
+            )
+            any_expired = True
+            continue
+        if not re.fullmatch(r"[0-9a-f]{64}", sha256):
+            rows.append(
+                {
+                    "source_id": source_id,
+                    "status": "ERROR",
+                    "expiry": f"sha256-invalid-format (expiry={expiry_date})",
                     "days_remaining": "-",
                 }
             )

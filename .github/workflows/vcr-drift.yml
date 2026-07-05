@@ -4,6 +4,10 @@ on:
     - cron: '0 4 * * 0'   # Sunday 4 AM UTC
   workflow_dispatch:        # allow manual trigger for testing
 
+permissions:
+  contents: read
+  issues: write
+
 concurrency:
   group: vcr-drift
   cancel-in-progress: false  # never cancel a drift check mid-run
@@ -12,7 +16,7 @@ jobs:
   drift:
     runs-on: [self-hosted, legal-corpus-ingester]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
       - name: Set up Python
         run: python3 --version
@@ -42,7 +46,7 @@ jobs:
             --output drift-report.md
 
       - name: Upload drift report
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
         if: always()
         with:
           name: vcr-drift-report-${{ github.run_id }}

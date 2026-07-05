@@ -1,0 +1,29 @@
+interactions:
+- request:
+    body: null
+    headers:
+      Accept:
+      - '*/*'
+      User-Agent:
+      - python-httpx/0.27.0
+    method: GET
+    uri: https://eur-lex.europa.eu/content/legal-notice/legal-notice.html
+  response:
+    body:
+      string: "<!DOCTYPE html>\n<html lang=\"en\">\n<head><title>Legal notice - EUR-Lex</title></head>\n<body>\n<h1>Legal
+        notice</h1>\n<p>The European Union owns the copyright of all content on this
+        website. Reproduction is permitted provided the source is acknowledged.</p>\n<p>The
+        texts of European Union acts published in EUR-Lex carry copyright of the European
+        Union. Reproduction of EUR-Lex materials for non-commercial and commercial
+        purposes is subject to the conditions set out in the EUR-Lex legal notice.</p>\n<p>SPDX-License-Identifier:
+        CC-BY-4.0</p>\n</body>\n</html>\n"
+    headers:
+      Content-Type:
+      - text/html; charset=UTF-8
+      X-Content-Type-Options:
+      - nosniff
+    status:
+      code: 200
+      message: OK
+    url: https://eur-lex.europa.eu/content/legal-notice/legal-notice.html
+version: 1
