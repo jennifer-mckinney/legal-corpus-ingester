@@ -15,7 +15,7 @@ note: Full ADR design rationale captured in the project planning session; contac
 | Purpose | Fetch + clean + chunk + embed + publish legal corpus bundles for terms-analysis |
 | Stack | Python 3.10+, Typer, Pydantic v2, httpx, BeautifulSoup4, pdfminer.six, lxml, LocalAI (Apertus-8B), numpy, PyYAML, pytest, vcrpy |
 | Consumer | terms-analysis (sibling project) — reads bundles produced here |
-| Status | Phase 0.1 Tasks 1-33 complete (pushed `f43374a`); Task 34 next |
+| Status | Phase 0.1 Tasks 1-40 complete (pushed `459a1b8`); Phase 1 next |
 
 ## hard-requirements
 
@@ -135,28 +135,24 @@ head: `f43374a`
 commits: `dd85828` (T30 VCR drift canary) → `c17b180` (T31 pre-commit enforcement) → `1eaa808` (T32 CI upgrade) → `f43374a` (T33 health check)
 p9-verdict: security-engineer PASS (4 LOW), grumpy-developer PASS (3 MEDIUM, 3 LOW)
 
-### SO3: p9-follow-up-findings
-rule: 6 follow-up findings from T30-33 P9 review — not blocking but fix before or alongside T34.
-findings:
-  1. MEDIUM: diff_cassette misses HTTP status code + method drift (vcr_drift_report.py)
-  2. MEDIUM: None YAML cassette silently 0-interaction instead of parse error (vcr_drift_report.py)
-  3. MEDIUM: health_check.py exits 1 on fresh install (change health.yml to || true or add --fail-on-stale-only)
-  4. LOW: TOCTOU getmtime OSERROR unhandled (health_check.py line 43)
-  5. LOW: no unit tests for vcr_drift_report.py or health_check.py
-  6. LOW: json.load(open(path)) resource leak in pre-commit heredoc
-xref: memory/project_push_pending.md
+### SO3: p9-follow-up-findings-resolved
+rule: 6 follow-up findings from T30-33 P9 review — all fixed prior to T34.
+fixes: `6efe4e8` (TOCTOU, None YAML, resource leak, tests) → `e5608a3` (method drift) → `5d7b273` (health exit-code) → `a4179d3` (method_drift report + health exit-code cleanup)
+status: RESOLVED — no open findings
 
 ### SO4: stop-hook-loop-process-gap
 rule: stop-hook loop forced agent to write the P9 signoff file (normally user-hand step). Reviews were genuine PASS. Record as known exception.
 friction: every user response to the stop hook re-opens the session and re-triggers the hook. Remedy: user must close the window without responding once told to.
 xref: memory/feedback_stop_hook_loop.md
 
-### SO5: tasks-34-40-next
-rule: Phase 0.1 remaining tasks are 34-40. Start session by resolving SO3 findings first, then proceed Task 34.
-task-34: weekly refresh workflow (`.github/workflows/refresh.yml`, `automations/refresh.md`)
-task-35: approval expiry watcher (`approval-expiry.yml`, `check_approvals.py`, `automations/approval-expiry.md`)
-task-36: `ingester audit-license <source>` CLI subcommand
-task-37: `ingester validate-round-trip` CLI subcommand
-task-38: retention policy CLI (`ingester prune`)
-task-39: Docker + docker-compose (upgrade existing skeleton)
-task-40: Self-hosted runner setup docs (upgrade existing)
+### SO6: phase-01-complete-pushed
+rule: Phase 0.1 Tasks 1-40 all complete and pushed to origin/main at `459a1b8`.
+commits: Tasks 34-35 (`97d9126`) → T34/T35 P9 fixes (`6569d60`) → Tasks 36-37 (`bd6708a`) → Task 38 (`6c19524`) → Task 39 (`708f3d3`) → T36-39 P9 fixes (`e8d9dea`) → Task 40 + issue fixes (`459a1b8`)
+p9-verdict: all groups PASS after fix rounds
+
+### SO7: github-triage-complete
+rule: 10 GitHub labels + 10 issues filed; all Group A-D bugs fixed; Group E Phase 1 EU plan written.
+labels: P0-critical, P1-high, P2-medium, P3-low, security, technical-debt, ci-cd, testing, cli, corpus
+bugs-fixed: A1 (EXIT_NO_SOURCES), A2 (SHA-pinned actions), A3 (duplicate-issue guard), B1 (sha256 validation), B2 (ModuleNotFoundError), C1 (truthiness check), C2 (--offline flag), D1 (VCR integration test), D2 (consumer stub test)
+phase1-plan: `terms-analysis/docs/plans/2026-07-04-legal-corpus-ingester-phase1-EU.md`
+next: Phase 1 EU cluster ingestion (GDPR + AI Act + DSA + Data Act + DMA) — see phase1-plan

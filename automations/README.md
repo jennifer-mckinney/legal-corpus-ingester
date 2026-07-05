@@ -13,11 +13,9 @@ Each file documents: trigger, artifact produced, failure mode, and escalation pa
 | `self-hosted-runner.md` | Setup | GitHub Actions self-hosted runner |
 | `secrets.md` | Configuration | Secrets management |
 | `p9-pre-push.md` | `git push` | P9 security + grumpy pre-push gate |
-
-Additional automations added in Phase 0.1 Tasks 30-35:
-- `health-check.md` — nightly health check
-- `refresh.md` — weekly corpus refresh
-- `vcr-drift.md` — weekly VCR cassette drift canary
-- `approval-expiry.md` — approval expiry watcher
-- `license-drift.md` — license drift audit
-- `publish-handoff.md` — symlink flip + SIGHUP publish handoff
+| `health-check.md` | Cron 3 AM UTC daily | Nightly corpus health check |
+| `refresh.md` | Cron Sun 3 AM UTC | Weekly corpus refresh |
+| `vcr-drift.md` | Cron Sun 4 AM UTC | Weekly VCR cassette drift canary |
+| `approval-expiry.md` | Cron daily | Approval expiry watcher |
+| `license-drift.md` | On demand / CI | License drift audit |
+| `publish-handoff.md` | Post-refresh | Symlink flip + SIGHUP publish handoff |
