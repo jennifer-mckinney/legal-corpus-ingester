@@ -17,8 +17,9 @@ The workflow (`.github/workflows/health.yml`) fires on:
 
 The `health` job runs two checks in order:
 
-1. `ingester status` - calls the CLI's built-in status command. Failures are
-   tolerated (`|| true`) so a partial ingest state does not abort the whole job.
+1. `ingester status` - calls the CLI's built-in status command. It exits 0 on a
+   healthy system (including "No runs recorded."), so it is not masked; a crash
+   fails the job (terms-analysis#90).
 2. `python scripts/health_check.py` - reads `config/sources/*.yaml` to enumerate
    sources, inspects `state/<source>.checkpoint.json` for last-run time and stage,
    and writes a markdown table to `out/health/YYYY-MM-DD.md`.
@@ -53,8 +54,9 @@ python scripts/health_check.py --stale-days 14
 
 ## Failure mode
 
-If `health_check.py` exits 1 (stale source detected), the `Run health check`
-step is marked failed. The artifact upload still runs because it has
+If `health_check.py` exits 1 (stale or never-run source) or 2 (`config/sources/`
+missing, i.e. a broken checkout), the `Run health check` step is marked failed.
+Neither code is masked (terms-analysis#90). The artifact upload still runs because it has
 `if: always()`. No issue is auto-opened - this is a monitoring report, not an
 alerting trigger. Alerting comes from VCR drift canary failures or publish
 pipeline failures, which are separate workflows.

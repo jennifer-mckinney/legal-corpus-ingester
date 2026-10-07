@@ -1,0 +1,57 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.14.3, pytest-9.1.1, pluggy-1.6.0 -- <projects>/legal-corpus-ingester/.venv/bin/python
+rootdir: <repo>
+configfile: pyproject.toml
+plugins: recording-0.13.4, cov-7.1.0, anyio-4.14.1, syrupy-5.4.0
+collecting ... collected 2 items
+
+tests/unit/test_cli_not_wired.py::test_fetch_unwired_exits_nonzero FAILED [ 50%]
+tests/unit/test_cli_not_wired.py::test_refresh_unwired_exits_nonzero FAILED [100%]
+
+=================================== FAILURES ===================================
+_______________________ test_fetch_unwired_exits_nonzero _______________________
+
+    def test_fetch_unwired_exits_nonzero() -> None:
+        # Guard: the source must exist, otherwise a non-zero exit would come from
+        # "Unknown source" and the test would pass for the wrong reason.
+        assert (_SOURCES_DIR / "eurlex_gdpr.yaml").is_file()
+    
+        result = runner.invoke(
+            app, ["fetch", "eurlex_gdpr", "--sources-dir", str(_SOURCES_DIR)]
+        )
+    
+>       assert result.exit_code != 0, (
+            f"unwired fetch reported success (exit 0); stdout={result.stdout!r}"
+        )
+E       AssertionError: unwired fetch reported success (exit 0); stdout="Fetching 'eurlex_gdpr' from https://eur-lex.europa.eu ...\n(Full fetch pipeline not yet wired — use orchestrator directly.)\n"
+E       assert 0 != 0
+E        +  where 0 = <Result okay>.exit_code
+
+tests/unit/test_cli_not_wired.py:37: AssertionError
+______________________ test_refresh_unwired_exits_nonzero ______________________
+
+    def test_refresh_unwired_exits_nonzero() -> None:
+        # Guard: an empty registry exits EXIT_NO_SOURCES, which is a different
+        # (already non-zero) path; make sure configs are present.
+        assert any(_SOURCES_DIR.glob("*.yaml"))
+    
+        result = runner.invoke(
+            app, ["refresh", "--all", "--sources-dir", str(_SOURCES_DIR)]
+        )
+    
+>       assert result.exit_code != 0, (
+            f"unwired refresh reported success (exit 0); stdout={result.stdout!r}"
+        )
+E       AssertionError: unwired refresh reported success (exit 0); stdout='Refreshing 5 source(s): eurlex_ai_act, eurlex_data_act, eurlex_dma, eurlex_dsa, eurlex_gdpr\n(Full refresh pipeline not yet wired — use orchestrator directly.)\n'
+E       assert 0 != 0
+E        +  where 0 = <Result okay>.exit_code
+
+tests/unit/test_cli_not_wired.py:54: AssertionError
+=========================== short test summary info ============================
+FAILED tests/unit/test_cli_not_wired.py::test_fetch_unwired_exits_nonzero - AssertionError: unwired fetch reported success (exit 0); stdout="Fetching 'eurlex_gdpr' from https://eur-lex.europa.eu ...\n(Full fetch pipeline not yet wired — use orchestrator directly.)\n"
+assert 0 != 0
+ +  where 0 = <Result okay>.exit_code
+FAILED tests/unit/test_cli_not_wired.py::test_refresh_unwired_exits_nonzero - AssertionError: unwired refresh reported success (exit 0); stdout='Refreshing 5 source(s): eurlex_ai_act, eurlex_data_act, eurlex_dma, eurlex_dsa, eurlex_gdpr\n(Full refresh pipeline not yet wired — use orchestrator directly.)\n'
+assert 0 != 0
+ +  where 0 = <Result okay>.exit_code
+============================== 2 failed in 0.15s ===============================

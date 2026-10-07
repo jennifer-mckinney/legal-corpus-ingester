@@ -6,6 +6,8 @@ freshness report to out/health/YYYY-MM-DD.md.
 
 Exit 0: all sources are fresh (lag < stale_days).
 Exit 1: one or more sources are stale or have never run.
+Exit 2: the config dir is missing (a broken checkout or wrong working dir, not
+        "nothing to do"; terms-analysis#90).
 """
 from __future__ import annotations
 
@@ -15,6 +17,9 @@ import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+
+# Config dir missing: distinct from 1 (stale sources) so the cause is visible in the exit code.
+EXIT_CONFIG_MISSING: int = 2
 
 
 def _utc_now() -> datetime:
@@ -164,10 +169,11 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(args.out_dir)
     stale_days: int = args.stale_days
 
-    # Handle missing config dir gracefully.
+    # A missing config dir means the checkout is broken, not that there is nothing
+    # to check; fail loudly instead of reporting success (terms-analysis#90).
     if not config_dir.is_dir():
-        print("No sources configured")
-        return 0
+        print(f"Error: config dir {config_dir} does not exist.", file=sys.stderr)
+        return EXIT_CONFIG_MISSING
 
     today = _utc_now().strftime("%Y-%m-%d")
     report, any_problem = build_report(

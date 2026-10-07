@@ -99,10 +99,13 @@ def test_validate_round_trip_valid_bundle(tmp_path: Path) -> None:
     for subdir in ("corpus", "index", "provenance"):
         (bundle / subdir).mkdir()
 
-    result = runner.invoke(app, ["validate-round-trip", str(bundle)])
-    # terms-analysis is not installed in the test env; it should skip gracefully
+    # terms-analysis is not installed in the test env; the structural-only opt-out is
+    # required for exit 0, and the verdict must say the consumer was skipped (terms-analysis#90).
+    result = runner.invoke(
+        app, ["validate-round-trip", str(bundle), "--allow-missing-consumer"]
+    )
     assert result.exit_code == 0, result.output
-    assert "VALID" in result.output
+    assert "VALID (consumer check skipped)" in result.output
 
 
 # ---------------------------------------------------------------------------
