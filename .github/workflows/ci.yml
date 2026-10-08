@@ -29,6 +29,11 @@ jobs:
           source .venv/bin/activate
           pip install -e '.[dev]' 2>&1 | tail -5
 
+      # Install the tracked P9 hooks (core.hooksPath) so the real-checkout gate
+      # test runs against them instead of failing under CI (terms-analysis#175).
+      - name: Install tracked git hooks
+        run: bash scripts/install-hooks.sh
+
       - name: Lint
         run: |
           source .venv/bin/activate
@@ -39,7 +44,38 @@ jobs:
           source .venv/bin/activate
           mypy src/
 
+      # Cross-repo P9 parity (terms-analysis#175, Copilot C3): compare the
+      # shared P9 files with the sibling's branch of the same name when it
+      # exists, else main, at that branch's commit sha (immutable).
+      - name: Resolve sibling ref for P9 hook parity
+        id: p9_sibling
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          resolved="$(bash scripts/ci/p9-sibling-parity.sh resolve-ref jennifer-mckinney/terms-analysis "${HEAD_REF}")"
+          printf '%s\n' "${resolved}" >> "$GITHUB_OUTPUT"
+
+      - name: P9 hook parity with terms-analysis (must run, never skip)
+        env:
+          P9_SIBLING_SHA: ${{ steps.p9_sibling.outputs.sha }}
+        run: |
+          source .venv/bin/activate
+          bash scripts/ci/p9-sibling-parity.sh check tests/unit/test_p9_gate_r5.py::test_p9_shared_files_match_the_sibling_at_the_resolved_sha
+
+      # The jurisdiction sync test reads terms-analysis's schemas.py; under CI
+      # it fails, never skips, when this checkout is missing (r5 F5). It sits
+      # inside the workspace, so ruff and mypy exclude companion/.
+      - name: Check out terms-analysis (companion for the jurisdiction sync test)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          repository: jennifer-mckinney/terms-analysis
+          path: companion/terms-analysis
+          persist-credentials: false
+
       - name: Unit tests
+        env:
+          P9_SIBLING_SHA: ${{ steps.p9_sibling.outputs.sha }}
+          TERMS_ANALYSIS_ROOT: ${{ github.workspace }}/companion/terms-analysis
         run: |
           source .venv/bin/activate
           pytest tests/unit tests/snapshot tests/cli -v --cov=src/legal_corpus_ingester --cov-report=xml --cov-fail-under=0 2>&1 | tail -30
@@ -60,3 +96,11 @@ jobs:
         with:
           name: coverage-report-${{ github.run_id }}
           path: coverage.xml
+
+      # The self-hosted runner reuses this checkout's .git/config across every
+      # workflow, and actions/checkout never resets core.hooksPath. Remove it
+      # however the job ended, so later workflows do not inherit the P9 gate
+      # (grumpy r6 #2).
+      - name: Uninstall tracked git hooks (shared self-hosted checkout)
+        if: always()
+        run: git config --local --unset-all core.hooksPath || true
