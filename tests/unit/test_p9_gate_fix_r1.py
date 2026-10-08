@@ -92,13 +92,13 @@ def in_ci(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true"}
 
 
-@pytest.mark.skipif(
-    in_ci(os.environ.get("CI")),
-    reason="CI checkouts have no local core.hooksPath; this guards developer clones",
-)
 def test_real_checkout_runs_the_tracked_gate() -> None:
     """Fails on a clone where install-hooks.sh was never run, or where
-    core.hooksPath points anywhere other than the tracked .githooks/."""
+    core.hooksPath points anywhere other than the tracked .githooks/.
+
+    Never skipped: under CI a checkout without the gate installed is a
+    failure, so the workflow must run install-hooks.sh before the suite
+    (QUALITY-BAR D, DEV-FUNDAMENTALS F9 and F12, terms-analysis#175 r5)."""
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env["GIT_TERMINAL_PROMPT"] = "0"
 
@@ -118,9 +118,10 @@ def test_real_checkout_runs_the_tracked_gate() -> None:
     toplevel = Path(query("rev-parse", "--show-toplevel")).resolve()
     hooks = Path(query("rev-parse", "--git-path", "hooks"))
     hooks = (hooks if hooks.is_absolute() else toplevel / hooks).resolve()
+    where = "the CI workflow must run" if in_ci(os.environ.get("CI")) else "run"
     assert hooks == toplevel / ".githooks", (
         f"git runs hooks from {hooks}, not the tracked {toplevel / '.githooks'}; "
-        "run `bash scripts/install-hooks.sh` in this checkout"
+        f"{where} `bash scripts/install-hooks.sh` in this checkout"
     )
     assert os.access(hooks / "pre-push", os.X_OK), ".githooks/pre-push is not executable"
 

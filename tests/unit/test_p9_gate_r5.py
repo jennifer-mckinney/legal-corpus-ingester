@@ -25,8 +25,9 @@ Contract pinned here (the Coder implements it; nothing here constrains how):
   "timed out"; an oversized advertisement refuses with a message saying
   it is too large. Any other value of either variable (0, negative, not a
   plain decimal integer) refuses and names the variable; empty means unset.
-- F4 many refs: 60,000 advertised refs (above Linux's 2 MiB and macOS's
-  1 MiB ARG_MAX once expanded onto argv) with a legitimate push PASS.
+- F4 many refs: 60,000 advertised refs at 60,000 distinct commits this clone
+  has (above Linux's 2 MiB and macOS's 1 MiB ARG_MAX once expanded onto
+  argv, and immune to dedupe) with a legitimate push PASS.
 - Grumpy MEDIUM honest message: when the remote advertises commits this
   clone has not fetched, the refusal says to run `git fetch <remote>` and
   never claims range.base is "not on" the remote.
@@ -554,12 +555,46 @@ def test_empty_limit_override_means_the_default(installed: Sandbox, hook: Hook, 
 MANY = 60_000
 
 
+def _import_many(sb: Sandbox, git_dir: Path, target: str) -> list[str]:
+    """MANY distinct commits, each a child of target, written by one
+    `git fast-import` into git_dir. Fixed dates make the ids identical in
+    every repository the same stream is imported into."""
+    stream = "".join(
+        f"commit refs/p9-many\nmark :{i + 1}\n"
+        f"committer P9 <p9@example.invalid> 1700000000 +0000\n"
+        f"data {len(f'pull {i:06d}')}\npull {i:06d}\nfrom {target}\n\n"
+        for i in range(MANY)
+    )
+    marks = sb.root / f"{git_dir.name}.marks"
+    root = Path(sb.env["P9_SANDBOX_ROOT"])
+    assert git_dir.resolve() == root or root in git_dir.resolve().parents
+    proc = subprocess.run(
+        ["git", "--git-dir", str(git_dir), "fast-import", "--quiet", "--force", f"--export-marks={marks}"],
+        cwd=sb.root,
+        env=sb.env,
+        input=stream,
+        capture_output=True,
+        text=True,
+        timeout=240,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    _git(sb.root, sb.env, "--git-dir", str(git_dir), "update-ref", "-d", "refs/p9-many")
+    return [line.split()[1] for line in marks.read_text().splitlines()]
+
+
 def _many_refs(sb: Sandbox, target: str) -> None:
-    lines = [f"{target} refs/pull/{i:06d}/head\n" for i in range(MANY)]
+    """The remote advertises MANY refs at MANY distinct commits that this
+    clone also has, so the hook's dedupe cannot shrink the exclusion list:
+    every one of them reaches `git rev-list`, and argv could not hold them."""
+    local = _import_many(sb, Path(_git(sb.main, sb.env, "rev-parse", "--absolute-git-dir")), target)
+    remote = _import_many(sb, sb.remote, target)
+    assert local == remote and len(set(remote)) == MANY
+    lines = [f"{sha} refs/pull/{i:06d}/head\n" for i, sha in enumerate(remote)]
     packed = sb.remote / "packed-refs"
     packed.write_text("# pack-refs with: peeled fully-peeled sorted \n" + "".join(lines))
-    count = _git(sb.root, sb.env, "--git-dir", str(sb.remote), "for-each-ref", "--format=x", "refs/pull")
-    assert len(count.splitlines()) == MANY
+    listed = _git(sb.root, sb.env, "--git-dir", str(sb.remote), "for-each-ref", "--format=%(objectname)", "refs/pull")
+    assert len(set(listed.splitlines())) == MANY
 
 
 def test_many_advertised_refs_tip_only_push_passes(installed: Sandbox) -> None:
