@@ -378,7 +378,13 @@ def test_display_path_truncation_never_splits_an_escape(mod: ModuleType, ch: str
 # the load-failure and empty-dir wording, so it ends at an explicit marker).
 _BLOCK_END = "# End of the byte-identical block (terms-analysis#173)."
 # Shared helpers that must live inside the locked block, once per script.
-_SHARED_DEFS = ("def scan_yaml_dir(", "def _load_failure(", "def _empty_dir_problem(")
+_SHARED_DEFS = (
+    "def scan_yaml_dir(",
+    "def _load_failure(",
+    "def _empty_dir_problem(",
+    "class _NoAliasLoader(",
+    "def _load_yaml(",
+)
 
 
 def test_folded_block_is_byte_identical_in_both_scripts() -> None:
@@ -686,6 +692,7 @@ def test_plain_yaml_alias_in_a_source_config_is_rejected(tmp_path: Path) -> None
     (cfg / "noalias.yaml").write_text('base: "x"\nsource_id: s\ncopy: "x"\n')
     rc, _out, err = _run_bounded(cfg, tmp_path)
     lines = err.splitlines()
-    assert any("plainalias.yaml" in line and "not valid YAML" in line for line in lines), err[-2000:]
+    # The docstring promises the "(line N)" suffix; the alias sits on line 3 of the file.
+    assert any("plainalias.yaml" in line and "not valid YAML (line 3)" in line for line in lines), err[-2000:]
     assert not any("noalias.yaml" in line for line in lines), err[-2000:]
     assert rc == _EXIT_CONFIG, err[-2000:]

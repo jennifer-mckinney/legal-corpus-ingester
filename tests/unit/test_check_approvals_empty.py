@@ -614,7 +614,11 @@ def test_plain_yaml_alias_is_rejected_at_load(tmp_path: Path) -> None:
     (approvals / "noalias.yaml").write_text('base: "x"\n' + _VALID_APPROVAL + 'copy: "x"\n')
     rc, out, err = _run_bounded(["--sources-dir", str(sources), "--approvals-dir", str(approvals)])
     rows = out.splitlines()
-    assert any(r.startswith("| plainalias | ERROR | not valid YAML") for r in rows), out[-2000:]
+    # The docstring promises the "(line N)" suffix: the alias is the file's last line.
+    alias_line = ('base: &a "x"\n' + _VALID_APPROVAL + "copy: *a\n").count("\n")
+    assert any(
+        r.startswith(f"| plainalias | ERROR | not valid YAML (line {alias_line})") for r in rows
+    ), out[-2000:]
     assert not any(r.startswith("| noalias | ERROR") for r in rows), out[-2000:]
     assert rc == _EXIT_EXPIRED_OR_INVALID, err[-2000:]
 
