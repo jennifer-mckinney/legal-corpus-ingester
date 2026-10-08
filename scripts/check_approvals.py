@@ -73,25 +73,28 @@ def display_path(path: Path | str) -> str:
     (``\\xNN``, ``\\uNNNN``, or ``\\UNNNNNNNN`` above U+FFFF) and a literal
     backslash becomes ``\\\\``, so each escape reads one way only. The result is
     one line with no terminal control, no bidi reordering and nothing that fails
-    to encode. Output is capped.
+    to encode. Output is capped, cut only between whole escapes.
     """
     out: list[str] = []
+    used = 0
     for ch in str(path):
         code = ord(ch)
         if ch == "\\":
-            out.append("\\\\")
+            token = "\\\\"
         elif unicodedata.category(ch) not in _ESCAPED_CATEGORIES:
-            out.append(ch)
+            token = ch
         elif code <= 0xFF:
-            out.append(f"\\x{code:02x}")
+            token = f"\\x{code:02x}"
         elif code <= 0xFFFF:
-            out.append(f"\\u{code:04x}")
+            token = f"\\u{code:04x}"
         else:
-            out.append(f"\\U{code:08x}")
-    text = "".join(out)
-    if len(text) > _MAX_DISPLAY_CHARS:
-        text = text[:_MAX_DISPLAY_CHARS] + "...(truncated)"
-    return text
+            token = f"\\U{code:08x}"
+        # Cut only between whole escapes, so the output never ends inside a partial one.
+        if used + len(token) > _MAX_DISPLAY_CHARS:
+            return "".join(out) + "...(truncated)"
+        out.append(token)
+        used += len(token)
+    return "".join(out)
 
 
 def table_cell(value: object) -> str:
