@@ -6,6 +6,9 @@ on:
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
+defaults:
+  run:
+    shell: bash -eo pipefail {0}
 jobs:
   test:
     runs-on: [self-hosted, legal-corpus-ingester]

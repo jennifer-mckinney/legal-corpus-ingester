@@ -1,71 +1,272 @@
 #!/usr/bin/env bash
-# P9 pre-push gate - LIB-PRINCIPLES P9 enforcement
-# Refuses push unless a signed reviewer-log exists for HEAD.
+# P9 pre-push gate - LIB-PRINCIPLES P9 enforcement (terms-analysis#175).
+#
+# Enforced contract (automations/p9-pre-push.md, "Enforced contract", carries
+# this exact text; a test fails if they drift):
+#   - Each pushed ref tip needs <git-common-dir>/reviews/<sha>.signoff.json
+#     whose head_sha is that commit, with security_engineer and
+#     grumpy_developer both verdict PASS and, for each, an explicit findings == []
+#     (key required; zero tolerance for both roles, any severity).
+#   - Every commit that is new to the remote must lie inside the reviewed
+#     range: range.base (a commit the remote already has) .. tip. Without
+#     range.base the reviewed range is the tip alone, so a push that carries
+#     an unreviewed intermediate commit along is refused.
+#   - A complete override (used: true + reason + authorized_by) replaces the
+#     verdict, findings and range checks, and is announced on stderr.
+#   - Deletions need no signoff. A push with nothing to send exits 0.
+#
+# Canonical file: byte-identical in terms-analysis and legal-corpus-ingester,
+# pinned by .githooks/pre-push.sha256 in each repo. Edit both, then re-pin.
+#
+# Scope: this is a local guard against honest mistakes, not a security
+# boundary. It is bypassed by `git push --no-verify`, by overriding
+# core.hooksPath, or by a hand-written signoff. Server-side branch protection
+# on main is the enforcing control; see automations/p9-pre-push.md.
 set -euo pipefail
+# An exported CDPATH makes `cd <relative>` search elsewhere and echo the
+# result, which would corrupt the resolved paths below.
+unset CDPATH
 
-REPO_ROOT="$(git rev-parse --show-toplevel)"
-HEAD_SHA="$(git rev-parse HEAD)"
-SIGNOFF_DIR="${REPO_ROOT}/.git/reviews"
-SIGNOFF="${SIGNOFF_DIR}/${HEAD_SHA}.signoff.json"
+# Git passes `<remote-name> <remote-url>` as arguments and one line per ref on
+# stdin: `<local_ref> <local_sha> <remote_ref> <remote_sha>`. The gate checks
+# the pushed shas, never HEAD: HEAD's signoff says nothing about other refs.
+REMOTE_NAME="${1:-remote}"
 
-if [ ! -f "${SIGNOFF}" ]; then
-    cat >&2 <<EOF
-P9 pre-push gate: signoff not found for HEAD ${HEAD_SHA:0:12}
+# Signoffs live in the repository's COMMON git dir. In a linked worktree `.git`
+# is a file, so `<toplevel>/.git/reviews` never exists there; the common dir is
+# the same `<main>/.git` from every checkout. rev-parse may print it relative
+# to the cwd, so resolve it to an absolute, symlink-free path.
+GIT_COMMON_DIR_RAW="$(git rev-parse --git-common-dir)"
+GIT_COMMON_DIR="$(cd -- "${GIT_COMMON_DIR_RAW}" && pwd -P)"
+SIGNOFF_DIR="${GIT_COMMON_DIR}/reviews"
 
-Expected signoff: ${SIGNOFF#${REPO_ROOT}/}
+# Validates one signoff file against one commit sha. On success it exits 0 and
+# prints exactly one line, `OK <override 0|1> <range.base or ->`; the shell
+# requires that line, so a crash or a silent exit never reads as a pass. Any
+# problem exits 1 with the reasons on stderr. Python runs isolated (-I) so a
+# json.py in the checkout cannot be imported, and the path and sha arrive via
+# argv, never interpolated into the source.
+VALIDATOR='
+import json
+import re
+import sys
+
+path, sha = sys.argv[1], sys.argv[2]
+short = sha[:12]
+OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def nonblank(value):
+    return isinstance(value, str) and value.strip() != ""
+
+
+def refuse(problems):
+    print(f"P9 pre-push gate: signoff invalid for {short}", file=sys.stderr)
+    for problem in problems:
+        print(f"  {problem}", file=sys.stderr)
+    sys.exit(1)
+
+
+try:
+    with open(path, encoding="utf-8") as fh:
+        doc = json.load(fh)
+except Exception as exc:
+    print(f"P9 pre-push gate: signoff not valid JSON for {short}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(doc, dict):
+    refuse(["signoff must be a JSON object"])
+
+problems = []
+recorded = doc.get("head_sha")
+if recorded != sha:
+    problems.append(f"head_sha mismatch: {recorded!r} != {sha!r}")
+
+override = doc.get("override")
+override_used = False
+if override is not None:
+    if not isinstance(override, dict):
+        problems.append("override must be an object")
+    else:
+        used = override.get("used", False)
+        if not isinstance(used, bool):
+            problems.append(f"override.used must be true or false, got {used!r}")
+        elif used:
+            override_used = True
+            if not nonblank(override.get("reason")):
+                problems.append("override.reason must be a non-empty string")
+            if not nonblank(override.get("authorized_by")):
+                problems.append("override.authorized_by must be a non-empty string")
+
+base = "-"
+if not override_used:
+    for role in ("security_engineer", "grumpy_developer"):
+        section = doc.get(role)
+        if not isinstance(section, dict):
+            problems.append(f"{role} verdict: missing ({role} must be an object)")
+            continue
+        verdict = section.get("verdict")
+        if verdict != "PASS":
+            problems.append(f"{role} verdict: {verdict}")
+        else:
+            # Zero tolerance for both roles: a PASS states findings == [] explicitly.
+            # An absent key is refused: it cannot be told from "never recorded".
+            findings = section.get("findings", "<missing>")
+            if not isinstance(findings, list) or findings:
+                problems.append(f"{role} findings must be [] for PASS, got {findings!r}")
+    review_range = doc.get("range")
+    if review_range is not None:
+        if not isinstance(review_range, dict):
+            problems.append("range must be an object")
+        elif "base" in review_range:
+            value = review_range["base"]
+            if isinstance(value, str) and OBJECT_ID.fullmatch(value):
+                base = value
+            else:
+                problems.append(f"range.base must be a 40- or 64-hex commit sha, got {value!r}")
+
+if problems:
+    refuse(problems)
+
+if override_used:
+    reason = override["reason"].strip()
+    who = override["authorized_by"].strip()
+    print(f"P9 OVERRIDE ACTIVE: {reason} (authorized by {who})", file=sys.stderr)
+print(f"OK {int(override_used)} {base}")
+'
+
+SHA_RE='^([0-9a-f]{40}|[0-9a-f]{64})$'
+ZERO_RE='^(0{40}|0{64})$'
+VERDICT_RE='^OK ([01]) (-|[0-9a-f]{40}|[0-9a-f]{64})$'
+# A remote name used as a --remotes pattern must hold no glob characters, or it
+# could match other remotes' refs and count their commits as published.
+REMOTE_NAME_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+
+# What the remote is known to have: its remote-tracking refs plus the
+# remote_sha values git read from the remote for this push, passed after
+# `git rev-list ... --not`. A missing tracking ref only makes more commits
+# count as new, which refuses; it never lets an unreviewed commit through.
+PUBLISHED=()
+if [[ "${REMOTE_NAME}" =~ ${REMOTE_NAME_RE} ]]; then
+    PUBLISHED+=("--remotes=${REMOTE_NAME}")
+fi
+
+# check_range <ref> <commit> <base>: returns 0 only if every commit new to the
+# remote lies in the reviewed range base..commit (base "-": the tip alone).
+check_range() {
+    local ref="$1" commit="$2" base="$3" new count base_commit unpublished
+    if [ "${base}" = "-" ]; then
+        if ! new="$(git rev-list "${commit}" --not ${PUBLISHED[@]+"${PUBLISHED[@]}"})"; then
+            echo "P9 pre-push gate: refusing ${ref}: cannot list the commits new to ${REMOTE_NAME}" >&2
+            return 1
+        fi
+        if [ -z "${new}" ] || [ "${new}" = "${commit}" ]; then
+            return 0
+        fi
+        count="$(printf '%s\n' "${new}" | wc -l | tr -d ' ')"
+        cat >&2 <<EOF
+P9 pre-push gate: refusing ${ref}: ${count} commits are new to ${REMOTE_NAME}, but the
+signoff for ${commit:0:12} has no range.base, so it covers only the tip.
+Set range.base to the commit the review started from (one ${REMOTE_NAME}
+already has, such as the merge-base with main), after the reviewers have
+read every commit in base..${commit:0:12}.
+EOF
+        return 1
+    fi
+    if ! base_commit="$(git rev-parse --verify -q "${base}^{commit}")"; then
+        echo "P9 pre-push gate: refusing ${ref}: range.base ${base:0:12} is not a commit in this repository" >&2
+        return 1
+    fi
+    if ! git merge-base --is-ancestor "${base_commit}" "${commit}"; then
+        echo "P9 pre-push gate: refusing ${ref}: range.base ${base:0:12} is not an ancestor of ${commit:0:12}" >&2
+        return 1
+    fi
+    if ! unpublished="$(git rev-list -n 1 "${base_commit}" --not ${PUBLISHED[@]+"${PUBLISHED[@]}"})"; then
+        echo "P9 pre-push gate: refusing ${ref}: cannot check whether range.base is on ${REMOTE_NAME}" >&2
+        return 1
+    fi
+    if [ -n "${unpublished}" ]; then
+        echo "P9 pre-push gate: refusing ${ref}: range.base ${base:0:12} is not on ${REMOTE_NAME}, so commits below it would be published unreviewed" >&2
+        return 1
+    fi
+    return 0
+}
+
+# check_ref <local_ref> <local_sha>: returns 0 only if the pushed commit is
+# signed off. Every failure path prints why and returns 1.
+check_ref() {
+    local ref="$1" sha="$2" commit signoff verdict override base
+    if ! [[ "${sha}" =~ ${SHA_RE} ]]; then
+        echo "P9 pre-push gate: refusing ${ref}: '${sha}' is not an object id" >&2
+        return 1
+    fi
+    # Annotated tags arrive as tag-object ids; review is recorded per commit.
+    if ! commit="$(git rev-parse --verify -q "${sha}^{commit}")"; then
+        echo "P9 pre-push gate: refusing ${ref}: ${sha:0:12} does not resolve to a commit" >&2
+        return 1
+    fi
+    signoff="${SIGNOFF_DIR}/${commit}.signoff.json"
+    if [ ! -f "${signoff}" ]; then
+        cat >&2 <<EOF
+P9 pre-push gate: signoff not found for ${ref} at ${commit:0:12}
+
+Expected signoff: ${signoff}
 
 To satisfy P9: ask Claude to dispatch security-engineer + grumpy-developer
-review, then write the signoff. Example prompt:
-    "run p9 review on HEAD and write signoff"
+review of ${commit:0:12}, then write the signoff. Example prompt:
+    "run p9 review on ${commit:0:12} and write signoff"
 
 Emergency override (records who + why): write a signoff with
-override.used = true. See automations/p9-pre-push.md for schema.
+override.used = true plus a non-empty override.reason and
+override.authorized_by. See automations/p9-pre-push.md for the schema.
 EOF
-    exit 1
+        return 1
+    fi
+    if ! verdict="$(python3 -I -c "${VALIDATOR}" "${signoff}" "${commit}")"; then
+        echo "  signoff file: ${signoff}" >&2
+        return 1
+    fi
+    if ! [[ "${verdict}" =~ ${VERDICT_RE} ]]; then
+        echo "P9 pre-push gate: refusing ${ref}: the signoff validator gave no verdict" >&2
+        echo "  signoff file: ${signoff}" >&2
+        return 1
+    fi
+    override="${BASH_REMATCH[1]}"
+    base="${BASH_REMATCH[2]}"
+    if [ "${override}" = "0" ] && ! check_range "${ref}" "${commit}" "${base}"; then
+        echo "  signoff file: ${signoff}" >&2
+        return 1
+    fi
+    echo "P9 pre-push gate: signoff OK for ${ref} at ${commit:0:12}"
+}
+
+# Read every line first: the remote_sha values on all lines tell the range
+# check what the remote already has.
+REF_LINES=()
+while read -r local_ref local_sha remote_ref remote_sha; do
+    REF_LINES+=("${local_ref} ${local_sha} ${remote_ref}")
+    if [[ "${remote_sha}" =~ ${SHA_RE} ]] && ! [[ "${remote_sha}" =~ ${ZERO_RE} ]] \
+        && known="$(git rev-parse --verify -q "${remote_sha}^{commit}")"; then
+        PUBLISHED+=("${known}")
+    fi
+done
+
+# Git runs the hook with no lines when every ref is already up to date. Nothing
+# can leave the machine then, so there is nothing to review: say so, exit 0.
+if [ "${#REF_LINES[@]}" -eq 0 ]; then
+    echo "P9 pre-push gate: nothing to push to ${REMOTE_NAME} (no refs received); nothing to review"
+    exit 0
 fi
 
-# Validate signoff shape
-if ! python3 -c "
-import json, sys
-d = json.load(open(sys.argv[1]))
-assert d['head_sha'] == sys.argv[2], f'head_sha mismatch: {d[\"head_sha\"]} != {sys.argv[2]}'
-override = d.get('override', {}).get('used', False)
-sec_pass = d.get('security_engineer', {}).get('verdict') == 'PASS'
-gru_pass = d.get('grumpy_developer', {}).get('verdict') == 'PASS'
-if not override:
-    assert sec_pass, 'security_engineer.verdict != PASS'
-    assert gru_pass, 'grumpy_developer.verdict != PASS'
-" "${SIGNOFF}" "${HEAD_SHA}" 2>/dev/null; then
-    python3 -c "
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-except Exception as e:
-    print(f'P9 pre-push gate: signoff not valid JSON for HEAD {sys.argv[2][:12]}: {e}', file=sys.stderr)
-    sys.exit(0)
-print(f'P9 pre-push gate: signoff invalid for HEAD {sys.argv[2][:12]}', file=sys.stderr)
-if d.get('head_sha') != sys.argv[2]:
-    print(f'  head_sha mismatch: {d.get(\"head_sha\")}', file=sys.stderr)
-override = d.get('override', {}).get('used', False)
-if not override:
-    if d.get('security_engineer', {}).get('verdict') != 'PASS':
-        print(f'  security_engineer verdict: {d.get(\"security_engineer\", {}).get(\"verdict\")}', file=sys.stderr)
-    if d.get('grumpy_developer', {}).get('verdict') != 'PASS':
-        print(f'  grumpy_developer verdict: {d.get(\"grumpy_developer\", {}).get(\"verdict\")}', file=sys.stderr)
-" "${SIGNOFF}" "${HEAD_SHA}"
-    exit 1
-fi
+status=0
+for line in "${REF_LINES[@]}"; do
+    read -r local_ref local_sha remote_ref <<<"${line}"
+    # A deletion pushes no commits, so there is nothing to review.
+    if [[ "${local_sha}" =~ ${ZERO_RE} ]]; then
+        echo "P9 pre-push gate: deleting ${remote_ref} on ${REMOTE_NAME}; no signoff needed"
+        continue
+    fi
+    check_ref "${local_ref}" "${local_sha}" || status=1
+done
 
-# Announce override if active
-python3 -c "
-import json, sys
-d = json.load(open(sys.argv[1]))
-o = d.get('override', {})
-if o.get('used'):
-    reason = o.get('reason', '(no reason)')
-    who = o.get('authorized_by', '(unknown)')
-    print(f'P9 OVERRIDE ACTIVE: {reason} (authorized by {who})', file=sys.stderr)
-" "${SIGNOFF}"
-
-echo "P9 pre-push gate: signoff OK for ${HEAD_SHA:0:12}"
-exit 0
+exit "${status}"
