@@ -79,7 +79,7 @@ resolve_ref() {
 
 check() {
     local node="$1" out summary
-    if out="$("${PYTHON:-python}" -m pytest "${node}" -q -p no:cacheprovider 2>&1)"; then
+    if out="$("${PYTHON:-python}" -m pytest "${node}" -q -p no:cacheprovider --color=no 2>&1)"; then
         printf '%s\n' "${out}"
     else
         printf '%s\n' "${out}"
