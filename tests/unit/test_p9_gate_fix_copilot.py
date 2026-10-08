@@ -483,7 +483,9 @@ def test_parity_script_rejects_bad_arguments(
 def _fake_python(tmp_path: Path, summary: str, code: int) -> tuple[Path, Path]:
     log = tmp_path / "python.argv"
     fake = tmp_path / "python-fake"
-    fake.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{log}"\nprintf "....\\n{summary}\\n"\nexit {code}\n')
+    # `%` doubled: the summary is a printf format in the fake (coverage lines contain `100%`).
+    body = summary.replace("%", "%%")
+    fake.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{log}"\nprintf "....\\n{body}\\n"\nexit {code}\n')
     fake.chmod(0o755)
     return fake, log
 
@@ -494,6 +496,37 @@ def _fake_python(tmp_path: Path, summary: str, code: int) -> tuple[Path, Path]:
         pytest.param("1 passed in 0.10s", 0, 0, id="passed"),
         pytest.param("1 passed, 2 warnings in 0.10s", 0, 0, id="passed-with-warnings"),
         pytest.param("1 passed, 1 warning in 0.10s", 0, 0, id="passed-with-warning"),
+        # The default banner pytest prints (no -q effect on it): the guard must read the
+        # summary, not demand a bare line (CI defect on PR #11).
+        pytest.param("=== 1 passed in 1.21s ===", 0, 0, id="banner-passed"),
+        pytest.param("=" * 30 + " 1 passed in 1.21s " + "=" * 31, 0, 0, id="banner-passed-wide"),
+        pytest.param("=== 1 passed, 1 warning in 0.5s ===", 0, 0, id="banner-passed-with-warning"),
+        pytest.param("=== 1 passed in 61.02s (0:01:01) ===", 0, 0, id="banner-passed-long-run"),
+        pytest.param(
+            "---------- coverage: platform linux, python 3.12 ----------\n"
+            "TOTAL   10   0   100%\n"
+            "Required test coverage of 90% reached. Total coverage: 100.00%\n"
+            "=== 1 passed in 1.21s ===",
+            0, 0, id="coverage-plugin-before-summary",
+        ),
+        pytest.param(
+            "=== 1 passed in 1.21s ===\nCoverage XML written to file coverage.xml",
+            0, 0, id="coverage-plugin-after-summary",
+        ),
+        pytest.param("=== 1 skipped in 0.10s ===", 0, 1, id="banner-skipped"),
+        pytest.param("=== 1 passed, 1 skipped in 0.10s ===", 0, 1, id="banner-passed-and-skipped"),
+        pytest.param("=== 0 passed in 0.10s ===", 0, 1, id="banner-zero-passed"),
+        pytest.param("=== no tests ran in 0.10s ===", 5, 1, id="banner-no-tests"),
+        pytest.param("=== 1 failed in 0.10s ===", 1, 1, id="banner-failed"),
+        pytest.param("=== 1 failed, 1 passed in 0.10s ===", 0, 1, id="banner-failed-and-passed"),
+        pytest.param("=== 1 passed, 1 error in 0.10s ===", 0, 1, id="banner-passed-and-error"),
+        pytest.param("=== 11 passed in 0.10s ===", 0, 1, id="banner-eleven-passed"),
+        pytest.param("=== 1 passed in 0.10s ===", 1, 1, id="banner-passed-nonzero-exit"),
+        # "1 passed" only in an earlier line; the real summary says otherwise.
+        pytest.param("1 passed in 0.10s\n=== 2 failed in 0.10s ===", 0, 1, id="earlier-passed-final-failed"),
+        pytest.param("1 passed in 0.10s\n=== 1 skipped in 0.10s ===", 0, 1, id="earlier-passed-final-skipped"),
+        pytest.param("1 passed in 0.10s\n=== no tests ran in 0.10s ===", 0, 1, id="earlier-passed-final-no-tests"),
+        pytest.param("=== 1 skipped in 0.10s ===\nnote: 1 passed in 0.10s", 0, 1, id="skipped-with-passed-in-prose"),
         pytest.param("1 skipped in 0.10s", 0, 1, id="skipped"),
         pytest.param("1 skipped, 2 warnings in 0.10s", 0, 1, id="skipped-with-warnings"),
         pytest.param("2 passed in 0.10s", 0, 1, id="two-passed"),
