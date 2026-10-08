@@ -3,9 +3,11 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import typer.main
 from typer.testing import CliRunner
 
 from legal_corpus_ingester.cli import app
+from tests.cli.helpers import strip_ansi
 
 runner = CliRunner()
 
@@ -47,7 +49,13 @@ def test_status_no_checkpoints(tmp_path: object, monkeypatch: object) -> None:  
 def test_fetch_dry_run_help() -> None:
     result = runner.invoke(app, ["fetch", "--help"])
     assert result.exit_code == 0
-    assert "dry-run" in result.output.lower() or "dry_run" in result.output.lower()
+    # Assert on the registered parameters, not the help text: the fetch
+    # docstring mentions --dry-run, so a text check passes without the option.
+    commands = getattr(typer.main.get_command(app), "commands", {})
+    assert "fetch" in commands, f"no fetch command: {sorted(commands)}"
+    fetch = commands["fetch"]
+    options = {opt for param in fetch.params for opt in getattr(param, "opts", [])}
+    assert "--dry-run" in options, f"fetch has no --dry-run option: {sorted(options)}"
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +129,9 @@ def test_prune_help() -> None:
     """prune --help exits 0 and mentions expected flags."""
     result = runner.invoke(app, ["prune", "--help"])
     assert result.exit_code == 0
-    assert "dry-run" in result.output or "force" in result.output
+    out = strip_ansi(result.output)
+    assert "--dry-run" in out
+    assert "--force" in out
 
 
 def test_prune_no_flags_prints_guidance(tmp_path: Path, monkeypatch: object) -> None:
