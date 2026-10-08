@@ -13,7 +13,11 @@
 #     an unreviewed intermediate commit along is refused.
 #   - What the remote already has is read from its live advertisement for
 #     the push URL (git ls-remote), never from local remote-tracking refs.
-#     If the advertisement cannot be read or parsed, the push is refused.
+#     If url.*.insteadOf would send that read to another URL, or the
+#     advertisement cannot be read within P9_ADVERT_TIMEOUT_SECONDS and
+#     P9_ADVERT_MAX_BYTES, or cannot be parsed, the push is refused.
+#   - Text that comes from the remote or from a signoff file is printed
+#     with control and format characters escaped, on one line, cut short.
 #   - A complete override (used: true + reason + authorized_by) replaces the
 #     verdict, findings and range checks, and is announced on stderr.
 #   - Deletions need no signoff. A push with nothing to send exits 0.
@@ -29,6 +33,13 @@ set -euo pipefail
 # An exported CDPATH makes `cd <relative>` search elsewhere and echo the
 # result, which would corrupt the resolved paths below.
 unset CDPATH
+
+# Configuration: the limits on reading the remote's advertisement. These
+# defaults are the only place the values live. Setting the variable of the
+# same name without _DEFAULT in the environment changes one for a push; see
+# limit() below for what it accepts.
+P9_ADVERT_TIMEOUT_SECONDS_DEFAULT=30
+P9_ADVERT_MAX_BYTES_DEFAULT=16777216
 
 # Git passes `<remote-name> <remote-url>` as arguments and one line per ref on
 # stdin: `<local_ref> <local_sha> <remote_ref> <remote_sha>`. The gate checks
@@ -46,128 +57,283 @@ GIT_COMMON_DIR_RAW="$(git rev-parse --git-common-dir)"
 GIT_COMMON_DIR="$(cd -- "${GIT_COMMON_DIR_RAW}" && pwd -P)"
 SIGNOFF_DIR="${GIT_COMMON_DIR}/reviews"
 
-# Validates one signoff file against one commit sha. On success it exits 0 and
-# prints exactly one line, `OK <override 0|1> <range.base or ->`; the shell
-# requires that line, so a crash or a silent exit never reads as a pass. Any
-# problem exits 1 with the reasons on stderr. Python runs isolated (-I) so a
-# json.py in the checkout cannot be imported, and the path and sha arrive via
-# argv, never interpolated into the source.
-VALIDATOR='
+# Every piece of untrusted text the hook reads (the signoff file, the remote's
+# advertisement) is handled by this one Python program, and printed only
+# through its safe(). It runs isolated (-I) so a json.py in the checkout
+# cannot be imported, and every input arrives via argv, never interpolated
+# into the source. Modes:
+#   signoff <path> <sha>: validates one signoff against one commit. On success
+#     it prints exactly one line, `OK <override 0|1> <range.base or ->`.
+#   advert <name> <url> <timeout> <max-bytes>: reads `git ls-remote -- <url>`
+#     within the limits, parses it, and resolves the advertised ids with one
+#     `git cat-file --batch-check`. On success it prints `^<commit>` for each
+#     advertised commit this clone has, then `OK <commits> <unresolved>`,
+#     where <unresolved> counts advertised ids that are not commits here.
+# The shell requires the final OK line, so a crash or a silent exit never
+# reads as a pass. Any problem exits 1 with the reasons on stderr.
+P9_PY='
 import json
+import os
 import re
+import selectors
+import subprocess
 import sys
+import time
 
-path, sha = sys.argv[1], sys.argv[2]
-short = sha[:12]
 OBJECT_ID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+# One `git ls-remote` line: `<object id><TAB><ref name>`; a ref name has no
+# whitespace or control bytes.
+ADVERT_LINE = re.compile(rb"([0-9a-f]{40}|[0-9a-f]{64})\t[^\x00-\x20\x7f]+")
+# One `git cat-file --batch-check` answer for `<id>^{commit}`.
+FOUND = re.compile(r"([0-9a-f]{40}|[0-9a-f]{64}) commit")
+ABSENT = re.compile(r"([0-9a-f]{40}|[0-9a-f]{64})\^\{commit\} missing")
+# Untrusted text is shown at most this many characters long, after escaping.
+SHOWN = 120
+
+
+def safe(value):
+    """Untrusted text as one line of printable ASCII: every character outside
+    space..tilde is written as a Python escape, and the result is cut short."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "backslashreplace")
+    text = value if isinstance(value, str) else repr(value)
+    shown = "".join(
+        ch if " " <= ch <= "~" else ch.encode("unicode_escape").decode("ascii") for ch in text
+    )
+    if len(shown) > SHOWN:
+        shown = f"{shown[:SHOWN]}... ({len(text)} characters)"
+    return shown
 
 
 def nonblank(value):
     return isinstance(value, str) and value.strip() != ""
 
 
-def refuse(problems):
-    print(f"P9 pre-push gate: signoff invalid for {short}", file=sys.stderr)
-    for problem in problems:
-        print(f"  {problem}", file=sys.stderr)
+def fail(*lines):
+    for line in lines:
+        print(line, file=sys.stderr)
     sys.exit(1)
 
 
-try:
-    with open(path, encoding="utf-8") as fh:
-        doc = json.load(fh)
-except Exception as exc:
-    print(f"P9 pre-push gate: signoff not valid JSON for {short}: {exc}", file=sys.stderr)
-    sys.exit(1)
+def check_signoff(path, sha):
+    short = sha[:12]
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except Exception as exc:
+        fail(f"P9 pre-push gate: signoff not valid JSON for {short}: {safe(str(exc))}")
+    if not isinstance(doc, dict):
+        fail(f"P9 pre-push gate: signoff invalid for {short}", "  signoff must be a JSON object")
+    problems = []
+    recorded = doc.get("head_sha")
+    if recorded != sha:
+        problems.append(f"head_sha mismatch: {safe(repr(recorded))} != {sha!r}")
 
-if not isinstance(doc, dict):
-    refuse(["signoff must be a JSON object"])
-
-problems = []
-recorded = doc.get("head_sha")
-if recorded != sha:
-    problems.append(f"head_sha mismatch: {recorded!r} != {sha!r}")
-
-override = doc.get("override")
-override_used = False
-if override is not None:
-    if not isinstance(override, dict):
-        problems.append("override must be an object")
-    else:
-        used = override.get("used", False)
-        if not isinstance(used, bool):
-            problems.append(f"override.used must be true or false, got {used!r}")
-        elif used:
-            override_used = True
-            if not nonblank(override.get("reason")):
-                problems.append("override.reason must be a non-empty string")
-            if not nonblank(override.get("authorized_by")):
-                problems.append("override.authorized_by must be a non-empty string")
-
-base = "-"
-if not override_used:
-    for role in ("security_engineer", "grumpy_developer"):
-        section = doc.get(role)
-        if not isinstance(section, dict):
-            problems.append(f"{role} verdict: missing ({role} must be an object)")
-            continue
-        verdict = section.get("verdict")
-        if verdict != "PASS":
-            problems.append(f"{role} verdict: {verdict}")
+    override = doc.get("override")
+    override_used = False
+    if override is not None:
+        if not isinstance(override, dict):
+            problems.append("override must be an object")
         else:
-            # Zero tolerance for both roles: a PASS states findings == [] explicitly.
-            # An absent key is refused: it cannot be told from "never recorded".
-            findings = section.get("findings", "<missing>")
-            if not isinstance(findings, list) or findings:
-                problems.append(f"{role} findings must be [] for PASS, got {findings!r}")
-    review_range = doc.get("range")
-    if review_range is not None:
-        if not isinstance(review_range, dict):
-            problems.append("range must be an object")
-        elif "base" in review_range:
-            value = review_range["base"]
-            if isinstance(value, str) and OBJECT_ID.fullmatch(value):
-                base = value
+            used = override.get("used", False)
+            if not isinstance(used, bool):
+                problems.append(f"override.used must be true or false, got {safe(repr(used))}")
+            elif used:
+                override_used = True
+                if not nonblank(override.get("reason")):
+                    problems.append("override.reason must be a non-empty string")
+                if not nonblank(override.get("authorized_by")):
+                    problems.append("override.authorized_by must be a non-empty string")
+
+    base = "-"
+    if not override_used:
+        for role in ("security_engineer", "grumpy_developer"):
+            section = doc.get(role)
+            if not isinstance(section, dict):
+                problems.append(f"{role} verdict: missing ({role} must be an object)")
+                continue
+            verdict = section.get("verdict")
+            if verdict != "PASS":
+                problems.append(f"{role} verdict: {safe(verdict)}")
             else:
-                problems.append(f"range.base must be a 40- or 64-hex commit sha, got {value!r}")
+                # Zero tolerance for both roles: a PASS states findings == [] explicitly.
+                # An absent key is refused: it cannot be told from "never recorded".
+                findings = section.get("findings", "<missing>")
+                if not isinstance(findings, list) or findings:
+                    problems.append(f"{role} findings must be [] for PASS, got {safe(repr(findings))}")
+        review_range = doc.get("range")
+        if review_range is not None:
+            if not isinstance(review_range, dict):
+                problems.append("range must be an object")
+            elif "base" in review_range:
+                value = review_range["base"]
+                if isinstance(value, str) and OBJECT_ID.fullmatch(value):
+                    base = value
+                else:
+                    problems.append(f"range.base must be a 40- or 64-hex commit sha, got {safe(repr(value))}")
 
-if problems:
-    refuse(problems)
+    if problems:
+        fail(f"P9 pre-push gate: signoff invalid for {short}", *(f"  {p}" for p in problems))
 
-if override_used:
-    reason = override["reason"].strip()
-    who = override["authorized_by"].strip()
-    print(f"P9 OVERRIDE ACTIVE: {reason} (authorized by {who})", file=sys.stderr)
-print(f"OK {int(override_used)} {base}")
+    if override_used:
+        reason = safe(override["reason"].strip())
+        who = safe(override["authorized_by"].strip())
+        print(f"P9 OVERRIDE ACTIVE: {reason} (authorized by {who})", file=sys.stderr)
+    print(f"OK {int(override_used)} {base}")
+
+
+def run_ls_remote(url, timeout, max_bytes, cannot_read):
+    """The stdout of `git ls-remote -- <url>`, read within the limits."""
+    proc = subprocess.Popen(
+        ["git", "ls-remote", "--", url],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    out, err = bytearray(), bytearray()
+    deadline = time.monotonic() + timeout
+    problem = None
+    with selectors.DefaultSelector() as sel:
+        sel.register(proc.stdout, selectors.EVENT_READ, out)
+        sel.register(proc.stderr, selectors.EVENT_READ, err)
+        try:
+            while sel.get_map() and problem is None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    problem = "timeout"
+                    break
+                for key, _events in sel.select(left):
+                    chunk = os.read(key.fd, 65536)
+                    if not chunk:
+                        sel.unregister(key.fileobj)
+                        continue
+                    key.data.extend(chunk)
+                    del err[: -4 * SHOWN]
+                    if len(out) > max_bytes:
+                        problem = "size"
+                        break
+            if problem is None:
+                try:
+                    proc.wait(timeout=max(deadline - time.monotonic(), 0))
+                except subprocess.TimeoutExpired:
+                    problem = "timeout"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+    if problem == "timeout":
+        fail(
+            f"{cannot_read}: git ls-remote timed out after {timeout}s (P9_ADVERT_TIMEOUT_SECONDS).",
+            "  If git was waiting for credentials, set up a credential helper, or raise",
+            "  P9_ADVERT_TIMEOUT_SECONDS for this push.",
+        )
+    if problem == "size":
+        fail(f"{cannot_read}: the advertisement is larger than {max_bytes} bytes (P9_ADVERT_MAX_BYTES)")
+    if proc.returncode != 0:
+        said = bytes(err).strip().splitlines()
+        fail(
+            f"{cannot_read} (git ls-remote failed), so what it already has is unknown",
+            *([f"  git said: {safe(said[-1])}"] if said else []),
+        )
+    return bytes(out)
+
+
+def read_advert(name, url, timeout, max_bytes):
+    who = safe(name)
+    listing = run_ls_remote(url, int(timeout), int(max_bytes), f"P9 pre-push gate: cannot read the refs {who} advertises")
+    ids = []
+    # An empty listing is a remote with no refs: everything pushed is new.
+    listing = listing.rstrip(b"\n")
+    for line in listing.split(b"\n") if listing else []:
+        match = ADVERT_LINE.fullmatch(line)
+        if match is None:
+            fail(f"P9 pre-push gate: cannot parse the refs {who} advertises: unexpected line {safe(line)!r}")
+        ids.append(match.group(1).decode("ascii"))
+    ids = list(dict.fromkeys(ids))
+    commits, unresolved = [], 0
+    if ids:
+        # One process for every id; stderr only repeats the "missing" answers.
+        proc = subprocess.run(
+            ["git", "cat-file", "--batch-check=%(objectname) %(objecttype)"],
+            input="".join(f"{i}^{{commit}}\n" for i in ids).encode("ascii"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        if proc.returncode != 0:
+            fail(f"P9 pre-push gate: cannot resolve the commits {who} advertises (git cat-file failed)")
+        answers = proc.stdout.decode("utf-8", "backslashreplace").rstrip("\n").split("\n")
+        for answer in answers:
+            found = FOUND.fullmatch(answer)
+            if found is not None:
+                commits.append(found.group(1))
+            elif ABSENT.fullmatch(answer) is not None:
+                unresolved += 1
+            else:
+                fail(f"P9 pre-push gate: cannot resolve the commits {who} advertises: unexpected answer {safe(answer)!r}")
+        if len(answers) != len(ids):
+            fail(f"P9 pre-push gate: cannot resolve the commits {who} advertises: {len(answers)} answers for {len(ids)} refs")
+    commits = list(dict.fromkeys(commits))
+    for commit in commits:
+        print(f"^{commit}")
+    print(f"OK {len(commits)} {unresolved}")
+
+
+MODES = {"signoff": check_signoff, "advert": read_advert}
+MODES[sys.argv[1]](*sys.argv[2:])
 '
 
 SHA_RE='^([0-9a-f]{40}|[0-9a-f]{64})$'
 ZERO_RE='^(0{40}|0{64})$'
 VERDICT_RE='^OK ([01]) (-|[0-9a-f]{40}|[0-9a-f]{64})$'
-# One `git ls-remote` line: `<object id><TAB><ref name>`.
-ADVERT_RE=$'^([0-9a-f]{40}|[0-9a-f]{64})\t[^[:space:]]+$'
-# One `git cat-file --batch-check` answer for `<id>^{commit}`.
-FOUND_RE='^([0-9a-f]{40}|[0-9a-f]{64}) commit$'
-ABSENT_RE='^([0-9a-f]{40}|[0-9a-f]{64})\^\{commit\} missing$'
+ADVERTISED_RE='^OK ([0-9]+) ([0-9]+)$'
+# A limit is a whole number from 1 to 999999999: no value switches it off.
+LIMIT_RE='^[1-9][0-9]{0,8}$'
+
+# limit <NAME>: prints the limit NAME from the environment, or
+# NAME_DEFAULT when it is unset or empty. Any other value refuses the push,
+# and the value itself is never echoed.
+limit() {
+    local name="$1" default value
+    default="${name}_DEFAULT"
+    value="${!name:-}"
+    if [ -z "${value}" ]; then
+        echo "${!default}"
+        return 0
+    fi
+    if ! [[ "${value}" =~ ${LIMIT_RE} ]]; then
+        echo "P9 pre-push gate: ${name} must be unset, empty or a whole number from 1 to 999999999; it is set to something else, so the push is refused" >&2
+        return 1
+    fi
+    echo "${value}"
+}
+
+# The limits are checked before anything else, so a bad value is reported
+# even for a push that would not have needed them.
+ADVERT_TIMEOUT="$(limit P9_ADVERT_TIMEOUT_SECONDS)" || exit 1
+ADVERT_MAX_BYTES="$(limit P9_ADVERT_MAX_BYTES)" || exit 1
 
 # What the remote already has: the commits its CURRENT advertisement for the
-# push URL points at, passed after `git rev-list ... --not`. Local
+# push URL points at, fed to `git rev-list --stdin` as `^<commit>` lines (on
+# stdin, because tens of thousands of refs overflow argv). Local
 # refs/remotes/* are never consulted: they go stale after a server-side delete
 # or when the remote's URL is changed, and would vouch for history the
 # destination does not hold (Copilot C1). The advertisement is read once, on
 # first need, so deletions, overrides and empty pushes never contact the
 # remote. PUBLISHED_STATE is unread, ok or failed; failed is sticky.
-PUBLISHED=()
+# UNRESOLVED counts advertised ids that are not commits in this clone.
+EXCLUDE=""
+UNRESOLVED=0
 PUBLISHED_STATE=unread
 
-# load_published: returns 0 only once PUBLISHED holds the advertised commits.
+# load_published: returns 0 only once EXCLUDE holds the advertised commits.
 # Every failure prints why and returns 1, and the caller refuses the ref.
 # An advertised id that is not a commit here (an object this clone never
 # fetched, or a ref to a blob or tree) is left out without fetching it.
 # Leaving an id out can only make more commits count as new, which refuses;
-# it never lets an unreviewed commit through.
+# it never lets an unreviewed commit through. Refusals then say so and
+# suggest `git fetch` (see fetch_note).
 load_published() {
-    local listing line answers count=0 ids=()
+    local read_url reply summary
     case "${PUBLISHED_STATE}" in
         ok) return 0 ;;
         failed) return 1 ;;
@@ -177,53 +343,50 @@ load_published() {
         echo "P9 pre-push gate: cannot read what ${REMOTE_NAME} has: git gave the hook no push URL" >&2
         return 1
     fi
-    if ! listing="$(git ls-remote -- "${REMOTE_URL}" </dev/null)"; then
-        echo "P9 pre-push gate: cannot read the refs ${REMOTE_NAME} advertises (git ls-remote failed), so what it already has is unknown" >&2
+    # Git hands the hook the push URL after pushInsteadOf, but ls-remote is a
+    # read, and git applies url.<base>.insteadOf to it again. If that sends the
+    # read elsewhere, the advertisement would describe another repository.
+    if ! read_url="$(git ls-remote --get-url -- "${REMOTE_URL}" </dev/null)"; then
+        echo "P9 pre-push gate: cannot read what ${REMOTE_NAME} has: git cannot resolve the URL it would read from" >&2
         return 1
     fi
-    # An empty listing is a remote with no refs: everything pushed is new.
-    if [ -n "${listing}" ]; then
-        while IFS= read -r line; do
-            if ! [[ "${line}" =~ ${ADVERT_RE} ]]; then
-                echo "P9 pre-push gate: cannot parse the refs ${REMOTE_NAME} advertises: unexpected line '${line}'" >&2
-                return 1
-            fi
-            ids+=("${BASH_REMATCH[1]}")
-        done <<<"${listing}"
-        # One process for every id; stderr only repeats the "missing" answers.
-        if ! answers="$(printf '%s^{commit}\n' "${ids[@]}" \
-            | git cat-file --batch-check='%(objectname) %(objecttype)' 2>/dev/null)"; then
-            echo "P9 pre-push gate: cannot resolve the commits ${REMOTE_NAME} advertises (git cat-file failed)" >&2
-            return 1
-        fi
-        while IFS= read -r line; do
-            count=$((count + 1))
-            if [[ "${line}" =~ ${FOUND_RE} ]]; then
-                PUBLISHED+=("${BASH_REMATCH[1]}")
-            elif ! [[ "${line}" =~ ${ABSENT_RE} ]]; then
-                echo "P9 pre-push gate: cannot resolve the commits ${REMOTE_NAME} advertises: unexpected answer '${line}'" >&2
-                return 1
-            fi
-        done <<<"${answers}"
-        if [ "${count}" -ne "${#ids[@]}" ]; then
-            echo "P9 pre-push gate: cannot resolve the commits ${REMOTE_NAME} advertises: ${count} answers for ${#ids[@]} refs" >&2
-            return 1
-        fi
+    if [ "${read_url}" != "${REMOTE_URL}" ]; then
+        echo "P9 pre-push gate: cannot read what ${REMOTE_NAME} has: url.*.insteadOf sends reads of its push URL to another URL, so the advertisement would not describe the push destination" >&2
+        return 1
     fi
+    if ! reply="$(python3 -I -c "${P9_PY}" advert "${REMOTE_NAME}" "${REMOTE_URL}" "${ADVERT_TIMEOUT}" "${ADVERT_MAX_BYTES}")"; then
+        return 1
+    fi
+    summary="${reply##*$'\n'}"
+    if ! [[ "${summary}" =~ ${ADVERTISED_RE} ]]; then
+        echo "P9 pre-push gate: cannot resolve the commits ${REMOTE_NAME} advertises: the reader gave no verdict" >&2
+        return 1
+    fi
+    UNRESOLVED="${BASH_REMATCH[2]}"
+    EXCLUDE="${reply%"${summary}"}"
     PUBLISHED_STATE=ok
     return 0
+}
+
+# fetch_note: when the remote advertised ids this clone cannot resolve, a
+# refusal may come from them rather than from the review. Say so, and say how
+# to fix it.
+fetch_note() {
+    if [ "${UNRESOLVED}" -gt 0 ]; then
+        echo "  note: ${REMOTE_NAME} advertises ${UNRESOLVED} objects that are not commits in this clone (usually commits it has not fetched); run 'git fetch ${REMOTE_NAME}' and push again" >&2
+    fi
 }
 
 # check_range <ref> <commit> <base>: returns 0 only if every commit new to the
 # remote lies in the reviewed range base..commit (base "-": the tip alone).
 check_range() {
-    local ref="$1" commit="$2" base="$3" new count base_commit unpublished
+    local ref="$1" commit="$2" base="$3" new count base_commit unpublished where
     if ! load_published; then
         echo "P9 pre-push gate: refusing ${ref}: cannot establish which commits are new to ${REMOTE_NAME}" >&2
         return 1
     fi
     if [ "${base}" = "-" ]; then
-        if ! new="$(git rev-list "${commit}" --not ${PUBLISHED[@]+"${PUBLISHED[@]}"})"; then
+        if ! new="$(printf '%s' "${EXCLUDE}" | git rev-list --stdin "${commit}")"; then
             echo "P9 pre-push gate: refusing ${ref}: cannot list the commits new to ${REMOTE_NAME}" >&2
             return 1
         fi
@@ -231,13 +394,18 @@ check_range() {
             return 0
         fi
         count="$(printf '%s\n' "${new}" | wc -l | tr -d ' ')"
+        where="new to"
+        if [ "${UNRESOLVED}" -gt 0 ]; then
+            where="not known to be on"
+        fi
         cat >&2 <<EOF
-P9 pre-push gate: refusing ${ref}: ${count} commits are new to ${REMOTE_NAME}, but the
+P9 pre-push gate: refusing ${ref}: ${count} commits are ${where} ${REMOTE_NAME}, but the
 signoff for ${commit:0:12} has no range.base, so it covers only the tip.
 Set range.base to the commit the review started from (one ${REMOTE_NAME}
 already has, such as the merge-base with main), after the reviewers have
 read every commit in base..${commit:0:12}.
 EOF
+        fetch_note
         return 1
     fi
     if ! base_commit="$(git rev-parse --verify -q "${base}^{commit}")"; then
@@ -248,12 +416,17 @@ EOF
         echo "P9 pre-push gate: refusing ${ref}: range.base ${base:0:12} is not an ancestor of ${commit:0:12}" >&2
         return 1
     fi
-    if ! unpublished="$(git rev-list -n 1 "${base_commit}" --not ${PUBLISHED[@]+"${PUBLISHED[@]}"})"; then
+    if ! unpublished="$(printf '%s' "${EXCLUDE}" | git rev-list -n 1 --stdin "${base_commit}")"; then
         echo "P9 pre-push gate: refusing ${ref}: cannot check whether range.base is on ${REMOTE_NAME}" >&2
         return 1
     fi
     if [ -n "${unpublished}" ]; then
-        echo "P9 pre-push gate: refusing ${ref}: range.base ${base:0:12} is not on ${REMOTE_NAME}, so commits below it would be published unreviewed" >&2
+        if [ "${UNRESOLVED}" -gt 0 ]; then
+            echo "P9 pre-push gate: refusing ${ref}: range.base ${base:0:12} is not provably on ${REMOTE_NAME}, so commits below it might be published unreviewed" >&2
+            fetch_note
+        else
+            echo "P9 pre-push gate: refusing ${ref}: range.base ${base:0:12} is not on ${REMOTE_NAME}, so commits below it would be published unreviewed" >&2
+        fi
         return 1
     fi
     return 0
@@ -289,7 +462,7 @@ override.authorized_by. See automations/p9-pre-push.md for the schema.
 EOF
         return 1
     fi
-    if ! verdict="$(python3 -I -c "${VALIDATOR}" "${signoff}" "${commit}")"; then
+    if ! verdict="$(python3 -I -c "${P9_PY}" signoff "${signoff}" "${commit}")"; then
         echo "  signoff file: ${signoff}" >&2
         return 1
     fi

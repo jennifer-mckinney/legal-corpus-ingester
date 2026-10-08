@@ -32,7 +32,11 @@ two drift apart.
     an unreviewed intermediate commit along is refused.
   - What the remote already has is read from its live advertisement for
     the push URL (git ls-remote), never from local remote-tracking refs.
-    If the advertisement cannot be read or parsed, the push is refused.
+    If url.*.insteadOf would send that read to another URL, or the
+    advertisement cannot be read within P9_ADVERT_TIMEOUT_SECONDS and
+    P9_ADVERT_MAX_BYTES, or cannot be parsed, the push is refused.
+  - Text that comes from the remote or from a signoff file is printed
+    with control and format characters escaped, on one line, cut short.
   - A complete override (used: true + reason + authorized_by) replaces the
     verdict, findings and range checks, and is announced on stderr.
   - Deletions need no signoff. A push with nothing to send exits 0.
@@ -68,6 +72,11 @@ let any other branch, sha or `--all` push through).
 6. The signoff is validated by `python3 -I` (so a `json.py` in the checkout
    cannot replace the parser). The validator must print an explicit
    `OK ...` line; a missing `python3`, a crash or a silent exit refuses.
+   Every value it quotes from the file (a verdict, `override.reason`,
+   `override.authorized_by`, a bad `range.base`) is printed through one
+   function that escapes control, format and non-ASCII characters and cuts
+   the text short, so a signoff cannot paint a fake PASS, move the cursor
+   or forge an extra line on the terminal.
    It requires:
    - the file is a JSON object and `head_sha` equals the pushed commit;
    - either a complete override (see "Override path"), or
@@ -82,20 +91,39 @@ let any other branch, sha or `--all` push through).
    reads what the destination has from its live advertisement,
    `git ls-remote -- <push-url>` (the URL git passes as the hook's second
    argument), once per push. The commits new to the remote are
-   `git rev-list <tip> --not <advertised commits>`. Local
+   `git rev-list --stdin <tip>`, with `^<advertised commit>` lines on
+   stdin, so a remote with tens of thousands of refs does not overflow the
+   command line. Local
    `refs/remotes/*` are never consulted: they go stale after a
    server-side delete or a `git remote set-url`, and would vouch for
    history the destination does not hold. The remote's name is only
    printed, so a name with `/` or glob characters, or a push straight to
    a URL, is judged the same way.
-   - If `ls-remote` fails, prints a line that is not `<id><TAB><ref>`,
-     or the advertised ids cannot be resolved, the ref is refused with
-     `cannot establish which commits are new to <remote>`.
+   - Git applies `pushInsteadOf` to the URL it hands the hook, but a read
+     of that URL is rewritten again by `url.<base>.insteadOf`. If
+     `git ls-remote --get-url -- <push-url>` is not the push URL itself,
+     the read would describe another repository (for example a mirror
+     that still holds history the destination does not), so the ref is
+     refused with a message naming `url.*.insteadOf`.
+   - The read is bounded. `P9_ADVERT_TIMEOUT_SECONDS` limits how long
+     `ls-remote` may take, and `P9_ADVERT_MAX_BYTES` how much it may
+     print; the defaults are set once, at the top of the hook. Either
+     variable, when set and not empty, must be a positive whole number,
+     or every push is refused with a message naming it: no value
+     switches a limit off. A read that times out, or prints more
+     than the cap, is killed and the ref refused.
+   - If `ls-remote` fails, times out, prints too much, prints a line that
+     is not `<id><TAB><ref>`, or the advertised ids cannot be resolved,
+     the ref is refused with `cannot establish which commits are new to
+     <remote>`. An unparseable line is shown escaped and cut short, never
+     raw.
    - An advertised id that is not a commit in this clone (never fetched,
      or a ref to a blob or tree) is left out, and nothing is fetched.
      That can only make more commits count as new, which refuses; it
-     never lets an unreviewed commit through. Run `git fetch` and push
-     again if the refusal names commits the remote already has.
+     never lets an unreviewed commit through. When that happens the
+     refusal says the commits are "not known to be on" the remote (or
+     that range.base is "not provably on" it) and adds a note telling you
+     to run `git fetch <remote>` and push again.
    - Without `range.base`, the tip must be the only new commit (or there
      are none). Otherwise the push is refused with
      `<n> commits are new to <remote>, but the signoff ... has no
@@ -226,9 +254,11 @@ Any pushed ref with no signoff, invalid JSON, a `head_sha` that differs
 from the pushed sha, a non-PASS verdict, a PASS with findings, a malformed
 `range`, an unreviewed new commit, a `range.base` that is not an ancestor
 or not on the remote, an object that is not a commit, a missing
-`python3`, a remote advertisement that cannot be read or parsed, or an
-incomplete override: the push is refused, the hook exits
-1, and a diagnostic naming the ref and the signoff path goes to stderr.
+`python3`, a push URL that `url.*.insteadOf` would read from elsewhere,
+a remote advertisement that cannot be read in time, is too large or
+cannot be parsed, a limit variable with an unusable value, or an
+incomplete override: the push is refused, the hook exits 1, and a
+diagnostic naming the reason goes to stderr.
 
 ## Limits and server-side enforcement
 
@@ -247,7 +277,9 @@ advertisement at push time. A branch deleted on the server, or a remote
 whose URL was changed, no longer vouches for its old history, so that
 history must be covered by the review range again. The hook contacts
 the push URL a second time for this; a remote that needs credentials may
-ask for them again.
+ask for them again. That second read counts against
+`P9_ADVERT_TIMEOUT_SECONDS`, so typing a password slowly can time it
+out: use a credential helper, or raise the limit for that push.
 
 The enforcing control is server-side. `main` is branch-protected on
 GitHub in both terms-analysis and legal-corpus-ingester (PR required,
@@ -302,28 +334,36 @@ refs; it prints "nothing to push" and exits 0.
 
 ## Cross-repo parity in CI
 
-The hook must stay byte-identical in terms-analysis and
-legal-corpus-ingester. Each repo's CI runs
-`test_pre_push_hook_matches_the_sibling_repos_published_hook`, which
-fetches the sibling's `.githooks/pre-push` from GitHub and compares
-sha256 digests. It fails closed when the fetch fails, and CI ignores the
+Three P9 artifacts must stay the same in terms-analysis and
+legal-corpus-ingester: `.githooks/pre-push`,
+`scripts/ci/p9-sibling-parity.sh` (both byte-identical) and the shared
+block of this document, between the `p9-shared` markers. Each repo's CI
+runs `test_p9_shared_files_match_the_sibling_at_the_resolved_sha`, which
+fetches the sibling's copies from GitHub at one commit sha and compares
+sha256 digests. It fails closed when a fetch fails, and CI ignores the
 local opt-out `P9_SKIP_SIBLING_PARITY=1`. A dedicated CI step runs it
 alone and fails unless the summary is exactly `1 passed`, so a skip is
 red.
 
-The sibling ref is `P9_SIBLING_REF`. CI sets it to the PR's head branch
-(`github.head_ref`) when the sibling repo has a branch of that name, and
-to `main` otherwise (pushes to `main`, and PRs that do not touch the
-hook). If CI cannot ask GitHub whether that branch exists, the step
-fails.
+The CI step "Resolve sibling ref for P9 hook parity" runs
+`p9-sibling-parity.sh resolve-ref`, which prints `ref=<branch>` and
+`sha=<commit>`. The branch is the PR's head branch (`github.head_ref`)
+when the sibling repo has a branch of that name, and `main` otherwise
+(pushes to `main`, and PRs that do not touch the shared files). The
+parity test reads the sha from `P9_SIBLING_SHA` and fetches the files at
+that sha, which cannot change, rather than at the branch name, which a
+CDN may serve stale for minutes after the branch moves. If CI cannot ask
+GitHub, the branch has no commit, or `P9_SIBLING_SHA` is missing, the
+step fails. Run locally without `P9_SIBLING_SHA`, the test resolves the
+sha itself, from `P9_SIBLING_REF` or `main`.
 
-Bootstrap order for a hook change: push the same hook on a branch with
-the same name in both repos, then open both PRs. Each PR's parity step is
-red until the sibling branch carries the identical hook, and green once
-both do. Merge the two PRs back to back. Between the two merges, the
-first-merged repo's `main` build compares against the sibling's `main`,
-which still has the old hook, and is red; re-run it after the second
-merge.
+Bootstrap order for a change to a shared file: push the same change on a
+branch with the same name in both repos, then open both PRs. Each PR's
+parity step is red until the sibling branch carries the identical files,
+and green once both do. Merge the two PRs back to back. Between the two
+merges, the first-merged repo's `main` build compares against the
+sibling's `main`, which still has the old files, and is red; re-run it
+after the second merge.
 
 <!-- p9-shared:end -->
 

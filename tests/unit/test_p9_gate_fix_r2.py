@@ -46,7 +46,7 @@ from tests.unit.test_p9_prepush_gate import (  # noqa: F401
 
 # Shared pin: the same constant appears in the sibling repo's copy of this
 # test, so a one-sided edit of the shared doc section fails that repo's suite.
-CANONICAL_P9_DOC_SHA256 = "0cbb696f5477c458cbc4ad003d234c799bb00ef102ee616c051cc0ca24e837f3"
+CANONICAL_P9_DOC_SHA256 = "a2dc001b853c3a1dcf15f74bb0bcb16337623186f532d68c6619723a494cd33c"
 SHARED_BEGIN = "<!-- p9-shared:begin -->"
 SHARED_END = "<!-- p9-shared:end -->"
 
@@ -382,6 +382,33 @@ def test_validator_without_an_ok_line_is_refused(
 
     assert proc.returncode != 0
     assert "the signoff validator gave no verdict" in proc.stderr, proc.stderr
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        pytest.param("exit 0", id="silent-exit-0"),
+        pytest.param("echo OK", id="bare-ok"),
+        pytest.param("echo 'OK 1'", id="missing-count"),
+        pytest.param("echo 'OK 0 0 extra'", id="extra-field"),
+    ],
+)
+def test_advertisement_reader_without_an_ok_line_is_refused(
+    installed: Sandbox, tmp_path: Path, script: str
+) -> None:
+    """r5: the advert reader, like the validator, must end with its OK line;
+    the real python3 still validates the signoff."""
+    _seed, tip = _one_new_commit(installed)
+    line = f"refs/heads/main {tip} refs/heads/main {ZERO_SHA}\n"
+    real = shutil.which("python3")
+    wrapper = f'[ "$4" = advert ] && {{ {script}; exit 0; }}\nexec "{real}" "$@"'
+
+    proc = _hook_as(installed, installed.main, "origin", line, path=_tool_dir(tmp_path, wrapper))
+
+    assert proc.returncode == 1
+    assert "the reader gave no verdict" in proc.stderr, proc.stderr
+    assert "cannot establish which commits are new to origin" in proc.stderr
+    assert "signoff OK" not in proc.stdout
 
 
 @pytest.mark.parametrize(

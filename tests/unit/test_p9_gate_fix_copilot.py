@@ -43,7 +43,7 @@ from tests.unit.test_p9_prepush_gate import (  # noqa: F401
 # Repo-specific wiring (the only lines that differ from the sibling's copy).
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 SUITE_STEP = "Unit tests"
-PARITY_NODE = "tests/unit/test_p9_gate_copilot.py::test_pre_push_hook_matches_the_sibling_repos_published_hook"
+PARITY_NODE = "tests/unit/test_p9_gate_r5.py::test_p9_shared_files_match_the_sibling_at_the_resolved_sha"
 
 PARITY_SCRIPT = REPO_ROOT / "scripts" / "ci" / "p9-sibling-parity.sh"
 RESOLVE_STEP = "Resolve sibling ref for P9 hook parity"
@@ -165,7 +165,8 @@ def test_unparseable_advertisement_refuses(
     text = listing.format(sha=seed, short=seed[:12], upper=seed.upper())
     (tmp_path / "listing.txt").write_text(text + "\n")
     path = _wrapped_git(
-        tmp_path, f'[ "$1" = ls-remote ] && {{ cat "{tmp_path / "listing.txt"}"; exit 0; }}'
+        tmp_path,
+        f'[ "$1" = ls-remote ] && [ "$2" != --get-url ] && {{ cat "{tmp_path / "listing.txt"}"; exit 0; }}',
     )
 
     proc = _hook(installed, _line(tip), "origin", str(installed.remote), path=path)
@@ -173,6 +174,48 @@ def test_unparseable_advertisement_refuses(
     assert proc.returncode == 1
     assert "cannot parse the refs origin advertises" in proc.stderr, proc.stderr
     assert NOT_ESTABLISHED in proc.stderr
+
+
+@pytest.mark.parametrize(
+    ("fake", "needle", "git_said"),
+    [
+        pytest.param(
+            '[ "$2" = --get-url ] && exit 128',
+            "git cannot resolve the URL it would read from",
+            False,
+            id="get-url-fails",
+        ),
+        pytest.param('[ "$2" = -- ] && exit 128', "(git ls-remote failed)", False, id="fails-silently"),
+        pytest.param(
+            '[ "$2" = -- ] && { printf "warning: x\\nfatal: \\033]0;x\\007 boom\\n" >&2; exit 128; }',
+            "git said: fatal: \\x1b]0;x\\x07 boom",
+            True,
+            id="fails-with-hostile-stderr",
+        ),
+        pytest.param(
+            '[ "$2" = -- ] && { exec >&- 2>&-; sleep 10; }',
+            "git ls-remote timed out after 2s",
+            False,
+            id="closes-its-output-then-hangs",
+        ),
+    ],
+)
+def test_advertisement_read_failures_refuse(
+    installed: Sandbox, tmp_path: Path, fake: str, needle: str, git_said: bool
+) -> None:
+    """r5: each way the read can fail refuses, says why, and shows git's own
+    last stderr line only escaped."""
+    _seed, tip = _one_new_commit(installed)
+    installed.env["P9_ADVERT_TIMEOUT_SECONDS"] = "2"
+    path = _wrapped_git(tmp_path, f'[ "$1" = ls-remote ] && {{ {fake}; }}')
+
+    proc = _hook(installed, _line(tip), "origin", str(installed.remote), path=path)
+
+    assert proc.returncode == 1
+    assert needle in proc.stderr, proc.stderr
+    assert NOT_ESTABLISHED in proc.stderr
+    assert ("git said: " in proc.stderr) is git_said, proc.stderr
+    assert "\x1b" not in proc.stderr and "\x07" not in proc.stderr
 
 
 @pytest.mark.parametrize(
@@ -228,7 +271,8 @@ def test_unknown_advertised_commit_as_the_only_proof_refuses(installed: Sandbox)
     proc = _hook(installed, _line(tip, "refs/heads/probe"), "origin", str(installed.remote))
 
     assert proc.returncode == 1
-    assert "2 commits are new to origin" in proc.stderr, proc.stderr
+    assert "2 commits are not known to be on origin" in proc.stderr, proc.stderr
+    assert "run 'git fetch origin' and push again" in proc.stderr, proc.stderr
     assert not _local_has(installed, x)
 
 
@@ -254,7 +298,8 @@ def test_annotated_tag_counts_and_blob_ref_is_ignored(installed: Sandbox) -> Non
 
 def _counting_git(tmp_path: Path) -> tuple[str, Path]:
     log = tmp_path / "ls-remote.calls"
-    return _wrapped_git(tmp_path, f'[ "$1" = ls-remote ] && echo call >> "{log}"'), log
+    script = f'[ "$1" = ls-remote ] && [ "$2" != --get-url ] && echo call >> "{log}"'
+    return _wrapped_git(tmp_path, script), log
 
 
 def test_advertisement_is_read_once_per_push(installed: Sandbox, tmp_path: Path) -> None:
@@ -341,7 +386,7 @@ def test_resolve_ref_uses_the_head_branch_when_the_sibling_has_it(tmp_path: Path
     proc = _script(tmp_path, "resolve-ref", SIB, BRANCH, path=path)
 
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == f"{BRANCH}\n"
+    assert proc.stdout == f"ref={BRANCH}\nsha={'a' * 40}\n"
     assert argv.read_text().splitlines() == [
         "ls-remote",
         "--heads",
@@ -351,26 +396,37 @@ def test_resolve_ref_uses_the_head_branch_when_the_sibling_has_it(tmp_path: Path
     ]
 
 
+# A fake GitHub that has only main, at MAIN_SHA ($5 is the ref pattern).
+MAIN_SHA = "b" * 40
+ONLY_MAIN = f"[ \"$5\" = refs/heads/main ] && printf '{MAIN_SHA}\\trefs/heads/main\\n'; exit 0"
+
+
 def test_resolve_ref_falls_back_to_main_when_the_sibling_lacks_the_branch(
     tmp_path: Path,
 ) -> None:
-    path, _argv = _fake_ls_remote(tmp_path, "exit 0")
+    path, _argv = _fake_ls_remote(tmp_path, ONLY_MAIN)
 
     proc = _script(tmp_path, "resolve-ref", SIB, "some-other-card", path=path)
 
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == "main\n"
+    assert proc.stdout == f"ref=main\nsha={MAIN_SHA}\n"
     assert "has no branch 'some-other-card'; comparing against main" in proc.stderr
 
 
-def test_resolve_ref_without_a_head_ref_is_main_and_asks_nobody(tmp_path: Path) -> None:
-    path, argv = _fake_ls_remote(tmp_path, "exit 99")
+def test_resolve_ref_without_a_head_ref_asks_only_for_main(tmp_path: Path) -> None:
+    path, argv = _fake_ls_remote(tmp_path, ONLY_MAIN)
 
     proc = _script(tmp_path, "resolve-ref", SIB, "", path=path)
 
     assert proc.returncode == 0, proc.stderr
-    assert proc.stdout == "main\n"
-    assert not argv.exists()
+    assert proc.stdout == f"ref=main\nsha={MAIN_SHA}\n"
+    assert argv.read_text().splitlines() == [
+        "ls-remote",
+        "--heads",
+        "--",
+        f"https://github.com/{SIB}",
+        "refs/heads/main",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -520,9 +576,14 @@ def _run_step(
 @pytest.mark.parametrize(
     ("head_ref", "listing", "expected"),
     [
-        pytest.param(BRANCH, f"printf '{'a' * 40}\\trefs/heads/{BRANCH}\\n'", BRANCH, id="pr-shared-branch"),
-        pytest.param("other-card", "true", "main", id="pr-no-sibling-branch"),
-        pytest.param("", "exit 99", "main", id="push-to-main"),
+        pytest.param(
+            BRANCH,
+            f"printf '{'a' * 40}\\trefs/heads/{BRANCH}\\n'",
+            f"ref={BRANCH}\nsha={'a' * 40}",
+            id="pr-shared-branch",
+        ),
+        pytest.param("other-card", ONLY_MAIN, f"ref=main\nsha={MAIN_SHA}", id="pr-no-sibling-branch"),
+        pytest.param("", ONLY_MAIN, f"ref=main\nsha={MAIN_SHA}", id="push-to-main"),
     ],
 )
 def test_resolve_step_writes_the_sibling_ref(
@@ -537,9 +598,8 @@ def test_resolve_step_writes_the_sibling_ref(
     proc = _run_step(tmp_path, step, {"HEAD_REF": head_ref, "GITHUB_OUTPUT": str(output)}, path)
 
     assert proc.returncode == 0, proc.stderr
-    assert output.read_text() == f"ref={expected}\n"
-    if head_ref:
-        assert f"https://github.com/{SIB}" in argv.read_text().splitlines()
+    assert output.read_text() == f"{expected}\n"
+    assert f"https://github.com/{SIB}" in argv.read_text().splitlines()
 
 
 def test_resolve_step_fails_when_github_cannot_be_asked(tmp_path: Path) -> None:
@@ -567,10 +627,10 @@ def test_parity_step_runs_this_repos_parity_test(
     resolve_at, resolve = _step(steps, RESOLVE_STEP)
     parity_at, parity = _parity_step(steps)
     suite_at, suite = _step(steps, SUITE_STEP)
-    ref_expr = "${{ steps.%s.outputs.ref }}" % resolve["id"]
+    sha_expr = "${{ steps.%s.outputs.sha }}" % resolve["id"]
     assert resolve_at < parity_at and resolve_at < suite_at
-    assert parity["env"] == {"P9_SIBLING_REF": ref_expr}
-    assert suite["env"]["P9_SIBLING_REF"] == ref_expr
+    assert parity["env"] == {"P9_SIBLING_SHA": sha_expr}
+    assert suite["env"]["P9_SIBLING_SHA"] == sha_expr
     assert "if" not in parity and "continue-on-error" not in parity
     fake, log = _fake_python(tmp_path, summary, 0)
     bindir = tmp_path / "pybin"
