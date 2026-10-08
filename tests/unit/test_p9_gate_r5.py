@@ -148,8 +148,13 @@ def _seed(sb: Sandbox) -> str:
 FAKE_HELPER = r"""#!/usr/bin/env bash
 # Fake git remote helper for p9fake:: URLs (test only).
 printf '%s\n' "$$" >> "${P9_FAKE_PIDS}"
-exec 2>/dev/null
 mode="${P9_FAKE_MODE:-list}"
+# linger: leave a child holding git's stderr open after git itself has exited.
+if [ "${mode}" = linger ]; then
+    sleep 3600 </dev/null >/dev/null &
+    printf '%s\n' "$!" >> "${P9_FAKE_PIDS}"
+fi
+exec 2>/dev/null
 if [ "${mode}" = hang-capabilities ]; then exec sleep 3600; fi
 while IFS= read -r line; do
     case "${line}" in
@@ -466,6 +471,7 @@ REAP_GRACE = 2
         pytest.param("p9fake::slow", "hang-capabilities", id="server-never-answers"),
         pytest.param("p9fake::slow", "hang-list", id="server-stalls-before-refs"),
         pytest.param("p9fake::endless", "endless", id="endless-advertisement"),
+        pytest.param("p9fake::linger", "linger", id="git-exits-but-a-helper-keeps-stderr-open"),
         pytest.param("fd::0", "list", id="fd-0"),
         pytest.param("fd::3", "list", id="fd-3"),
     ],
