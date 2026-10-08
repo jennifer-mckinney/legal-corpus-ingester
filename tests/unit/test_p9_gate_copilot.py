@@ -10,28 +10,24 @@ Findings: docs/evidence/2026-10-07-g0-5-copilot.md (C1, C3, C4).
   git passes the URL as the name) must not lose what the remote already has:
   a new-branch push (remote sha all zeros) over history the remote holds is
   judged against that history.
-- C3: the hook is byte-identical to the SIBLING repo's hook as published on
-  GitHub, not just to a constant copied into this repo.
+- C3: cross-repo parity now lives in test_p9_gate_r5.py (round-5 F6: it is
+  checked at the sibling's resolved commit sha, not its branch name).
 
 Sandbox commands reuse the acceptance harness: throwaway main checkout,
 linked worktree and local bare remotes under tmp_path, isolated HOME and git
-config. The only network access is the C3 parity fetch from GitHub.
+config. Nothing here contacts the network.
 """
 
 from __future__ import annotations
 
-import hashlib
-import os
 import re
 import subprocess
-import urllib.error
-import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from tests.unit.test_p9_gate_fix_r1 import _pass, _signoff, in_ci
+from tests.unit.test_p9_gate_fix_r1 import _pass, _signoff
 from tests.unit.test_p9_prepush_gate import (  # noqa: F401
     REPO_ROOT,
     Sandbox,
@@ -368,7 +364,7 @@ def test_push_to_a_bare_url_judges_against_that_remote(installed: Sandbox) -> No
     assert installed.remote_sha("probe-url-new") == tip
 
 
-# C3: cross-repo parity against the sibling's published hook -----------------
+# Sibling names (imported by the fix-coder tests) ----------------------------
 
 SIBLINGS = {
     "terms-analysis": "legal-corpus-ingester",
@@ -376,132 +372,5 @@ SIBLINGS = {
 }
 THIS_REPO = "legal-corpus-ingester"
 SIBLING_REPO = SIBLINGS[THIS_REPO]
-SIBLING_REF_ENV = "P9_SIBLING_REF"
-OPT_OUT_ENV = "P9_SKIP_SIBLING_PARITY"
-RAW_URL = "https://raw.githubusercontent.com/jennifer-mckinney/{repo}/{ref}/.githooks/pre-push"
-# A git branch or tag name as GitHub serves it raw: no "..", no leading "/" or "-".
-SAFE_REF = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,199}")
-
-Opener = Callable[[str, float], bytes]
-
-
-class ParityError(Exception):
-    """The sibling's hook could not be fetched; parity cannot be established."""
-
-
-def _urlopen(url: str, timeout: float) -> bytes:
-    with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 - fixed https host
-        return resp.read()
-
-
-def sibling_hook_url(ref: str) -> str:
-    if not SAFE_REF.fullmatch(ref) or ".." in ref or ref.endswith("/"):
-        raise ParityError(f"{SIBLING_REF_ENV}={ref!r} is not a usable branch or tag name")
-    return RAW_URL.format(repo=SIBLING_REPO, ref=ref)
-
-
-def sibling_hook_digest(ref: str, opener: Opener = _urlopen) -> str:
-    """sha256 of the sibling's .githooks/pre-push at `ref`; ParityError on any failure."""
-    url = sibling_hook_url(ref)
-    try:
-        body = opener(url, 20.0)
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        raise ParityError(f"cannot fetch {url}: {exc}") from exc
-    if not body.startswith(b"#!"):
-        raise ParityError(f"{url} did not return a hook script ({len(body)} bytes)")
-    return hashlib.sha256(body).hexdigest()
-
-
-def parity_skip_reason(env: dict[str, str]) -> str | None:
-    """None means run. Locally the check runs unless explicitly opted out;
-    in CI the opt-out is ignored."""
-    if in_ci(env.get("CI")):
-        return None
-    if env.get(OPT_OUT_ENV, "").strip() == "1":
-        return f"{OPT_OUT_ENV}=1: cross-repo hook parity explicitly skipped on this machine"
-    return None
-
-
-def test_pre_push_hook_matches_the_sibling_repos_published_hook() -> None:
-    reason = parity_skip_reason(dict(os.environ))
-    if reason is not None:
-        pytest.skip(reason)
-    ref = os.environ.get(SIBLING_REF_ENV, "").strip() or "main"
-    local = hashlib.sha256((REPO_ROOT / ".githooks" / "pre-push").read_bytes()).hexdigest()
-
-    try:
-        remote = sibling_hook_digest(ref)
-    except ParityError as exc:
-        pytest.fail(f"cross-repo hook parity cannot be established (fail closed): {exc}")
-
-    assert local == remote, (
-        f".githooks/pre-push (sha256 {local}) differs from {SIBLING_REPO}@{ref} "
-        f"(sha256 {remote}); land the same hook in both repos, or point "
-        f"{SIBLING_REF_ENV} at the sibling's PR branch"
-    )
-
-
-def _raises(exc: BaseException) -> Opener:
-    def opener(url: str, timeout: float) -> bytes:
-        raise exc
-
-    return opener
-
-
-@pytest.mark.parametrize(
-    "opener",
-    [
-        pytest.param(
-            _raises(urllib.error.HTTPError("u", 404, "Not Found", None, None)),  # type: ignore[arg-type]
-            id="http-404",
-        ),
-        pytest.param(_raises(urllib.error.URLError("no route")), id="url-error"),
-        pytest.param(_raises(TimeoutError("timed out")), id="timeout"),
-        pytest.param(_raises(ConnectionResetError("reset")), id="connection-reset"),
-        pytest.param(lambda url, timeout: b"", id="empty-body"),
-        pytest.param(lambda url, timeout: b"<html>404</html>", id="html-body"),
-    ],
-)
-def test_sibling_fetch_failure_fails_closed(opener: Opener) -> None:
-    with pytest.raises(ParityError):
-        sibling_hook_digest("main", opener)
-
-
-def test_sibling_fetch_success_returns_the_body_digest() -> None:
-    body = b"#!/usr/bin/env bash\nexit 0\n"
-    seen: list[str] = []
-
-    def opener(url: str, timeout: float) -> bytes:
-        seen.append(url)
-        return body
-
-    assert sibling_hook_digest("feat/g0-5-p9-gate", opener) == hashlib.sha256(body).hexdigest()
-    assert seen == [RAW_URL.format(repo=SIBLING_REPO, ref="feat/g0-5-p9-gate")]
-
-
-@pytest.mark.parametrize(
-    "ref", ["", "../main", "main/../x", "-main", "/main", "main/", "ma in", "main\n", "a" * 201]
-)
-def test_unusable_sibling_ref_fails_closed(ref: str) -> None:
-    with pytest.raises(ParityError):
-        sibling_hook_digest(ref, _raises(AssertionError("must not fetch")))
-
-
-@pytest.mark.parametrize(
-    ("env", "skipped"),
-    [
-        pytest.param({}, False, id="local-default-runs"),
-        pytest.param({OPT_OUT_ENV: "1"}, True, id="local-opt-out-skips"),
-        pytest.param({OPT_OUT_ENV: "0"}, False, id="local-opt-out-0-runs"),
-        pytest.param({OPT_OUT_ENV: "true"}, False, id="local-opt-out-not-1-runs"),
-        pytest.param({"CI": "true", OPT_OUT_ENV: "1"}, False, id="ci-ignores-opt-out"),
-        pytest.param({"CI": "true"}, False, id="ci-runs"),
-    ],
-)
-def test_parity_check_skips_only_on_explicit_local_opt_out(
-    env: dict[str, str], skipped: bool
-) -> None:
-    reason = parity_skip_reason(env)
-    assert (reason is not None) is skipped
-    if skipped:
-        assert reason is not None and OPT_OUT_ENV in reason
+# The cross-repo parity check (C3) moved to test_p9_gate_r5.py, which compares
+# every shared P9 artifact at an immutable commit sha, never a branch name (F6).
