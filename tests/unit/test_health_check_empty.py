@@ -14,6 +14,7 @@ run on its own with no helper module beside it.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -34,6 +35,7 @@ sys.path.insert(0, str(_SCRIPTS))
 
 import check_approvals
 import health_check
+import yaml
 from health_check import main
 
 _EXIT_CONFIG = 2
@@ -74,6 +76,11 @@ def _unreadable(path: Path) -> Iterator[None]:
         path.chmod(stat.S_IRWXU)
 
 
+def _empty_dir_message(config_dir: Path) -> str:
+    """The shared empty-dir wording (grumpy r2-4), read from the script, never restated."""
+    return health_check._empty_dir_problem(config_dir, "config dir")
+
+
 # ---------------------------------------------------------------------------
 # Card spec
 # ---------------------------------------------------------------------------
@@ -84,7 +91,7 @@ def test_empty_config_dir_exits_nonzero(tmp_path: Path, capsys: pytest.CaptureFi
     config_dir.mkdir()
     rc, _out, err = _run(config_dir, tmp_path, capsys)
     assert rc == _EXIT_CONFIG
-    assert "No sources configured" in err
+    assert f"Error: {_empty_dir_message(config_dir)}" in err.splitlines()
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +127,7 @@ def test_dir_with_no_source_files_exits_config_error(
     populate(config_dir)  # type: ignore[operator]
     rc, _out, err = _run(config_dir, tmp_path, capsys)
     assert rc == _EXIT_CONFIG
-    assert "No sources configured" in err
+    assert f"Error: {_empty_dir_message(config_dir)}" in err.splitlines()
 
 
 def test_symlink_to_empty_dir_exits_config_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -130,7 +137,7 @@ def test_symlink_to_empty_dir_exits_config_error(tmp_path: Path, capsys: pytest.
     link.symlink_to(real, target_is_directory=True)
     rc, _out, err = _run(link, tmp_path, capsys)
     assert rc == _EXIT_CONFIG
-    assert "No sources configured" in err
+    assert f"Error: {_empty_dir_message(link)}" in err.splitlines()
 
 
 _NOT_A_MAPPING = "is empty or not a YAML mapping"
@@ -147,7 +154,7 @@ _NOT_A_MAPPING = "is empty or not a YAML mapping"
         ("{}\n", _NOT_A_MAPPING),
         ("- a\n- b\n", _NOT_A_MAPPING),
         ("just a string\n", _NOT_A_MAPPING),
-        ("key: [unclosed\n", "is not valid YAML (line "),
+        ("key: [unclosed\n", "not valid YAML (line "),
     ],
     ids=[
         "empty-file", "comments-only", "bare-document-marker", "yaml-null",
@@ -185,7 +192,7 @@ def test_unreadable_config_dir_exits_config_error(tmp_path: Path, capsys: pytest
     assert "cannot read config dir " in err
     assert "Errno" not in err  # strerror only, not the exception's repr with the raw path
     # Honest reason: the dir holds a config, so "no sources" would be a false diagnosis.
-    assert "No sources configured" not in err
+    assert _empty_dir_message(config_dir) not in err
 
 
 def test_yaml_directory_beside_real_config_is_config_error(
@@ -209,7 +216,11 @@ def test_non_utf8_source_yaml_is_config_error(tmp_path: Path, capsys: pytest.Cap
     (config_dir / "latin.yaml").write_bytes(b"name: caf\xe9\n")
     rc, _out, err = _run(config_dir, tmp_path, capsys)
     assert rc == _EXIT_CONFIG
-    assert "cannot read source config latin.yaml" in err
+    with pytest.raises(UnicodeDecodeError) as decoded:
+        b"name: caf\xe9\n".decode("utf-8")
+    # Grumpy r2-4: the reason is the shared load-failure text, on the line naming the file.
+    reason = health_check._load_failure(decoded.value)
+    assert any("latin.yaml" in line and reason in line for line in err.splitlines()), err
     assert "UnicodeDecodeError" in err
     assert "\xe9" not in err and "\ufffd" not in err  # no raw or replaced file bytes
 
@@ -222,7 +233,8 @@ def test_unreadable_source_file_is_config_error(tmp_path: Path, capsys: pytest.C
     with _unreadable(locked):
         rc, _out, err = _run(config_dir, tmp_path, capsys)
     assert rc == _EXIT_CONFIG
-    assert "cannot read source config locked.yaml" in err
+    reason = health_check._load_failure(PermissionError(errno.EACCES, os.strerror(errno.EACCES)))
+    assert any("locked.yaml" in line and reason in line for line in err.splitlines()), err
 
 
 def test_hostile_config_dir_name_is_sanitised_on_stderr(
@@ -328,9 +340,9 @@ def test_display_path_caps_length_at_boundary(mod: ModuleType) -> None:
     assert mod.display_path("a" * cap) == "a" * cap
     assert mod.display_path("a" * (cap + 1)) == "a" * cap + "...(truncated)"
     huge = mod.display_path("\n" * (2 * 1024 * 1024))  # 2 MB of line breaks
-    # At most the cap: the cut may stop short of it to keep a whole escape (security F2).
-    assert huge.endswith("...(truncated)")
-    assert len(huge) <= cap + len("...(truncated)")
+    # Grumpy r2-3: a full, capped prefix of whole "\x0a" escapes, nothing less.
+    token = "\\x0a"
+    assert huge == token * (cap // len(token)) + "...(truncated)"
 
 
 # One character per escape width the renderer emits: \\ (2), \xNN (4), \uNNNN (6), \UNNNNNNNN (10).
@@ -361,15 +373,100 @@ def test_display_path_truncation_never_splits_an_escape(mod: ModuleType, ch: str
     assert mod.display_path(raw) == kept + "...(truncated)"
 
 
+# Last line of the shared block in both scripts (grumpy r2-4: the block now also holds
+# the load-failure and empty-dir wording, so it ends at an explicit marker).
+_BLOCK_END = "# End of the byte-identical block (terms-analysis#173)."
+# Shared helpers that must live inside the locked block, once per script.
+_SHARED_DEFS = ("def scan_yaml_dir(", "def _load_failure(", "def _empty_dir_problem(")
+
+
 def test_folded_block_is_byte_identical_in_both_scripts() -> None:
     # The banner promises one byte-identical copy per script; this is what enforces it.
     blocks = []
     for script in ("health_check.py", "check_approvals.py"):
         src = (_SCRIPTS / script).read_text(encoding="utf-8")
         start = src.index("# Directory listing and log-path rendering")
-        end = src.index("return YamlDirListing(files=files, non_files=non_files)", start)
-        blocks.append(src[start:end])
+        assert src.count(_BLOCK_END) == 1, f"{script}: shared block has no single end marker"
+        end = src.index(_BLOCK_END, start)
+        block = src[start:end]
+        for definition in _SHARED_DEFS:
+            assert definition in block, f"{script}: {definition} is outside the shared block"
+            assert src.count(definition) == 1, f"{script}: {definition} defined more than once"
+        blocks.append(block)
     assert blocks[0] == blocks[1]
+
+
+_HOSTILE_DIRS = [Path("plain"), Path(_HOSTILE_NAME), Path("a|b\\x1b")]
+
+
+@pytest.mark.parametrize("d", _HOSTILE_DIRS, ids=["plain", "forging-name", "pipe-and-backslash"])
+@pytest.mark.parametrize("label", ["config dir", "approvals dir"])
+def test_empty_dir_message_is_one_wording_in_both_scripts(d: Path, label: str) -> None:
+    # Grumpy r2-4: one message, one spelling, whichever script or code path emits it.
+    message = health_check._empty_dir_problem(d, label)
+    assert message == check_approvals._empty_dir_problem(d, label)
+    # Honest and safe: names the dir by label and escaped path, no raw control bytes (F8).
+    assert f"{label} {health_check.display_path(d)}" in message
+    assert len(message.splitlines()) == 1
+    assert "\x1b" not in message and "\u202e" not in message
+
+
+def test_both_scripts_print_the_shared_empty_dir_message(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Behaviour, not just the helper: each main() prints exactly that line for an empty dir.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    rc, _out, err = _run(empty, tmp_path, capsys)
+    assert rc == _EXIT_CONFIG
+    assert err.splitlines() == [f"Error: {health_check._empty_dir_problem(empty, 'config dir')}"]
+    no_sources = tmp_path / "no-sources"
+    no_sources.mkdir()  # zero configs: no "unverified" clause, so the line is the message alone
+    rc = check_approvals.main(["--sources-dir", str(no_sources), "--approvals-dir", str(empty)])
+    err = capsys.readouterr().err
+    assert rc == _EXIT_CONFIG
+    assert err.splitlines() == [f"Error: {check_approvals._empty_dir_problem(empty, 'approvals dir')}"]
+
+
+def _deep_nesting() -> bytes:
+    # Nested past the parser's recursion limit: safe_load raises RecursionError.
+    return b"k: " + b"[" * 5000 + b"]" * 5000 + b"\n"
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b"key: [unclosed\n",  # YAMLError with a line mark
+        b"key: \x07BELL\n",  # YAMLError without a mark
+        b"name: caf\xe9\n",  # not UTF-8
+        _deep_nesting(),  # not a YAMLError at all
+    ],
+    ids=["parse-error", "reader-error-no-mark", "non-utf8", "deep-nesting"],
+)
+def test_load_failure_text_is_the_same_in_both_scripts(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], body: bytes
+) -> None:
+    # Grumpy r2-4: one load-failure rule and wording. Same bytes, same reason, both jobs.
+    with pytest.raises(Exception) as failed:  # any loader failure: the family is the point
+        yaml.safe_load(body.decode("utf-8"))
+    reason = check_approvals._load_failure(failed.value)
+    assert health_check._load_failure(failed.value) == reason
+    assert reason and "BELL" not in reason and "unclosed" not in reason  # no file bytes (F8)
+
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "ghost.yaml").write_bytes(body)
+    rc, out, err = _run(cfg, tmp_path, capsys)
+    assert rc == _EXIT_CONFIG, err
+    assert out == ""
+    assert any("ghost.yaml" in line and reason in line for line in err.splitlines()), err
+
+    srcs = tmp_path / "srcs"
+    srcs.mkdir()
+    rc = check_approvals.main(["--sources-dir", str(srcs), "--approvals-dir", str(cfg)])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert f"| ghost | ERROR | {check_approvals.table_cell(reason)} | - |" in out.splitlines()
 
 
 @_SCRIPT_MODULES
@@ -444,8 +541,11 @@ def test_hostile_checkpoint_stage_is_escaped_on_exit_zero_path(
             assert raw not in text
         assert not any(line.startswith("FORGED") for line in text.splitlines())
         rows = [line for line in text.splitlines() if line.startswith("| ") and "---" not in line]
+        assert len(rows) == 2, f"header plus one source row expected: {rows!r}"
         for row in rows:
             assert _REPORT_ROW.fullmatch(row), f"row has a forged cell delimiter: {row!r}"
+        # Grumpy r2-2: the stage is escaped, not dropped.
+        assert f"| {health_check.table_cell(stage)} |" in rows[1]
 
 
 # ---------------------------------------------------------------------------
@@ -454,11 +554,12 @@ def test_hostile_checkpoint_stage_is_escaped_on_exit_zero_path(
 
 
 @pytest.mark.parametrize("how", ["removed", "emptied"])
-def test_config_dir_lost_after_check_does_not_exit_zero(
+def test_config_dir_lost_after_check_exits_config_error(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, how: str
 ) -> None:
-    # Reaches the guard in _source_names (and build_report's "no sources" branch) the
-    # only way it can be reached from main(): the dir changes between check and use.
+    # Reaches the guard in _source_names the only way it can be reached from main():
+    # the dir changes between check and use. Grumpy r2-1: one outcome only. main()
+    # must catch YamlDirError and return exit 2; deleting that catch fails this test.
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     (config_dir / "eurlex.yaml").write_text(_FIXTURE_SOURCE.read_text())
@@ -474,18 +575,17 @@ def test_config_dir_lost_after_check_does_not_exit_zero(
         return problems
 
     monkeypatch.setattr(health_check, "_config_problems", check_then_lose_dir)
-    try:
-        rc: int | None = main([
-            "--config-dir", str(config_dir),
-            "--state-dir", str(tmp_path / "state"),
-            "--out-dir", str(tmp_path / "out"),
-        ])
-    except health_check.YamlDirError:
-        rc = None  # uncaught: the script dies with a traceback (exit 1), never 0
-    out = capsys.readouterr().out
-    # None: YamlDirError escaped main (exit 1); 1: reported as a problem; 2: config error.
-    assert rc in (None, 1, _EXIT_CONFIG), f"lost config dir reported success: {out!r}"
-    assert "No sources configured" not in out, "stdout claims a clean, empty run"
+    rc, out, err = _run(config_dir, tmp_path, capsys)
+    assert rc == _EXIT_CONFIG, f"lost config dir: rc={rc}, out={out!r}"
+    assert out == ""
+    assert not (tmp_path / "out").exists(), "no report is written for a config error"
+    if how == "removed":
+        with pytest.raises(health_check.YamlDirError) as missing:
+            health_check.scan_yaml_dir(config_dir, "config dir")
+        expected = str(missing.value)
+    else:
+        expected = _empty_dir_message(config_dir)
+    assert err.splitlines() == [f"Error: {expected}"]
 
 
 # ---------------------------------------------------------------------------

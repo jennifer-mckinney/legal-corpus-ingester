@@ -10,6 +10,7 @@ import pytest
 # scripts/ is not a package; inject it into the path.
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
 
+import health_check
 from health_check import (  # noqa: E402
     EXIT_CONFIG_MISSING,
     YamlDirError,
@@ -42,17 +43,19 @@ class TestBuildReport:
         config_dir = tmp_path / "config"
         if make_dir:
             config_dir.mkdir()
-        try:
-            _report, any_problem = build_report(
+        # Grumpy r2-1: one contract only. build_report raises; it never returns a report.
+        with pytest.raises(YamlDirError) as raised:
+            build_report(
                 config_dir=config_dir,
                 state_dir=tmp_path / "state",
                 out_dir=tmp_path / "out",
                 stale_days=8,
                 today="2026-07-04",
             )
-        except YamlDirError:
-            return  # failing closed by raising is acceptable
-        assert any_problem is True
+        if make_dir:
+            assert str(raised.value) == health_check._empty_dir_problem(config_dir, "config dir")
+        else:
+            assert "does not exist" in str(raised.value)
 
     def test_all_fresh(self, tmp_path):
         config_dir = tmp_path / "config"

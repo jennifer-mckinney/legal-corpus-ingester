@@ -10,6 +10,7 @@ import pytest
 # scripts/ is not a package; inject it into the path.
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
 
+import check_approvals
 from check_approvals import YamlDirError, check_approvals_dir, classify_approval  # noqa: E402
 
 # Valid 64-char lowercase hex sha256 used by tests that need a passing sha256.
@@ -74,11 +75,10 @@ class TestCheckApprovalsDir:
 
     def test_empty_directory_is_not_success(self, tmp_path):
         """Zero approval files must not read as "all OK" for any caller (terms-analysis#173)."""
-        try:
-            _rows, any_expired = check_approvals_dir(tmp_path, date.today(), warn_days=60)
-        except YamlDirError:
-            return  # failing closed by raising is acceptable
-        assert any_expired is True
+        # Grumpy r2-1: one contract only. The walk raises, with the shared empty-dir wording.
+        with pytest.raises(YamlDirError) as raised:
+            check_approvals_dir(tmp_path, date.today(), warn_days=60)
+        assert str(raised.value) == check_approvals._empty_dir_problem(tmp_path, "approvals dir")
 
     def test_valid_expired_approval(self, tmp_path):
         """An expired APPROVAL.yaml yields any_expired=True and an EXPIRED row."""

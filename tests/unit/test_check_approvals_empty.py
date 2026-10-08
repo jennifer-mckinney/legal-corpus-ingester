@@ -16,7 +16,9 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -102,6 +104,9 @@ def test_empty_approvals_dir_with_source_configs_exits_nonzero(
     assert f"{n_configs} source config(s)" in err
     assert "unverified" in err
     assert out == ""
+    # Grumpy r2-4: the dir part of the message is the shared empty-dir wording.
+    shared = check_approvals._empty_dir_problem(approvals, "approvals dir")
+    assert shared.rstrip(".") in err
 
 
 def test_missing_approvals_dir_exits_nonzero(
@@ -125,6 +130,10 @@ def test_empty_registry_and_no_approvals_exits_nonzero(
     rc, _out, err = _run([], capsys)
     assert rc == _EXIT_CONFIG
     assert "config/approvals" in err
+    # Grumpy r2-4: zero sources means no "unverified" clause, so the whole line is the
+    # shared empty-dir message (one wording for both scripts and both code paths).
+    expected = check_approvals._empty_dir_problem(Path("config/approvals"), "approvals dir")
+    assert f"Error: {expected}" in err.splitlines()
 
 
 # ---------------------------------------------------------------------------
@@ -383,16 +392,195 @@ def test_hostile_yaml_values_are_escaped_in_table(
 
 
 # ---------------------------------------------------------------------------
+# Security r2 F3: non-scalar YAML values are ERROR rows before any str()
+# ---------------------------------------------------------------------------
+
+_NOT_A_DATE = "invalid date: not a date or string"
+_NOT_A_STRING = "source_id is not a string"
+_SHA = "a" * 64
+
+# (field, YAML value, expected cell). Each value is a type safe_load can build.
+_NON_SCALARS = [
+    ("expiry", "20990101", _NOT_A_DATE),
+    ("expiry", "1.5", _NOT_A_DATE),
+    ("expiry", "true", _NOT_A_DATE),
+    ("expiry", "[2099-01-01]", _NOT_A_DATE),
+    ("expiry", "{y: 2099}", _NOT_A_DATE),
+    ("expiry", "!!binary aGk=", _NOT_A_DATE),
+    ("source_id", "42", _NOT_A_STRING),
+    ("source_id", "true", _NOT_A_STRING),
+    ("source_id", "null", _NOT_A_STRING),
+    ("source_id", "[eurlex]", _NOT_A_STRING),
+    ("source_id", "{a: b}", _NOT_A_STRING),
+]
+
+
+def _approval_with(field: str, value: str) -> str:
+    fields = {"source_id": '"eurlex"', "expiry": '"2099-01-01"', "signed_artifact_sha256": f'"{_SHA}"'}
+    fields[field] = value
+    return "".join(f"{k}: {v}\n" for k, v in fields.items())
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "cell"), _NON_SCALARS, ids=[f"{f}-{v}" for f, v, _ in _NON_SCALARS]
+)
+def test_non_scalar_expiry_or_source_id_is_an_error_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], field: str, value: str, cell: str
+) -> None:
+    sources = _sources(tmp_path / "srcs")
+    approvals = tmp_path / "appr"
+    approvals.mkdir()
+    (approvals / "ghost.yaml").write_text(_approval_with(field, value))
+    rc, out, _err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
+    assert rc == _EXIT_EXPIRED_OR_INVALID
+    # A non-string source_id is never shown: the row is named by the file stem.
+    row_id = "ghost" if field == "source_id" else "eurlex"
+    assert f"| {row_id} | ERROR | {cell} | - |" in out.splitlines(), out
+
+
+@pytest.mark.parametrize(
+    "approval",
+    [
+        _approval_with("source_id", '"eurlex"'),  # string id, quoted date
+        _approval_with("expiry", "2099-01-01"),  # unquoted date: safe_load builds a date
+        f'expiry: "2099-01-01"\nsigned_artifact_sha256: "{_SHA}"\n',  # no source_id: the stem
+    ],
+    ids=["string-id-quoted-date", "unquoted-date", "absent-source-id"],
+)
+def test_scalar_expiry_and_source_id_still_pass(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], approval: str
+) -> None:
+    # Control for the type checks: real scalars must not become ERROR rows.
+    sources = _sources(tmp_path / "srcs")
+    approvals = tmp_path / "appr"
+    approvals.mkdir()
+    (approvals / "eurlex.yaml").write_text(approval)
+    rc, out, _err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
+    assert rc == 0
+    assert "| eurlex | OK |" in out
+
+
+class _NoStr(list):  # type: ignore[type-arg]
+    """A loaded non-scalar that fails the test if anything renders it (str, repr, format)."""
+
+    def _refuse(self, *_args: object) -> str:
+        raise AssertionError("untrusted non-scalar was rendered before its type was checked")
+
+    __str__ = __repr__ = __format__ = _refuse  # type: ignore[assignment]
+
+
+@pytest.mark.parametrize(
+    ("field", "cell"),
+    [
+        ("expiry", _NOT_A_DATE),
+        ("source_id", _NOT_A_STRING),
+        ("signed_artifact_sha256", "sha256-invalid-format (expiry=2099-01-01)"),
+    ],
+)
+def test_non_scalar_is_rejected_without_rendering_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, field: str, cell: str
+) -> None:
+    # Deterministic form of F3: the type check must come before any str()/f-string.
+    sources = _sources(tmp_path / "srcs")
+    approvals = tmp_path / "appr"
+    approvals.mkdir()
+    (approvals / "ghost.yaml").write_text("placeholder: 1\n")
+    loaded: dict[str, object] = {"source_id": "eurlex", "expiry": "2099-01-01", "signed_artifact_sha256": _SHA}
+    loaded[field] = _NoStr(["x"])
+    monkeypatch.setattr(check_approvals.yaml, "safe_load", lambda _text: loaded)
+    rc, out, _err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
+    assert rc == _EXIT_EXPIRED_OR_INVALID
+    row_id = "ghost" if field == "source_id" else "eurlex"
+    assert f"| {row_id} | ERROR | {cell} | - |" in out.splitlines(), out
+
+
+# Bounds for the alias-bomb subprocess. Python plus PyYAML idles far below the RSS cap;
+# the unfixed code needs gigabytes. RSS is sampled from outside the child, because
+# str() of a nested list runs in C and never yields to a thread or signal handler.
+_BOMB_TIMEOUT_S = 10.0
+_BOMB_MAX_RSS_KB = 256 * 1024
+_BOMB_POLL_S = 0.02
+
+
+def _alias_bomb(levels: int) -> str:
+    """Nine-way alias fan-out per level: tiny on disk, 9**levels strings if expanded."""
+    lines = ["l0: &l0 [" + ", ".join(['"xxxxxxxxxx"'] * 9) + "]"]
+    for i in range(1, levels + 1):
+        lines.append(f"l{i}: &l{i} [" + ", ".join([f"*l{i - 1}"] * 9) + "]")
+    return "\n".join(lines) + "\n"
+
+
+def _rss_kb(pid: int) -> int:
+    out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True, timeout=5, check=False)
+    return int(out.stdout.strip() or 0)
+
+
+def _run_bounded(argv: list[str]) -> tuple[int, str, str]:
+    """Run check_approvals.py in a child; kill it and fail if it passes the time or RSS cap."""
+    script = Path(check_approvals.__file__).resolve()
+    proc = subprocess.Popen(
+        [sys.executable, str(script), *argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+    start = time.monotonic()
+    peak = 0
+    try:
+        while proc.poll() is None:
+            peak = max(peak, _rss_kb(proc.pid))
+            elapsed = time.monotonic() - start
+            if peak > _BOMB_MAX_RSS_KB or elapsed > _BOMB_TIMEOUT_S:
+                proc.kill()
+                proc.communicate()
+                pytest.fail(
+                    f"alias bomb was expanded: rss={peak} KB (cap {_BOMB_MAX_RSS_KB}), "
+                    f"{elapsed:.1f}s (cap {_BOMB_TIMEOUT_S}s)"
+                )
+            time.sleep(_BOMB_POLL_S)
+        out, err = proc.communicate(timeout=_BOMB_TIMEOUT_S)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    return proc.returncode, out, err
+
+
+@pytest.mark.parametrize(
+    ("field", "cell"),
+    [
+        ("expiry", _NOT_A_DATE),
+        ("source_id", _NOT_A_STRING),
+        ("signed_artifact_sha256", "sha256-invalid-format (expiry=2099-01-01)"),
+    ],
+)
+def test_yaml_alias_bomb_is_an_error_row_within_bounds(tmp_path: Path, field: str, cell: str) -> None:
+    # Security r2 F3: a ~1 KB file whose alias graph expands to 9**10 strings. The
+    # value must be rejected by type, never expanded by str() before a cap applies.
+    sources = _sources(tmp_path / "srcs")
+    approvals = tmp_path / "appr"
+    approvals.mkdir()
+    levels = 10
+    body = _alias_bomb(levels) + _approval_with(field, f"*l{levels}")
+    assert len(body) < 2048  # control: the hostile input itself is small
+    (approvals / "bomb.yaml").write_text(body)
+    rc, out, err = _run_bounded(["--sources-dir", str(sources), "--approvals-dir", str(approvals)])
+    assert rc == _EXIT_EXPIRED_OR_INVALID, err[-2000:]
+    row_id = "bomb" if field == "source_id" else "eurlex"
+    assert f"| {row_id} | ERROR | {cell} | - |" in out.splitlines(), out[-2000:]
+    assert "Traceback" not in err
+
+
+# ---------------------------------------------------------------------------
 # Grumpy 4: the approvals dir vanishing after main()'s check must not read as success
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("how", ["removed", "emptied"])
-def test_approvals_dir_lost_after_check_does_not_exit_zero(
+def test_approvals_dir_lost_after_check_exits_config_error(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, how: str
 ) -> None:
     # Reaches the guard in check_approvals_dir the only way it can be reached from
-    # main(): the dir changes between the config check and the walk.
+    # main(): the dir changes between the config check and the walk. Grumpy r2-1:
+    # one outcome only. main() must catch YamlDirError and return exit 2; deleting
+    # that catch lets the exception escape and fails this test.
     sources = _sources(tmp_path / "srcs")
     approvals = tmp_path / "appr"
     approvals.mkdir()
@@ -409,14 +597,18 @@ def test_approvals_dir_lost_after_check_does_not_exit_zero(
         return problems
 
     monkeypatch.setattr(check_approvals, "_config_problems", check_then_lose_dir)
-    argv = ["--sources-dir", str(sources), "--approvals-dir", str(approvals)]
-    try:
-        rc: int | None = main(argv)
-    except check_approvals.YamlDirError:
-        rc = None  # uncaught: the script dies with a traceback (exit 1), never 0
-    out = capsys.readouterr().out
-    # None: YamlDirError escaped main (exit 1); 1: reported invalid; 2: config error.
-    assert rc in (None, _EXIT_EXPIRED_OR_INVALID, _EXIT_CONFIG), f"lost approvals dir reported success: {out!r}"
+    rc, out, err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
+    assert rc == _EXIT_CONFIG, f"lost approvals dir: rc={rc}, out={out!r}"
+    assert out == "", "no table is printed for a config error"
+    if how == "removed":
+        # The listing's own message for a missing dir, derived rather than restated.
+        with pytest.raises(check_approvals.YamlDirError) as missing:
+            check_approvals.scan_yaml_dir(approvals, "approvals dir")
+        expected = str(missing.value)
+    else:
+        # Grumpy r2-4: the walk's empty-dir raise uses the shared one-wording message.
+        expected = check_approvals._empty_dir_problem(approvals, "approvals dir")
+    assert err.splitlines() == [f"Error: {expected}"]
 
 
 # ---------------------------------------------------------------------------
