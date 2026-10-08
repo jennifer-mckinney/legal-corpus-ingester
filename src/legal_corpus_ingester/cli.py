@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import importlib
 import json
 import shutil
+import sys
 from pathlib import Path
 
 import httpx
@@ -24,6 +26,8 @@ EXIT_NOT_WIRED: int = 3
 # validate-round-trip could not import the terms-analysis consumer, so the bundle was NOT
 # verified end to end; must not look like VALID unless --allow-missing-consumer (terms-analysis#90)
 EXIT_CONSUMER_SKIPPED: int = 4
+# No subcommand given: click's conventional usage-error code, as the console script returns
+EXIT_USAGE: int = 2
 
 # Main app
 app = typer.Typer(
@@ -463,3 +467,28 @@ def prune(
         typer.echo(f"  pruned: {p.name}")
 
     typer.echo("Done.")
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Entry point for `python -m legal_corpus_ingester.cli` (terms-analysis#173).
+
+    With no subcommand, Typer's `no_args_is_help` prints help to STDOUT, which a
+    caller capturing stdout could mistake for real output. Print the help to
+    stderr instead and exit with the usage-error code, so "did nothing" is never
+    confused with a run. Everything else is the Typer app unchanged.
+    """
+    args = sys.argv[1:] if argv is None else argv
+    if not args:
+        with contextlib.redirect_stdout(sys.stderr):
+            try:
+                app(args=["--help"])
+            except SystemExit:
+                # --help always ends in SystemExit(0); the exit code is set below.
+                pass
+        typer.echo("Error: Missing command.", err=True)
+        raise SystemExit(EXIT_USAGE)
+    app(args=args)
+
+
+if __name__ == "__main__":
+    main()

@@ -54,8 +54,10 @@ python scripts/health_check.py --stale-days 14
 
 ## Failure mode
 
-If `health_check.py` exits 1 (stale or never-run source) or 2 (`config/sources/`
-missing, i.e. a broken checkout), the `Run health check` step is marked failed.
+If `health_check.py` exits 1 (stale or never-run source) or 2 (config problem:
+`config/sources/` missing, unreadable or holding zero source configs, a `*.yaml`
+entry that is not a regular file, or a source YAML that is empty or not a mapping;
+terms-analysis#90, #173), the `Run health check` step is marked failed.
 Neither code is masked (terms-analysis#90). The artifact upload still runs because it has
 `if: always()`. No issue is auto-opened - this is a monitoring report, not an
 alerting trigger. Alerting comes from VCR drift canary failures or publish

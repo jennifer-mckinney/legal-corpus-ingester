@@ -6,7 +6,11 @@ EXPIRED / EXPIRING_SOON / OK, prints a markdown summary table, and exits
 non-zero if any approval has expired.
 
 Exit 0: all approvals are current (no expired entries).
-Exit 1: one or more approvals are EXPIRED.
+Exit 1: one or more approvals are EXPIRED or invalid.
+Exit 2: config problem, never "nothing to do": the approvals dir or the
+        --sources-dir is missing or unreadable, a *.yaml entry is not a
+        regular file, or there are zero approval files (terms-analysis#173).
+        Messages go to stderr.
 """
 from __future__ import annotations
 
@@ -17,6 +21,10 @@ from datetime import date
 from pathlib import Path
 
 import yaml
+from _yaml_dir import YamlDirError, display_path, scan_yaml_dir
+
+# Config problem: distinct from 1 (expired/invalid approval) so the cause is visible.
+EXIT_CONFIG: int = 2
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +67,10 @@ def check_approvals_dir(
     rows: list[dict[str, str | int]] = []
     any_expired = False
 
-    yaml_files = sorted(approvals_dir.glob("*.yaml"))
+    # main() rejects a missing, unreadable or empty dir before this runs (exit 2).
+    if not approvals_dir.is_dir():
+        return rows, any_expired
+    yaml_files = scan_yaml_dir(approvals_dir, "approvals dir").files
     for yaml_path in yaml_files:
         try:
             data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
@@ -161,6 +172,46 @@ def check_approvals_dir(
     return rows, any_expired
 
 
+def _scan(directory: Path, label: str, problems: list[str]) -> list[Path] | None:
+    """Return the regular *.yaml files in ``directory``, appending any problem found.
+
+    Returns None when the directory itself cannot be listed.
+    """
+    try:
+        listing = scan_yaml_dir(directory, label)
+    except YamlDirError as exc:
+        problems.append(str(exc))
+        return None
+    shown_dir = display_path(directory)
+    problems.extend(
+        f"{display_path(p.name)} in {label} {shown_dir} is not a regular file."
+        for p in listing.non_files
+    )
+    return listing.files
+
+
+def _config_problems(sources_dir: Path, approvals_dir: Path) -> list[str]:
+    """Return every reason the job cannot do its check; empty means usable.
+
+    Zero approvals is always a problem (terms-analysis#173): with source configs
+    present the gated sources are unverified, and with none the scheduled job
+    has nothing to verify, which looks exactly like a job that is not wired up.
+    """
+    problems: list[str] = []
+    sources = _scan(sources_dir, "sources dir", problems)
+    approvals = _scan(approvals_dir, "approvals dir", problems)
+    if approvals is not None and not approvals:
+        unverified = (
+            f"; {len(sources)} source config(s) in {display_path(sources_dir)} are unverified"
+            if sources
+            else ""
+        )
+        problems.append(
+            f"no approval files (*.yaml) in approvals dir {display_path(approvals_dir)}{unverified}."
+        )
+    return problems
+
+
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
@@ -199,6 +250,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Directory containing APPROVAL.yaml files (default: config/approvals)",
     )
     parser.add_argument(
+        "--sources-dir",
+        default="config/sources",
+        help="Directory containing per-source YAML configs (default: config/sources)",
+    )
+    parser.add_argument(
         "--warn-days",
         type=int,
         default=60,
@@ -211,18 +267,17 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--warn-days must be a non-negative integer")
 
     approvals_dir = Path(args.approvals_dir)
+    sources_dir = Path(args.sources_dir)
     warn_days: int = args.warn_days
     today = date.today()
 
-    # No directory or no files -- treat as no approvals to check.
-    if not approvals_dir.is_dir():
-        print("No approvals to check.")
-        return 0
-
-    yaml_files = list(approvals_dir.glob("*.yaml"))
-    if not yaml_files:
-        print("No approvals to check.")
-        return 0
+    # Nothing to check is a config error, not success: the daily job must go red
+    # instead of passing silently (terms-analysis#173).
+    problems = _config_problems(sources_dir, approvals_dir)
+    if problems:
+        for problem in problems:
+            print(f"Error: {problem}", file=sys.stderr)
+        return EXIT_CONFIG
 
     rows, any_expired = check_approvals_dir(approvals_dir, today, warn_days)
 

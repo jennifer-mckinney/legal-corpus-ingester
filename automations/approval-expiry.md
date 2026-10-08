@@ -41,11 +41,15 @@ The script prints a markdown table to stdout with one row per approval file:
 ```
 
 Exit 0 when all approvals are OK or EXPIRING_SOON. Exit 1 when any approval is
-EXPIRED or ERROR.
+EXPIRED or ERROR. Exit 2 (config problem, message on stderr) when there is nothing
+to check: the approvals dir or the `--sources-dir` (default `config/sources`) is
+missing or unreadable, a `*.yaml` entry is not a regular file, or the approvals dir
+holds zero approval files. Zero approvals is never success, with or without source
+configs (terms-analysis#173).
 
 ## What it produces
 
-**GitHub issue** (conditional). When the check script exits 1, the workflow creates the
+**GitHub issue** (conditional). When the check script exits non-zero (1 or 2), the workflow creates the
 `approval-expiry` label if it is missing (`gh label create --force`, idempotent; a real
 error fails the step). It then opens an issue titled `Approval expiry alert -- YYYY-MM-DD`
 with that label. The
@@ -58,8 +62,8 @@ during normal operation.
 
 ## Failure mode
 
-If `check_approvals.py` exits 1 (expired approval detected), the `Run approval
-check` step is marked failed and the `Open issue on expiry` step fires. That step's
+If `check_approvals.py` exits 1 (expired or invalid approval) or 2 (config
+problem, see above), the `Run approval check` step is marked failed and the `Open issue on expiry` step fires. That step's
 condition is `failure() && steps.approval_check.outcome == 'failure'`. The workflow
 job itself ends in failure, making the problem visible in the Actions summary without
 requiring the operator to inspect logs proactively.
@@ -68,8 +72,10 @@ If checkout or `Install` fails, the approval check is skipped and no expiry issu
 opened, because that alert would be misleading. The run stays plain red, and GitHub
 sends its standard failed-scheduled-workflow notification (terms-analysis#90).
 
-If no `config/approvals/` directory exists (fresh install with no gated sources),
-the script prints "No approvals to check." and exits 0. The workflow passes silently.
+If `config/approvals/` is missing, unreadable or holds no `*.yaml` approval files,
+the script prints the reason to stderr and exits 2. The run goes red and the expiry
+issue opens; its body is generic, so read the step log for the exact cause. The job
+never passes silently on an empty or absent approvals dir (terms-analysis#173).
 
 ## Escalation
 

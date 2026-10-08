@@ -6,8 +6,10 @@ freshness report to out/health/YYYY-MM-DD.md.
 
 Exit 0: all sources are fresh (lag < stale_days).
 Exit 1: one or more sources are stale or have never run.
-Exit 2: the config dir is missing (a broken checkout or wrong working dir, not
-        "nothing to do"; terms-analysis#90).
+Exit 2: config problem, never "nothing to do": the config dir is missing
+        (terms-analysis#90), unreadable or holds zero source configs, a *.yaml
+        entry is not a regular file, or a source YAML is empty or not a
+        mapping (terms-analysis#173). Messages go to stderr.
 """
 from __future__ import annotations
 
@@ -18,7 +20,11 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-# Config dir missing: distinct from 1 (stale sources) so the cause is visible in the exit code.
+import yaml
+from _yaml_dir import YamlDirError, display_path, scan_yaml_dir
+
+# Config problem (missing/unreadable/empty dir, bad source YAML): distinct from 1
+# (stale sources) so the cause is visible in the exit code.
 EXIT_CONFIG_MISSING: int = 2
 
 
@@ -28,10 +34,53 @@ def _utc_now() -> datetime:
 
 
 def _source_names(config_dir: Path) -> list[str]:
-    """Return sorted list of source names from config YAML filenames."""
+    """Return sorted list of source names from config YAML filenames.
+
+    Uses the shared listing rule, so only regular *.yaml files count; main()
+    rejects every other config problem before this runs.
+    """
     if not config_dir.is_dir():
         return []
-    return sorted(p.stem for p in config_dir.glob("*.yaml"))
+    return sorted(p.stem for p in scan_yaml_dir(config_dir, "config dir").files)
+
+
+def _config_problems(config_dir: Path) -> list[str]:
+    """Return every reason the config dir cannot be checked; empty means usable.
+
+    Zero source configs is a problem, not success: a scheduled job with nothing
+    configured is indistinguishable from one that is not wired up (terms-analysis#173).
+    """
+    try:
+        listing = scan_yaml_dir(config_dir, "config dir")
+    except YamlDirError as exc:
+        return [str(exc)]
+
+    shown_dir = display_path(config_dir)
+    problems = [
+        f"{display_path(p.name)} in config dir {shown_dir} is not a regular file."
+        for p in listing.non_files
+    ]
+    for path in listing.files:
+        shown = display_path(path.name)
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError) as exc:
+            reason = getattr(exc, "strerror", None) or type(exc).__name__
+            problems.append(f"cannot read source config {shown} in {shown_dir}: {reason}.")
+            continue
+        except yaml.YAMLError as exc:
+            # Line number only: the parser's message can quote untrusted file bytes (F8).
+            mark = getattr(exc, "problem_mark", None)
+            where = f" (line {mark.line + 1})" if mark is not None else ""
+            problems.append(f"source config {shown} in {shown_dir} is not valid YAML{where}.")
+            continue
+        if not isinstance(data, dict) or not data:
+            problems.append(
+                f"source config {shown} in {shown_dir} is empty or not a YAML mapping."
+            )
+    if not listing.files:
+        problems.append(f"No sources configured: config dir {shown_dir} has no *.yaml source configs.")
+    return problems
 
 
 def _checkpoint_info(state_dir: Path, source: str) -> tuple[str, str, float | None]:
@@ -169,10 +218,13 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(args.out_dir)
     stale_days: int = args.stale_days
 
-    # A missing config dir means the checkout is broken, not that there is nothing
-    # to check; fail loudly instead of reporting success (terms-analysis#90).
-    if not config_dir.is_dir():
-        print(f"Error: config dir {config_dir} does not exist.", file=sys.stderr)
+    # A missing, unreadable or empty config dir means the checkout is broken, not
+    # that there is nothing to check; fail loudly instead of reporting success
+    # (terms-analysis#90, #173). No report is written: there is nothing true to say.
+    problems = _config_problems(config_dir)
+    if problems:
+        for problem in problems:
+            print(f"Error: {problem}", file=sys.stderr)
         return EXIT_CONFIG_MISSING
 
     today = _utc_now().strftime("%Y-%m-%d")
