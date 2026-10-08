@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -40,6 +41,12 @@ _FIXTURE_SOURCE = Path(__file__).resolve().parents[1] / "fixtures" / "sources" /
 # A directory name that tries to forge terminal output: clear-screen escape,
 # a newline followed by a fake status line, and a bidi override.
 _HOSTILE_NAME = "hostile-cfg\x1b[2J\nFORGED: all sources fresh\u202e"
+# A source config stem that tries to forge the report table: an ANSI escape and a cell
+# delimiter. Rendered through display_path, then "|" escaped as "\\|" (security F1).
+_HOSTILE_STEM = "e\x1b[31m|red"
+_HOSTILE_STEM_SHOWN = "e\\x1b[31m\\|red"
+# One report row: exactly five cells, each made of escapes or non-delimiter characters.
+_REPORT_ROW = re.compile(r"\|(?: (?:\\.|[^\\|\n])* \|){5}")
 
 
 def _run(config_dir: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
@@ -286,12 +293,20 @@ def test_script_runs_standalone_without_helper_module(tmp_path: Path, script: st
         ("para\u2029sep", "para\\u2029sep"),
         ("bad\udcffbyte", "bad\\udcffbyte"),
         ("pua\ue000x", "pua\\ue000x"),
+        ("unassigned\u0378x", "unassigned\\u0378x"),
+        # A literal backslash is escaped, so the text "\x1b" never looks like a real ESC (F2).
+        ("back\\slash", "back\\\\slash"),
+        ("a\\x1bb", "a\\\\x1bb"),
+        # Above U+FFFF: a fixed-width \U escape, so trailing text is not read as hex (F2).
+        ("plane16\U0010fffdfd", "plane16\\U0010fffdfd"),
+        ("tag\U000e0001x", "tag\\U000e0001x"),
         ("caf\u00e9 r\u00e9sum\u00e9", "caf\u00e9 r\u00e9sum\u00e9"),
     ],
     ids=[
         "plain", "lf", "cr", "vt-ff", "nel", "nul", "ansi-escape", "del", "bidi-override",
         "zero-width", "bom", "line-separator", "paragraph-separator", "lone-surrogate",
-        "private-use", "printable-unicode-kept",
+        "private-use", "unassigned-cn", "literal-backslash", "literal-escape-text",
+        "astral-private-use", "astral-format-tag", "printable-unicode-kept",
     ],
 )
 def test_display_path_escapes_unsafe_characters(mod: ModuleType, raw: str, expected: str) -> None:
@@ -316,8 +331,15 @@ def test_display_path_caps_length_at_boundary(mod: ModuleType) -> None:
     assert len(huge) == cap + len("...(truncated)")
 
 
-def test_both_scripts_share_one_display_cap() -> None:
-    assert health_check._MAX_DISPLAY_CHARS == check_approvals._MAX_DISPLAY_CHARS
+def test_folded_block_is_byte_identical_in_both_scripts() -> None:
+    # The banner promises one byte-identical copy per script; this is what enforces it.
+    blocks = []
+    for script in ("health_check.py", "check_approvals.py"):
+        src = (_SCRIPTS / script).read_text(encoding="utf-8")
+        start = src.index("# Directory listing and log-path rendering")
+        end = src.index("return YamlDirListing(files=files, non_files=non_files)", start)
+        blocks.append(src[start:end])
+    assert blocks[0] == blocks[1]
 
 
 @_SCRIPT_MODULES
@@ -349,6 +371,91 @@ def test_scan_rejects_a_file_given_as_the_dir(mod: ModuleType, tmp_path: Path) -
     f.write_text("")
     with pytest.raises(mod.YamlDirError, match="is not a directory"):
         mod.scan_yaml_dir(f, "config dir")
+
+
+# ---------------------------------------------------------------------------
+# Security F1: untrusted names and checkpoint text in the report (exit 0 and 1 paths)
+# ---------------------------------------------------------------------------
+
+
+def test_hostile_source_stem_is_escaped_in_report_and_stdout(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / f"{_HOSTILE_STEM}.yaml").write_text(_FIXTURE_SOURCE.read_text())
+    rc, out, _err = _run(config_dir, tmp_path, capsys)
+    assert rc == 1  # never run: the stale/never-run path, not a config error
+    (report,) = (tmp_path / "out" / "health").glob("*.md")
+    for text in (out, report.read_text()):
+        assert "\x1b" not in text
+        rows = [line for line in text.splitlines() if line.startswith("| ") and "---" not in line]
+        assert rows, "control: the report has a table"
+        for row in rows:
+            assert _REPORT_ROW.fullmatch(row), f"row has a forged cell delimiter: {row!r}"
+        assert f"| {_HOSTILE_STEM_SHOWN} |" in text  # still identifies the source
+
+
+def test_hostile_checkpoint_stage_is_escaped_on_exit_zero_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "eurlex.yaml").write_text(_FIXTURE_SOURCE.read_text())
+    state = tmp_path / "state"
+    state.mkdir()
+    stage = "pub\x1b[2J|lished\nFORGED | x | y | z | fresh |\u2028\u202e"
+    (state / "eurlex.checkpoint.json").write_text(json.dumps({"stage": stage}))
+    rc, out, _err = _run(config_dir, tmp_path, capsys)
+    assert rc == 0  # fresh source: the success path must be safe too
+    (report,) = (tmp_path / "out" / "health").glob("*.md")
+    for text in (out, report.read_text()):
+        for raw in ("\x1b", "\u2028", "\u202e"):
+            assert raw not in text
+        assert not any(line.startswith("FORGED") for line in text.splitlines())
+        rows = [line for line in text.splitlines() if line.startswith("| ") and "---" not in line]
+        for row in rows:
+            assert _REPORT_ROW.fullmatch(row), f"row has a forged cell delimiter: {row!r}"
+
+
+# ---------------------------------------------------------------------------
+# Grumpy 4: the config dir vanishing after main()'s check must not read as success
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("how", ["removed", "emptied"])
+def test_config_dir_lost_after_check_does_not_exit_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    # Reaches the guard in _source_names (and build_report's "no sources" branch) the
+    # only way it can be reached from main(): the dir changes between check and use.
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "eurlex.yaml").write_text(_FIXTURE_SOURCE.read_text())
+    real_check = health_check._config_problems
+
+    def check_then_lose_dir(d: Path) -> list[str]:
+        problems = real_check(d)
+        if how == "removed":
+            shutil.rmtree(d)
+        else:
+            for f in d.iterdir():
+                f.unlink()
+        return problems
+
+    monkeypatch.setattr(health_check, "_config_problems", check_then_lose_dir)
+    try:
+        rc: int | None = main([
+            "--config-dir", str(config_dir),
+            "--state-dir", str(tmp_path / "state"),
+            "--out-dir", str(tmp_path / "out"),
+        ])
+    except health_check.YamlDirError:
+        rc = None  # uncaught: the script dies with a traceback (exit 1), never 0
+    out = capsys.readouterr().out
+    # None: YamlDirError escaped main (exit 1); 1: reported as a problem; 2: config error.
+    assert rc in (None, 1, _EXIT_CONFIG), f"lost config dir reported success: {out!r}"
+    assert "No sources configured" not in out, "stdout claims a clean, empty run"
 
 
 # ---------------------------------------------------------------------------

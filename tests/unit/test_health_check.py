@@ -5,10 +5,18 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 # scripts/ is not a package; inject it into the path.
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
 
-from health_check import EXIT_CONFIG_MISSING, _status_label, build_report, main  # noqa: E402
+from health_check import (  # noqa: E402
+    EXIT_CONFIG_MISSING,
+    YamlDirError,
+    _status_label,
+    build_report,
+    main,
+)
 
 
 class TestStatusLabel:
@@ -28,18 +36,23 @@ class TestStatusLabel:
 
 
 class TestBuildReport:
-    def test_no_sources(self, tmp_path):
+    @pytest.mark.parametrize("make_dir", [True, False], ids=["empty-dir", "missing-dir"])
+    def test_no_sources_is_not_success(self, tmp_path, make_dir):
+        # Zero sources, or no dir at all, must never be a clean report (terms-analysis#173, grumpy 4).
         config_dir = tmp_path / "config"
-        config_dir.mkdir()
-        report, any_problem = build_report(
-            config_dir=config_dir,
-            state_dir=tmp_path / "state",
-            out_dir=tmp_path / "out",
-            stale_days=8,
-            today="2026-07-04",
-        )
-        assert "No sources" in report
-        assert any_problem is False
+        if make_dir:
+            config_dir.mkdir()
+        try:
+            _report, any_problem = build_report(
+                config_dir=config_dir,
+                state_dir=tmp_path / "state",
+                out_dir=tmp_path / "out",
+                stale_days=8,
+                today="2026-07-04",
+            )
+        except YamlDirError:
+            return  # failing closed by raising is acceptable
+        assert any_problem is True
 
     def test_all_fresh(self, tmp_path):
         config_dir = tmp_path / "config"

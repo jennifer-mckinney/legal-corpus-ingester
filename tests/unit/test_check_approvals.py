@@ -5,10 +5,12 @@ import sys
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 # scripts/ is not a package; inject it into the path.
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
 
-from check_approvals import check_approvals_dir, classify_approval  # noqa: E402
+from check_approvals import YamlDirError, check_approvals_dir, classify_approval  # noqa: E402
 
 # Valid 64-char lowercase hex sha256 used by tests that need a passing sha256.
 _VALID_SHA256 = "a" * 64
@@ -64,20 +66,19 @@ class TestClassifyApproval:
 
 
 class TestCheckApprovalsDir:
-    def test_no_directory_returns_empty(self, tmp_path):
-        """Non-existent directory yields empty rows and any_expired=False."""
+    def test_no_directory_fails_closed(self, tmp_path):
+        """A missing dir raises; it is never "nothing expired" (terms-analysis#173, grumpy 4)."""
         missing = tmp_path / "no_such_dir"
-        # check_approvals_dir expects a dir; caller (main()) guards is_dir() first.
-        # When called directly it will glob an absent path — should return empty.
-        rows, any_expired = check_approvals_dir(missing, date.today(), warn_days=60)
-        assert rows == []
-        assert any_expired is False
+        with pytest.raises(YamlDirError, match="does not exist"):
+            check_approvals_dir(missing, date.today(), warn_days=60)
 
-    def test_empty_directory_returns_empty(self, tmp_path):
-        """Empty directory yields no rows and any_expired=False."""
-        rows, any_expired = check_approvals_dir(tmp_path, date.today(), warn_days=60)
-        assert rows == []
-        assert any_expired is False
+    def test_empty_directory_is_not_success(self, tmp_path):
+        """Zero approval files must not read as "all OK" for any caller (terms-analysis#173)."""
+        try:
+            _rows, any_expired = check_approvals_dir(tmp_path, date.today(), warn_days=60)
+        except YamlDirError:
+            return  # failing closed by raising is acceptable
+        assert any_expired is True
 
     def test_valid_expired_approval(self, tmp_path):
         """An expired APPROVAL.yaml yields any_expired=True and an EXPIRED row."""

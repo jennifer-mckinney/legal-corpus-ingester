@@ -9,21 +9,24 @@ its branches and pin the argv=None path (folded in from a separate file, #173).
 """
 from __future__ import annotations
 
+import importlib
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
+import click
 import pytest
 from typer.testing import CliRunner
 
 from legal_corpus_ingester.cli import EXIT_USAGE, app, main
+from legal_corpus_ingester.pipeline.state import STAGES, CheckpointState, CheckpointStore
+from legal_corpus_ingester.sources.registry import load_all
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SRC = _REPO_ROOT / "src"
-# Usage errors use click's conventional exit code 2 (the same code the
-# `ingester` console script returns with no arguments).
-_EXIT_USAGE = 2
+_FIXTURE_SOURCE = _REPO_ROOT / "tests" / "fixtures" / "sources" / "eurlex.yaml"
 
 
 def _run_module(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -48,8 +51,8 @@ def _run_module(*args: str, cwd: Path) -> subprocess.CompletedProcess[str]:
 
 def test_python_dash_m_cli_without_subcommand_exits_nonzero(tmp_path: Path) -> None:
     result = _run_module(cwd=tmp_path)
-    assert result.returncode == _EXIT_USAGE, (
-        f"expected usage exit {_EXIT_USAGE}, got {result.returncode}; "
+    assert result.returncode == EXIT_USAGE, (
+        f"expected usage exit {EXIT_USAGE}, got {result.returncode}; "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
     # Usage goes to stderr so a caller capturing stdout cannot mistake it for output.
@@ -57,14 +60,20 @@ def test_python_dash_m_cli_without_subcommand_exits_nonzero(tmp_path: Path) -> N
 
 
 def test_python_dash_m_cli_runs_subcommand(tmp_path: Path) -> None:
+    # One real source config plus its checkpoint, so `status` has real work to show.
+    # Not an EMPTY sources/state pair: `status` exiting 0 on nothing is the silent-green
+    # path tracked by ingester/TA #190, and this test must not bless it.
     sources = tmp_path / "sources"
     state = tmp_path / "state"
     sources.mkdir()
-    state.mkdir()
+    (sources / _FIXTURE_SOURCE.name).write_text(_FIXTURE_SOURCE.read_text())
+    (name,) = load_all(sources)  # source name from the config, not a literal
+    CheckpointStore(state).save(CheckpointState(source_name=name, stage=STAGES[-1], corpus_version="v-test"))
+    status_line = f"{name}: {STAGES[-1]}"
     args = ["status", "--sources-dir", str(sources), "--state-dir", str(state)]
 
     expected = CliRunner().invoke(app, args)
-    assert expected.stdout.strip(), "control: in-process `status` printed nothing"
+    assert status_line in expected.stdout, "control: in-process `status` did not show the checkpoint"
 
     result = _run_module(*args, cwd=tmp_path)
     assert result.returncode == expected.exit_code, result.stderr
@@ -78,7 +87,25 @@ def test_python_dash_m_cli_runs_subcommand(tmp_path: Path) -> None:
 
 
 def test_cli_exit_usage_matches_click_convention() -> None:
-    assert EXIT_USAGE == _EXIT_USAGE
+    # Checked against click itself, not against a literal restated here.
+    assert click.exceptions.UsageError("x").exit_code == EXIT_USAGE
+
+
+def test_console_script_without_args_prints_usage_to_stderr_and_exits_usage(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Resolve the `ingester` console script exactly as pyproject.toml declares it, so the
+    # installed entry point and `python -m` cannot drift apart again (terms-analysis#173).
+    scripts = tomllib.loads((_REPO_ROOT / "pyproject.toml").read_text())["project"]["scripts"]
+    module_name, _, attr = scripts["ingester"].partition(":")
+    entry = getattr(importlib.import_module(module_name), attr)
+    monkeypatch.setattr(sys, "argv", ["ingester"])
+    with pytest.raises(SystemExit) as info:
+        entry()
+    captured = capsys.readouterr()
+    assert info.value.code == EXIT_USAGE
+    assert captured.out == "", "console script wrote help to stdout"
+    assert "Usage:" in captured.err
 
 
 def test_main_without_args_prints_usage_to_stderr_and_exits_usage(
@@ -95,15 +122,22 @@ def test_main_without_args_prints_usage_to_stderr_and_exits_usage(
 
 
 def test_main_with_args_runs_the_app(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # One real source config plus its checkpoint, so `status` has real work to show.
+    # Not an EMPTY sources/state pair: `status` exiting 0 on nothing is the silent-green
+    # path tracked by ingester/TA #190, and this test must not bless it.
     sources = tmp_path / "sources"
     state = tmp_path / "state"
     sources.mkdir()
-    state.mkdir()
+    (sources / _FIXTURE_SOURCE.name).write_text(_FIXTURE_SOURCE.read_text())
+    (name,) = load_all(sources)  # source name from the config, not a literal
+    CheckpointStore(state).save(CheckpointState(source_name=name, stage=STAGES[-1], corpus_version="v-test"))
+    status_line = f"{name}: {STAGES[-1]}"
     with pytest.raises(SystemExit) as info:
         main(["status", "--sources-dir", str(sources), "--state-dir", str(state)])
     captured = capsys.readouterr()
     assert info.value.code == 0
-    assert captured.out.strip()
+    # The checkpoint's stage is shown, which only happens when the command really ran.
+    assert status_line in captured.out.splitlines()
     assert "Usage:" not in captured.out, "main() showed help instead of running the command"
 
 

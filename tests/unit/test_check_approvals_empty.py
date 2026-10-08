@@ -13,6 +13,8 @@ cleanly with feat/g0-1-unwired-exit-nonzero (terms-analysis#90).
 from __future__ import annotations
 
 import os
+import re
+import shutil
 import stat
 import sys
 from collections.abc import Iterator
@@ -24,6 +26,8 @@ import pytest
 # scripts/ is not a package; inject it into the path.
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
 
+import check_approvals
+import yaml
 from check_approvals import main
 
 _EXIT_CONFIG = 2
@@ -37,6 +41,12 @@ _VALID_APPROVAL = (
 # A directory name that tries to forge log output: clear-screen escape,
 # a newline followed by a fake status line, and a bidi override.
 _HOSTILE_NAME = "hostile-appr\x1b[2J\nFORGED: all approvals OK\u202e"
+# An approval file stem that tries to forge the table: an ANSI escape and a cell
+# delimiter. Rendered through display_path, then "|" escaped as "\\|" (security F1).
+_HOSTILE_STEM = "e\x1b[31m|red"
+_HOSTILE_STEM_SHOWN = "e\\x1b[31m\\|red"
+# One table row: exactly four cells, each made of escapes or non-delimiter characters.
+_TABLE_ROW = re.compile(r"\|(?: (?:\\.|[^\\|\n])* \|){4}")
 
 
 def _run(argv: list[str], capsys: pytest.CaptureFixture[str]) -> tuple[int, str, str]:
@@ -274,6 +284,110 @@ def test_hostile_approvals_dir_name_is_sanitised_on_stderr(
         assert "\x1b" not in text
         assert "\u202e" not in text
     assert not any(line.startswith("FORGED") for line in err.splitlines())
+
+
+# ---------------------------------------------------------------------------
+# Security F1: untrusted stems, parser text and YAML values in the table (exit 0/1)
+# ---------------------------------------------------------------------------
+
+
+def test_hostile_stem_and_parse_error_are_escaped_on_exit_one_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sources = _sources(tmp_path / "srcs")
+    approvals = tmp_path / "appr"
+    approvals.mkdir()
+    body = "expiry: [PARSER-LEAK\n"
+    (approvals / f"{_HOSTILE_STEM}.yaml").write_text(body)
+    with pytest.raises(yaml.YAMLError) as parsed:
+        yaml.safe_load(body)
+    line = parsed.value.problem_mark.line + 1  # what the operator needs to find it
+    rc, out, err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
+    assert rc == _EXIT_EXPIRED_OR_INVALID
+    assert "\x1b" not in out + err
+    rows = [r for r in out.splitlines() if r.startswith("| ") and "---" not in r][1:]  # skip header
+    assert len(rows) == 1, f"parser text broke the table into extra lines: {out!r}"
+    assert _TABLE_ROW.fullmatch(rows[0]), f"row has a forged cell delimiter: {rows[0]!r}"
+    assert rows[0].startswith(f"| {_HOSTILE_STEM_SHOWN} | ERROR |")
+    # Line number only: the parser's message quotes file bytes (F8).
+    assert f"line {line}" in rows[0]
+    assert "PARSER-LEAK" not in out + err
+    assert "<unicode string>" not in out + err
+
+
+_HOSTILE_VALUE = "a\\e[2J|FORGED\\nx\\L\\u202e"  # YAML escapes: ESC, |, LF, U+2028, RLO
+
+
+@pytest.mark.parametrize(
+    ("approval", "expected_rc"),
+    [
+        (  # source_id on the exit-0 path: a valid, current approval
+            f'source_id: "{_HOSTILE_VALUE}"\nsigned_artifact_sha256: "{"a" * 64}"\nexpiry: "2099-01-01"\n',
+            0,
+        ),
+        (  # source_id on an ERROR row
+            f'source_id: "{_HOSTILE_VALUE}"\nexpiry: "2099-01-01"\n',
+            _EXIT_EXPIRED_OR_INVALID,
+        ),
+        (  # the raw expiry value on the invalid-date row
+            f'source_id: "plain"\nexpiry: "{_HOSTILE_VALUE}"\n',
+            _EXIT_EXPIRED_OR_INVALID,
+        ),
+    ],
+    ids=["source-id-ok-row", "source-id-error-row", "invalid-expiry-row"],
+)
+def test_hostile_yaml_values_are_escaped_in_table(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], approval: str, expected_rc: int
+) -> None:
+    sources = _sources(tmp_path / "srcs")
+    approvals = tmp_path / "appr"
+    approvals.mkdir()
+    (approvals / "eurlex.yaml").write_text(approval)
+    rc, out, err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
+    assert rc == expected_rc
+    for raw in ("\x1b", "\u2028", "\u202e"):
+        assert raw not in out + err
+    assert not any(line.startswith("FORGED") for line in out.splitlines())
+    rows = [r for r in out.splitlines() if r.startswith("| ") and "---" not in r][1:]
+    assert len(rows) == 1, f"a value broke the table into extra lines: {out!r}"
+    assert _TABLE_ROW.fullmatch(rows[0]), f"row has a forged cell delimiter: {rows[0]!r}"
+
+
+# ---------------------------------------------------------------------------
+# Grumpy 4: the approvals dir vanishing after main()'s check must not read as success
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("how", ["removed", "emptied"])
+def test_approvals_dir_lost_after_check_does_not_exit_zero(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    # Reaches the guard in check_approvals_dir the only way it can be reached from
+    # main(): the dir changes between the config check and the walk.
+    sources = _sources(tmp_path / "srcs")
+    approvals = tmp_path / "appr"
+    approvals.mkdir()
+    (approvals / "eurlex.yaml").write_text(_VALID_APPROVAL)
+    real_check = check_approvals._config_problems
+
+    def check_then_lose_dir(sources_dir: Path, approvals_dir: Path) -> list[str]:
+        problems = real_check(sources_dir, approvals_dir)
+        if how == "removed":
+            shutil.rmtree(approvals_dir)
+        else:
+            for f in approvals_dir.iterdir():
+                f.unlink()
+        return problems
+
+    monkeypatch.setattr(check_approvals, "_config_problems", check_then_lose_dir)
+    argv = ["--sources-dir", str(sources), "--approvals-dir", str(approvals)]
+    try:
+        rc: int | None = main(argv)
+    except check_approvals.YamlDirError:
+        rc = None  # uncaught: the script dies with a traceback (exit 1), never 0
+    out = capsys.readouterr().out
+    # None: YamlDirError escaped main (exit 1); 1: reported invalid; 2: config error.
+    assert rc in (None, _EXIT_EXPIRED_OR_INVALID, _EXIT_CONFIG), f"lost approvals dir reported success: {out!r}"
 
 
 # ---------------------------------------------------------------------------
