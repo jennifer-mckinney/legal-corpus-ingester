@@ -14,6 +14,7 @@ import pytest
 import yaml
 from typer.testing import CliRunner
 
+from legal_corpus_ingester import cli
 from legal_corpus_ingester.cli import app
 
 runner = CliRunner()
@@ -102,6 +103,7 @@ class TestValidateRoundTripConsumer:
         result = runner.invoke(app, ["validate-round-trip", str(bundle)])
         assert result.exit_code == 0, result.output
         assert "VALID" in result.output
+        assert "consumer check skipped" not in result.output
         assert "terms-analysis round-trip: OK" in result.output
 
     def test_retrieve_returns_none_list_exits_1(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -148,10 +150,9 @@ class TestValidateRoundTripConsumer:
         assert result.exit_code == 1
         assert "terms-analysis error" in result.output
 
-    def test_module_not_found_skips_gracefully(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """When terms-analysis is not installed, validate-round-trip exits 0 and skips."""
-        bundle = _make_bundle(tmp_path)
-
+    @staticmethod
+    def _make_consumer_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Make the terms-analysis consumer import raise ModuleNotFoundError."""
         # Remove any stubs that may have been installed in prior tests
         for key in (
             "backend",
@@ -173,6 +174,29 @@ class TestValidateRoundTripConsumer:
 
         monkeypatch.setattr(importlib, "import_module", _raise_for_legal_kb)
 
+    def test_module_not_found_exits_consumer_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing consumer is not a pass: exits EXIT_CONSUMER_SKIPPED, never prints VALID."""
+        bundle = _make_bundle(tmp_path)
+        self._make_consumer_missing(monkeypatch)
+
         result = runner.invoke(app, ["validate-round-trip", str(bundle)])
+        assert result.exit_code == cli.EXIT_CONSUMER_SKIPPED, result.output
+        assert result.exit_code not in (0, 1)
+        assert "VALID" not in result.stdout
+        assert "NOT checked" in result.stderr
+
+    def test_module_not_found_with_opt_out_says_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--allow-missing-consumer exits 0 but labels the verdict as consumer-skipped."""
+        bundle = _make_bundle(tmp_path)
+        self._make_consumer_missing(monkeypatch)
+
+        result = runner.invoke(
+            app, ["validate-round-trip", str(bundle), "--allow-missing-consumer"]
+        )
         assert result.exit_code == 0, result.output
         assert "not installed" in result.output
+        assert "VALID (consumer check skipped)" in result.output

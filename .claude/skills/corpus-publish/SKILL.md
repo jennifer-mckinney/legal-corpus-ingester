@@ -20,6 +20,7 @@ allowed-tools: Bash, Read, Grep, Glob
    ingester validate-round-trip out/current
    ```
    Expected: parse → chunk → embed → serialize → deserialize → terms-analysis retrieve → non-empty result
+   Run where terms-analysis is importable (for example `PYTHONPATH=<terms-analysis>/src`); otherwise it exits 4 (`EXIT_CONSUMER_SKIPPED`), not VALID.
 
 2. **Publish bundle**
    ```bash

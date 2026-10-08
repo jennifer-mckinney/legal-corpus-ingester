@@ -19,7 +19,8 @@ note below.
 
 ## Steps
 
-The single `test` job runs these steps sequentially:
+The single `test` job runs these steps sequentially. Every step runs under the workflow-level `shell: bash -eo pipefail {0}`, so a failing
+command piped into `tail` still fails the step (terms-analysis#90).
 
 1. `actions/checkout@v4` - pulls the ref under test.
 2. `Set up Python` - runs `python3 --version` to confirm the runner's Python is reachable.

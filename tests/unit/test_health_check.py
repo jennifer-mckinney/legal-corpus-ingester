@@ -8,7 +8,7 @@ from pathlib import Path
 # scripts/ is not a package; inject it into the path.
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
 
-from health_check import _status_label, build_report  # noqa: E402
+from health_check import EXIT_CONFIG_MISSING, _status_label, build_report, main  # noqa: E402
 
 
 class TestStatusLabel:
@@ -78,3 +78,25 @@ class TestBuildReport:
         )
         assert "never-run" in report
         assert any_problem is True
+
+
+class TestMainExitCodes:
+    """main() must not report success when it could not check anything (terms-analysis#90)."""
+
+    def test_missing_config_dir_exits_config_missing(self, tmp_path, capsys):
+        missing = tmp_path / "no-such-config"
+        rc = main(["--config-dir", str(missing), "--state-dir", str(tmp_path / "state"),
+                   "--out-dir", str(tmp_path / "out")])
+        assert rc == EXIT_CONFIG_MISSING
+        assert EXIT_CONFIG_MISSING not in (0, 1)
+        captured = capsys.readouterr()
+        assert "does not exist" in captured.err
+        assert captured.out == ""
+
+    def test_never_run_source_exits_one(self, tmp_path):
+        config_dir = tmp_path / "config"
+        config_dir.mkdir()
+        (config_dir / "eurlex.yaml").write_text("name: eurlex\n")
+        rc = main(["--config-dir", str(config_dir), "--state-dir", str(tmp_path / "state"),
+                   "--out-dir", str(tmp_path / "out")])
+        assert rc == 1

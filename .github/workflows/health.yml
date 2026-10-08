@@ -4,11 +4,18 @@ on:
     - cron: '0 3 * * *'   # 3 AM UTC daily
   workflow_dispatch:
 
+# Explicit pipefail: GitHub's default `bash -e` lets `cmd | tail` hide cmd's failure (terms-analysis#90).
+defaults:
+  run:
+    shell: bash -eo pipefail {0}
+
 jobs:
   health:
     runs-on: [self-hosted, legal-corpus-ingester]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false  # no step needs git credentials; keep the token out of .git/config
 
       - name: Set up Python
         run: python3 --version
@@ -22,12 +29,13 @@ jobs:
       - name: Run ingester status
         run: |
           source .venv/bin/activate
-          ingester status || true
+          ingester status   # exits 0 on a healthy system (incl. 'No runs recorded'); no masking (terms-analysis#90)
 
       - name: Run health check
         run: |
           source .venv/bin/activate
-          python scripts/health_check.py || { rc=$?; [ $rc -le 1 ] || exit $rc; }
+          # Exit 1 = stale/never-run source, 2 = config dir missing: both are real problems and turn the run red (terms-analysis#90).
+          python scripts/health_check.py
 
       - name: Upload health report
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
