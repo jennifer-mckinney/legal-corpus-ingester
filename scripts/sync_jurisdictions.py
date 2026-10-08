@@ -6,13 +6,20 @@ and writes src/legal_corpus_ingester/jurisdictions.py with a frozenset.
 
 Run: python scripts/sync_jurisdictions.py
 Idempotent: running twice produces identical output.
+
+The terms-analysis checkout is TERMS_ANALYSIS_ROOT when that is set and not
+empty (CI checks it out into the workspace), else the directory named
+terms-analysis beside this repo.
 """
 from __future__ import annotations
 import ast
+import os
 import sys
 from pathlib import Path
 
-TERMS_ANALYSIS_SCHEMAS = Path(__file__).parent.parent.parent / "terms-analysis" / "src" / "backend" / "app" / "schemas.py"
+ROOT_ENV = "TERMS_ANALYSIS_ROOT"
+DEFAULT_TERMS_ANALYSIS_ROOT = Path(__file__).resolve().parent.parent.parent / "terms-analysis"
+SCHEMAS_IN_ROOT = Path("src") / "backend" / "app" / "schemas.py"
 OUT_FILE = Path(__file__).parent.parent / "src" / "legal_corpus_ingester" / "jurisdictions.py"
 
 HEADER = '''\
@@ -69,12 +76,23 @@ def extract_jurisdiction_codes(schemas_path: Path) -> list[str]:
     raise ValueError(f"Could not find 'Jurisdiction' Literal assignment in {schemas_path}")
 
 
+def terms_analysis_schemas() -> Path:
+    """terms-analysis's schemas.py, under TERMS_ANALYSIS_ROOT or the default."""
+    root = os.environ.get(ROOT_ENV, "")
+    return (Path(root) if root else DEFAULT_TERMS_ANALYSIS_ROOT) / SCHEMAS_IN_ROOT
+
+
 def main() -> None:
-    if not TERMS_ANALYSIS_SCHEMAS.exists():
-        print(f"ERROR: terms-analysis schemas not found at {TERMS_ANALYSIS_SCHEMAS}", file=sys.stderr)
+    schemas = terms_analysis_schemas()
+    if not schemas.is_file():
+        print(
+            f"ERROR: terms-analysis schemas not found at {schemas} "
+            f"(set {ROOT_ENV} to the terms-analysis checkout)",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
-    codes = sorted(extract_jurisdiction_codes(TERMS_ANALYSIS_SCHEMAS))
+    codes = sorted(extract_jurisdiction_codes(schemas))
     entries = "\n".join(f'    "{code}",' for code in codes)
     content = HEADER.format(entries=entries)
     OUT_FILE.write_text(content, encoding="utf-8")

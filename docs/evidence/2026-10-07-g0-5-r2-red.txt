@@ -1,0 +1,111 @@
+# G0-5 round-2 red run and mutation probes (terms-analysis#175)
+
+## Red: test_p9_gate_fix_r2.py against the pre-fix hook and doc (tip 35eb7e9 / 1868450)
+Tests that pass here pin behaviour the pre-fix hook already had (the round-2 mutation survivors M3/M18/M19/M22 and the installer contract); the mutation table below shows each of them can fail.
+
+E         error: failed to push some refs to '<sandbox>/test_up_to_date_push_succeeds_0/remote.git'
+PASSED tests/test_p9_gate_fix_r2.py::test_range_base_on_remote_covers_the_intermediate_commits
+PASSED tests/test_p9_gate_fix_r2.py::test_tip_already_on_remote_needs_no_range
+PASSED tests/test_p9_gate_fix_r2.py::test_complete_override_replaces_the_range_check
+PASSED tests/test_p9_gate_fix_r2.py::test_remote_sha_from_stdin_counts_as_published
+PASSED tests/test_p9_gate_fix_r2.py::test_unknown_remote_sha_is_ignored_not_fatal
+PASSED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[string-finding-security_engineer]
+PASSED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[nit-finding-security_engineer]
+PASSED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[empty-object-security_engineer]
+PASSED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[empty-string-security_engineer]
+PASSED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[null-security_engineer]
+PASSED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[string-security_engineer]
+PASSED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[zero-security_engineer]
+PASSED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[false-security_engineer]
+PASSED tests/test_p9_gate_fix_r2.py::test_pass_with_empty_findings_for_both_roles_is_allowed
+PASSED tests/test_p9_gate_fix_r2.py::test_non_commit_object_is_refused[blob]
+PASSED tests/test_p9_gate_fix_r2.py::test_non_commit_object_is_refused[tree]
+PASSED tests/test_p9_gate_fix_r2.py::test_non_commit_object_is_refused[unknown]
+PASSED tests/test_p9_gate_fix_r2.py::test_missing_python3_refuses_a_validly_signed_push
+PASSED tests/test_p9_gate_fix_r2.py::test_sha256_signed_push_is_allowed
+PASSED tests/test_p9_gate_fix_r2.py::test_sha256_unsigned_push_is_refused
+PASSED tests/test_p9_gate_fix_r2.py::test_sha256_range_base_covers_intermediate
+PASSED tests/test_p9_gate_fix_r2.py::test_sha256_deletion_is_allowed
+PASSED tests/test_p9_gate_fix_r2.py::test_installer_replaces_absolute_hooks_path_and_exits_zero[main]
+PASSED tests/test_p9_gate_fix_r2.py::test_installer_replaces_absolute_hooks_path_and_exits_zero[worktree]
+PASSED tests/test_p9_gate_fix_r2.py::test_in_ci_parses_only_real_ci_markers[true-True]
+PASSED tests/test_p9_gate_fix_r2.py::test_in_ci_parses_only_real_ci_markers[TRUE-True]
+PASSED tests/test_p9_gate_fix_r2.py::test_in_ci_parses_only_real_ci_markers[1-True]
+PASSED tests/test_p9_gate_fix_r2.py::test_in_ci_parses_only_real_ci_markers[ true -True]
+PASSED tests/test_p9_gate_fix_r2.py::test_in_ci_parses_only_real_ci_markers[false-False]
+PASSED tests/test_p9_gate_fix_r2.py::test_in_ci_parses_only_real_ci_markers[0-False]
+PASSED tests/test_p9_gate_fix_r2.py::test_in_ci_parses_only_real_ci_markers[-False]
+PASSED tests/test_p9_gate_fix_r2.py::test_in_ci_parses_only_real_ci_markers[None-False]
+PASSED tests/test_p9_gate_fix_r2.py::test_in_ci_parses_only_real_ci_markers[yes-False]
+FAILED tests/test_p9_gate_fix_r2.py::test_signed_tip_over_unsigned_intermediate_without_base_is_refused
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[range-null]
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[range-without-base]
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[range-string]
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[range-list]
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[base-ref-name]
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[base-39-hex]
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[base-41-hex]
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[base-upper]
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[base-newline]
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[base-null]
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[base-int]
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[base-unknown]
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[base-not-ancestor]
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[base-not-on-remote]
+FAILED tests/test_p9_gate_fix_r2.py::test_bad_or_uncovering_range_is_refused[base-is-the-tip]
+FAILED tests/test_p9_gate_fix_r2.py::test_glob_remote_name_does_not_borrow_tracking_refs
+FAILED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[string-finding-grumpy_developer]
+FAILED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[nit-finding-grumpy_developer]
+FAILED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[empty-object-grumpy_developer]
+FAILED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[empty-string-grumpy_developer]
+FAILED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[null-grumpy_developer]
+FAILED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[string-grumpy_developer]
+FAILED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[zero-grumpy_developer]
+FAILED tests/test_p9_gate_fix_r2.py::test_pass_with_findings_other_than_empty_list_is_refused[false-grumpy_developer]
+FAILED tests/test_p9_gate_fix_r2.py::test_validator_without_an_ok_line_is_refused[silent-exit-0]
+FAILED tests/test_p9_gate_fix_r2.py::test_validator_without_an_ok_line_is_refused[bare-ok]
+FAILED tests/test_p9_gate_fix_r2.py::test_validator_without_an_ok_line_is_refused[bad-override-flag]
+FAILED tests/test_p9_gate_fix_r2.py::test_validator_without_an_ok_line_is_refused[bad-base]
+FAILED tests/test_p9_gate_fix_r2.py::test_validator_without_an_ok_line_is_refused[two-lines]
+FAILED tests/test_p9_gate_fix_r2.py::test_git_failure_inside_the_range_check_refuses[no-base]
+FAILED tests/test_p9_gate_fix_r2.py::test_git_failure_inside_the_range_check_refuses[with-base]
+FAILED tests/test_p9_gate_fix_r2.py::test_empty_stdin_exits_zero_with_a_notice
+FAILED tests/test_p9_gate_fix_r2.py::test_up_to_date_push_succeeds_and_chains
+FAILED tests/test_p9_gate_fix_r2.py::test_shared_doc_section_matches_the_cross_repo_pin
+FAILED tests/test_p9_gate_fix_r2.py::test_doc_states_the_hook_contract_verbatim
+36 failed, 33 passed, 2 warnings in 45.59s
+
+## Mutation probes against the fixed hook (one mutation at a time, file restored after each)
+mutation | selected tests | result | pytest summary
+range-tip-only-skip | signed_tip_over_unsigned or range-null or range-without-base or glob_remote | KILLED | 4 failed, 65 deselected, 2 warnings in 4.24s
+zero-new-refused | tip_already_on_remote | KILLED | 1 failed, 68 deselected, 2 warnings in 0.84s
+base-ignored | range_base_on_remote_covers or sha256_range | KILLED | 2 failed, 67 deselected, 2 warnings in 1.80s
+no-ancestor-check | base-not-ancestor | KILLED | 1 failed, 68 deselected, 2 warnings in 1.29s
+no-on-remote-check | base-not-on-remote or base-is-the-tip | KILLED | 2 failed, 67 deselected, 2 warnings in 2.41s
+base-not-resolved | base-unknown | KILLED | 1 failed, 68 deselected, 2 warnings in 1.25s
+objectid-prefix-match | base-41-hex or base-newline | KILLED | 2 failed, 67 deselected, 2 warnings in 2.29s
+range-type-unchecked | range-string or range-list | KILLED | 2 failed, 67 deselected, 2 warnings in 2.27s
+override-still-range-checked | override_replaces_the_range | KILLED | 1 failed, 68 deselected, 2 warnings in 1.23s
+glob-remote-name-used | glob_remote_name | KILLED | 1 failed, 68 deselected, 2 warnings in 0.83s
+remote-sha-not-counted | remote_sha_from_stdin | KILLED | 1 failed, 68 deselected, 2 warnings in 0.92s
+remote-sha-not-verified | unknown_remote_sha | KILLED | 1 failed, 68 deselected, 2 warnings in 0.86s
+grumpy-findings-unchecked | grumpy_developer | KILLED | 8 failed, 61 deselected, 2 warnings in 5.84s
+findings-type-unchecked | pass_with_findings_other | KILLED | 10 failed, 6 passed, 53 deselected, 2 warnings in 11.24s
+empty-findings-refused | pass_with_empty_findings | KILLED | 1 failed, 68 deselected, 2 warnings in 1.26s
+M22-non-commit-passes | non_commit_object | KILLED | 3 failed, 66 deselected, 2 warnings in 1.63s
+python-missing-skips | missing_python3 | KILLED | 1 failed, 68 deselected, 2 warnings in 0.80s
+verdict-line-unchecked | validator_without_an_ok_line | KILLED | 5 failed, 64 deselected, 2 warnings in 3.96s
+empty-stdin-refused | empty_stdin or up_to_date | KILLED | 2 failed, 67 deselected, 2 warnings in 1.28s
+M18-sha-40-only | sha256_signed | KILLED | 1 failed, 68 deselected, 2 warnings in 0.71s
+M19-zero-40-only | sha256_deletion | KILLED | 1 failed, 68 deselected, 2 warnings in 0.55s
+verdict-re-40-only | sha256_range | KILLED | 1 failed, 68 deselected, 2 warnings in 0.75s
+objectid-40-only | sha256_range | KILLED | 1 failed, 68 deselected, 2 warnings in 0.82s
+installer-refuses-replacement | installer_replaces_absolute | KILLED | 2 failed, 67 deselected, 2 warnings in 0.84s
+doc-shared-edited | cross_repo_pin | KILLED | 1 failed, 68 deselected, 2 warnings in 0.09s
+hook-contract-edited | hook_contract_verbatim | KILLED | 1 failed, 68 deselected, 2 warnings in 0.09s
+in-ci-bool | in_ci_parses | KILLED | 3 failed, 6 passed, 60 deselected, 2 warnings in 0.11s
+revlist-failure-passes-no-base | range_check_refuses and no-base | KILLED | 1 failed, 68 deselected, 2 warnings in 1.02s
+revlist-failure-passes-with-base | range_check_refuses and with-base | KILLED | 1 failed, 68 deselected, 2 warnings in 0.96s
+ALL KILLED
+
+Ingester run of the same probes: 29 of 29 killed.

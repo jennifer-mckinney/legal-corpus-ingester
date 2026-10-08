@@ -1,0 +1,72 @@
+# G0-5 red run (ingester, base e184b8a) 2026-10-07T21:37:48Z
+# cmd: python -m pytest tests/unit/test_p9_prepush_gate.py --no-cov -rA --tb=line
+============================= test session starts ==============================
+platform darwin -- Python 3.14.3, pytest-9.1.1, pluggy-1.6.0
+rootdir: <worktree>
+configfile: pyproject.toml
+plugins: recording-0.13.4, cov-7.1.0, anyio-4.14.1, syrupy-5.4.0
+collected 11 items
+
+tests/unit/test_p9_prepush_gate.py .F.FF.F.F.F                           [100%]
+
+=================================== FAILURES ===================================
+E   AssertionError: push from worktree with signoff at <tmp>/test_push_with_valid_signoff_i1/main/.git/reviews was refused:
+      P9 pre-push gate: signoff not found for HEAD e69debff51a3
+      
+      Expected signoff: .git/reviews/e69debff51a399745b4b6d6969e72f4eeb165134.signoff.json
+      
+      To satisfy P9: ask Claude to dispatch security-engineer + grumpy-developer
+      review, then write the signoff. Example prompt:
+          "run p9 review on HEAD and write signoff"
+      
+      Emergency override (records who + why): write a signoff with
+      override.used = true. See automations/p9-pre-push.md for schema.
+      error: failed to push some refs to '<tmp>/test_push_with_valid_signoff_i1/remote.git'
+      
+    assert 1 == 0
+     +  where 1 = CompletedProcess(args=['git', 'push', 'origin', 'HEAD:refs/heads/a-worktree'], returncode=1, stdout='', stderr='P9 pre...<tmp>/<pytest-tmp>/pytest-114/test_push_with_valid_signoff_i1/remote.git\'\n').returncode
+<worktree>/tests/unit/test_p9_prepush_gate.py:161: AssertionError: push from worktree with signoff at <tmp>/test_push_with_valid_signoff_i1/main/.git/reviews was refused:
+E   AssertionError: gate in worktree names <tmp>/test_push_without_signoff_is_r1/wt/.git/reviews/5d62bdbc9be1c5b6449a4d2f4313385b53b685c4.signoff.json, but signoffs live at <tmp>/test_push_without_signoff_is_r1/main/.git/reviews/5d62bdbc9be1c5b6449a4d2f4313385b53b685c4.signoff.json
+    assert '/private/var....signoff.json' == '/private/var....signoff.json'
+      
+      Skipping 117 identical leading characters in diff, use -v to show
+      - off_is_r1/main/.git/reviews/5d62bdbc9be1c5b6449a4d2f4313385b53b685c4.signoff.json
+      ?           ^^^^
+      + off_is_r1/wt/.git/reviews/5d62bdbc9be1c5b6449a4d2f4313385b53b685c4.signoff.json
+      ?           ^^
+<worktree>/tests/unit/test_p9_prepush_gate.py:192: AssertionError: gate in worktree names <tmp>/test_push_without_signoff_is_r1/wt/.git/reviews/5d62bdbc9be1c5b6449a4d2f4313385b53b685c4.signoff.json, but signoffs live at <tmp>/test_push_without_signoff_is_r1/main/.git/reviews/5d62bdbc9be1c5b6449a4d2f4313385b53b685c4.signoff.json
+E   AssertionError: signoff=True: main=(True, True) worktree=(False, False) (pushed_ok, remote_updated)
+    assert (True, True) == (False, False)
+      
+      At index 0 diff: True != False
+      Use -v to get more diff
+<worktree>/tests/unit/test_p9_prepush_gate.py:207: AssertionError: signoff=True: main=(True, True) worktree=(False, False) (pushed_ok, remote_updated)
+E   AssertionError: install-hooks.sh from worktree failed:
+      mkdir: .git: Not a directory
+      
+    assert 1 == 0
+     +  where 1 = CompletedProcess(args=['bash', 'scripts/install-hooks.sh'], returncode=1, stdout='', stderr='mkdir: .git: Not a directory\n').returncode
+<worktree>/tests/unit/test_p9_prepush_gate.py:225: AssertionError: install-hooks.sh from worktree failed:
+E   AssertionError: install-hooks.sh from worktree exited 1 without naming core.hooksPath:
+      mkdir: .git: Not a directory
+      
+    assert 'hooksPath' in 'mkdir: .git: Not a directory\n'
+     +  where 'mkdir: .git: Not a directory\n' = CompletedProcess(args=['bash', 'scripts/install-hooks.sh'], returncode=1, stdout='', stderr='mkdir: .git: Not a directory\n').stderr
+<worktree>/tests/unit/test_p9_prepush_gate.py:249: AssertionError: install-hooks.sh from worktree exited 1 without naming core.hooksPath:
+E   AssertionError: CI steps pipe pytest output without pipefail, masking failures: test: Unit tests, test: Integration tests, test: E2E tests
+    assert not ['test: Unit tests', 'test: Integration tests', 'test: E2E tests']
+<worktree>/tests/unit/test_p9_prepush_gate.py:295: AssertionError: CI steps pipe pytest output without pipefail, masking failures: test: Unit tests, test: Integration tests, test: E2E tests
+==================================== PASSES ====================================
+=========================== short test summary info ============================
+PASSED tests/unit/test_p9_prepush_gate.py::test_push_with_valid_signoff_in_common_dir_succeeds[main]
+PASSED tests/unit/test_p9_prepush_gate.py::test_push_without_signoff_is_refused_and_names_common_dir_path[main]
+PASSED tests/unit/test_p9_prepush_gate.py::test_install_hooks_sets_relative_hookspath[main]
+PASSED tests/unit/test_p9_prepush_gate.py::test_install_hooks_overrides_or_refuses_absolute_git_hooks_path[main]
+PASSED tests/unit/test_p9_prepush_gate.py::test_pre_push_hook_is_tracked_and_executable
+FAILED tests/unit/test_p9_prepush_gate.py::test_push_with_valid_signoff_in_common_dir_succeeds[worktree]
+FAILED tests/unit/test_p9_prepush_gate.py::test_push_without_signoff_is_refused_and_names_common_dir_path[worktree]
+FAILED tests/unit/test_p9_prepush_gate.py::test_main_checkout_and_worktree_behave_identically
+FAILED tests/unit/test_p9_prepush_gate.py::test_install_hooks_sets_relative_hookspath[worktree]
+FAILED tests/unit/test_p9_prepush_gate.py::test_install_hooks_overrides_or_refuses_absolute_git_hooks_path[worktree]
+FAILED tests/unit/test_p9_prepush_gate.py::test_ci_pytest_steps_propagate_exit_status
+========================= 6 failed, 5 passed in 5.89s ==========================
