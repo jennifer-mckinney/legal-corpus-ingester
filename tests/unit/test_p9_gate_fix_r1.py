@@ -104,7 +104,13 @@ def test_real_checkout_runs_the_tracked_gate() -> None:
 
     def query(*args: str) -> str:
         proc = subprocess.run(
-            ["git", *args], cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=30
+            ["git", *args],
+            cwd=REPO_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
         )
         assert proc.returncode == 0, proc.stderr
         return proc.stdout.strip()
@@ -135,6 +141,7 @@ def _hook(sb: Sandbox, cwd: Path, stdin: str) -> subprocess.CompletedProcess[str
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
     )
 
 

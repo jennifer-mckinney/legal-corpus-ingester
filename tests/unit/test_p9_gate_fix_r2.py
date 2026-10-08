@@ -79,6 +79,7 @@ def _hook_as(
         capture_output=True,
         text=True,
         timeout=60,
+        check=False,
     )
 
 
