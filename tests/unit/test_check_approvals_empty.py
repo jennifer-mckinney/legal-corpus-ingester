@@ -107,6 +107,12 @@ def test_empty_approvals_dir_with_source_configs_exits_nonzero(
     # Grumpy r2-4: the dir part of the message is the shared empty-dir wording.
     shared = check_approvals._empty_dir_problem(approvals, "approvals dir")
     assert shared.rstrip(".") in err
+    # G0-4 R6 (mutant M8): the empty-dir line and the unverified note are two separate
+    # stderr lines; folding the note into the shared line must fail this.
+    assert err.splitlines() == [
+        f"Error: {shared}",
+        f"Error: {n_configs} source config(s) in {check_approvals.display_path(sources)} are unverified.",
+    ]
 
 
 def test_missing_approvals_dir_exits_nonzero(
