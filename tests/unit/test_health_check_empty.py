@@ -22,6 +22,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -434,21 +435,25 @@ def _deep_nesting() -> bytes:
 
 
 @pytest.mark.parametrize(
-    "body",
+    ("body", "exc_type", "has_mark"),
     [
-        b"key: [unclosed\n",  # YAMLError with a line mark
-        b"key: \x07BELL\n",  # YAMLError without a mark
-        b"name: caf\xe9\n",  # not UTF-8
-        _deep_nesting(),  # not a YAMLError at all
+        (b"key: [unclosed\n", yaml.YAMLError, True),  # parse error with a line mark
+        (b"key: \x07BELL\n", yaml.YAMLError, False),  # reader error, no mark
+        (b"name: caf\xe9\n", UnicodeDecodeError, False),  # not UTF-8: fails at decode
+        (_deep_nesting(), RecursionError, False),  # not a YAMLError at all
     ],
     ids=["parse-error", "reader-error-no-mark", "non-utf8", "deep-nesting"],
 )
 def test_load_failure_text_is_the_same_in_both_scripts(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], body: bytes
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], body: bytes, exc_type: type[Exception], has_mark: bool
 ) -> None:
     # Grumpy r2-4: one load-failure rule and wording. Same bytes, same reason, both jobs.
-    with pytest.raises(Exception) as failed:  # any loader failure: the family is the point
+    # Grumpy r3-1: pin the exception type and mark per case, so a body that fails for a
+    # different reason cannot pass as the case it is named for.
+    with pytest.raises(exc_type) as failed:
         yaml.safe_load(body.decode("utf-8"))
+    assert isinstance(failed.value, exc_type)
+    assert (getattr(failed.value, "problem_mark", None) is not None) is has_mark
     reason = check_approvals._load_failure(failed.value)
     assert health_check._load_failure(failed.value) == reason
     assert reason and "BELL" not in reason and "unclosed" not in reason  # no file bytes (F8)
@@ -603,3 +608,84 @@ def test_fresh_valid_source_still_exits_zero(tmp_path: Path, capsys: pytest.Capt
     rc, out, _err = _run(config_dir, tmp_path, capsys)
     assert rc == 0
     assert "| eurlex |" in out
+
+
+# ---------------------------------------------------------------------------
+# Security r3 F4: YAML merge-key bomb and aliases in source configs
+# ---------------------------------------------------------------------------
+
+# Bounds for the bomb child. Same shape as the approvals test: RSS is sampled from
+# outside, because the exponential work runs in C inside yaml.safe_load.
+_BOMB_TIMEOUT_S = 10.0
+_BOMB_MAX_RSS_KB = 256 * 1024
+_BOMB_POLL_S = 0.02
+
+
+def _merge_key_bomb(levels: int) -> str:
+    """Each level merges the previous mapping twice via `<<`: ~2**levels work inside safe_load."""
+    lines = ["m0: &m0 {k0: 1}"]
+    for i in range(1, levels + 1):
+        lines.append(f"m{i}: &m{i} {{<<: [*m{i - 1}, *m{i - 1}], k{i}: 1}}")
+    return "\n".join(lines) + "\n"
+
+
+def _run_bounded(config_dir: Path, tmp_path: Path) -> tuple[int, str, str]:
+    """Run health_check.py in a child; kill it and fail if it passes the time or RSS cap."""
+    argv = [
+        sys.executable, str(_SCRIPTS / "health_check.py"),
+        "--config-dir", str(config_dir),
+        "--state-dir", str(tmp_path / "state"),
+        "--out-dir", str(tmp_path / "out"),
+    ]
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    start = time.monotonic()
+    peak = 0
+    try:
+        while proc.poll() is None:
+            ps = subprocess.run(
+                ["ps", "-o", "rss=", "-p", str(proc.pid)], capture_output=True, text=True, timeout=5, check=False
+            )
+            peak = max(peak, int(ps.stdout.strip() or 0))
+            elapsed = time.monotonic() - start
+            if peak > _BOMB_MAX_RSS_KB or elapsed > _BOMB_TIMEOUT_S:
+                proc.kill()
+                proc.communicate()
+                pytest.fail(
+                    f"YAML bomb was expanded: rss={peak} KB (cap {_BOMB_MAX_RSS_KB}), "
+                    f"{elapsed:.1f}s (cap {_BOMB_TIMEOUT_S}s)"
+                )
+            time.sleep(_BOMB_POLL_S)
+        out, err = proc.communicate(timeout=_BOMB_TIMEOUT_S)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    return proc.returncode, out, err
+
+
+def test_yaml_merge_key_bomb_is_a_config_problem_within_bounds(tmp_path: Path) -> None:
+    # ~900 bytes, exponential inside yaml.safe_load. Unfixed: >1.6 GB and a hang.
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    body = _merge_key_bomb(25) + "source_id: s\n"
+    assert len(body) < 2048  # control: the hostile input itself is small
+    (cfg / "mergebomb.yaml").write_text(body)
+    rc, out, err = _run_bounded(cfg, tmp_path)
+    assert rc == _EXIT_CONFIG, err[-2000:]
+    assert out == ""
+    assert any("mergebomb.yaml" in line and "not valid YAML" in line for line in err.splitlines()), err[-2000:]
+    assert "Traceback" not in err
+
+
+def test_plain_yaml_alias_in_a_source_config_is_rejected(tmp_path: Path) -> None:
+    # Source configs never need anchors, so even a harmless alias is refused at load.
+    # Control: the same mapping without the alias loads (no config problem for it).
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "plainalias.yaml").write_text('base: &a "x"\nsource_id: s\ncopy: *a\n')
+    (cfg / "noalias.yaml").write_text('base: "x"\nsource_id: s\ncopy: "x"\n')
+    rc, _out, err = _run_bounded(cfg, tmp_path)
+    lines = err.splitlines()
+    assert any("plainalias.yaml" in line and "not valid YAML" in line for line in lines), err[-2000:]
+    assert not any("noalias.yaml" in line for line in lines), err[-2000:]
+    assert rc == _EXIT_CONFIG, err[-2000:]

@@ -493,7 +493,9 @@ def test_non_scalar_is_rejected_without_rendering_it(
     (approvals / "ghost.yaml").write_text("placeholder: 1\n")
     loaded: dict[str, object] = {"source_id": "eurlex", "expiry": "2099-01-01", "signed_artifact_sha256": _SHA}
     loaded[field] = _NoStr(["x"])
+    # Whichever entry the script loads through (safe_load, or load with a no-alias Loader, r3 F4).
     monkeypatch.setattr(check_approvals.yaml, "safe_load", lambda _text: loaded)
+    monkeypatch.setattr(check_approvals.yaml, "load", lambda _text, Loader=None: loaded)  # noqa: N803
     rc, out, _err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
     assert rc == _EXIT_EXPIRED_OR_INVALID
     row_id = "ghost" if field == "source_id" else "eurlex"
@@ -569,9 +571,52 @@ def test_yaml_alias_bomb_is_an_error_row_within_bounds(tmp_path: Path, field: st
     (approvals / "bomb.yaml").write_text(body)
     rc, out, err = _run_bounded(["--sources-dir", str(sources), "--approvals-dir", str(approvals)])
     assert rc == _EXIT_EXPIRED_OR_INVALID, err[-2000:]
+    # Two valid defences: the type check (r3 F3) or refusal of the alias at load (r3 F4).
+    # Either way the file is an ERROR row and nothing was expanded.
     row_id = "bomb" if field == "source_id" else "eurlex"
-    assert f"| {row_id} | ERROR | {cell} | - |" in out.splitlines(), out[-2000:]
+    rows = out.splitlines()
+    by_type_check = f"| {row_id} | ERROR | {cell} | - |" in rows
+    refused_at_load = any(r.startswith("| bomb | ERROR | not valid YAML") for r in rows)
+    assert by_type_check or refused_at_load, out[-2000:]
     assert "Traceback" not in err
+
+
+def _merge_key_bomb(levels: int) -> str:
+    """Each level merges the previous mapping twice via `<<`: ~2**levels work inside safe_load."""
+    lines = ["m0: &m0 {k0: 1}"]
+    for i in range(1, levels + 1):
+        lines.append(f"m{i}: &m{i} {{<<: [*m{i - 1}, *m{i - 1}], k{i}: 1}}")
+    return "\n".join(lines) + "\n"
+
+
+def test_yaml_merge_key_bomb_is_an_error_row_within_bounds(tmp_path: Path) -> None:
+    # Security r3 F4: ~900 bytes, exponential inside yaml.safe_load itself, so the type
+    # checks that stop the F3 bomb never run. 25 levels took >1.6 GB and >20 s unfixed.
+    sources = _sources(tmp_path / "srcs")
+    approvals = tmp_path / "appr"
+    approvals.mkdir()
+    body = _merge_key_bomb(25) + _VALID_APPROVAL
+    assert len(body) < 2048  # control: the hostile input itself is small
+    (approvals / "mergebomb.yaml").write_text(body)
+    rc, out, err = _run_bounded(["--sources-dir", str(sources), "--approvals-dir", str(approvals)])
+    assert rc == _EXIT_EXPIRED_OR_INVALID, err[-2000:]
+    assert any(r.startswith("| mergebomb | ERROR |") for r in out.splitlines()), out[-2000:]
+    assert "Traceback" not in err
+
+
+def test_plain_yaml_alias_is_rejected_at_load(tmp_path: Path) -> None:
+    # Security r3 F4: configs never need anchors, so even a harmless alias is refused
+    # (the root fix for F3 and F4). Control: the same file without the alias is fine.
+    sources = _sources(tmp_path / "srcs")
+    approvals = tmp_path / "appr"
+    approvals.mkdir()
+    (approvals / "plainalias.yaml").write_text('base: &a "x"\n' + _VALID_APPROVAL + "copy: *a\n")
+    (approvals / "noalias.yaml").write_text('base: "x"\n' + _VALID_APPROVAL + 'copy: "x"\n')
+    rc, out, err = _run_bounded(["--sources-dir", str(sources), "--approvals-dir", str(approvals)])
+    rows = out.splitlines()
+    assert any(r.startswith("| plainalias | ERROR | not valid YAML") for r in rows), out[-2000:]
+    assert not any(r.startswith("| noalias | ERROR") for r in rows), out[-2000:]
+    assert rc == _EXIT_EXPIRED_OR_INVALID, err[-2000:]
 
 
 # ---------------------------------------------------------------------------
