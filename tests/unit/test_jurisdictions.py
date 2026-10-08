@@ -25,6 +25,18 @@ def test_sync_script_is_idempotent() -> None:
     from pathlib import Path
     script = Path("scripts/sync_jurisdictions.py")
     assert script.exists(), "sync_jurisdictions.py must exist"
+    schemas = (
+        script.resolve().parent.parent.parent
+        / "terms-analysis"
+        / "src"
+        / "backend"
+        / "app"
+        / "schemas.py"
+    )
+    if not schemas.is_file():
+        import pytest
+
+        pytest.skip("requires the adjacent terms-analysis checkout")
 
     subprocess.run(
         [sys.executable, str(script)],
