@@ -480,12 +480,35 @@ def test_parity_script_rejects_bad_arguments(
     assert not argv.exists()
 
 
-def _fake_python(tmp_path: Path, summary: str, code: int) -> tuple[Path, Path]:
+# The summary line pytest 9.1.1 prints under `PY_COLORS=1` or `FORCE_COLOR=1` (bytes captured
+# from a real run). `--color=no` overrides both variables and yields the plain line.
+_COLOURED_PASS = "\x1b[32m\x1b[32m\x1b[1m1 passed\x1b[0m\x1b[32m in 0.00s\x1b[0m\x1b[0m"
+
+
+def _fake_python(
+    tmp_path: Path, summary: str, code: int, coloured: str | None = None
+) -> tuple[Path, Path]:
+    """Fake interpreter: records argv, prints `summary` verbatim, exits `code`.
+
+    The output is read from a file, never embedded in sh source, so quotes, `$`,
+    backticks, `\\` and `%` reach the script byte for byte. With `coloured`, the fake
+    behaves like pytest: when the environment forces colour and `--color=no` is absent
+    from argv, it prints `coloured` instead.
+    """
     log = tmp_path / "python.argv"
     fake = tmp_path / "python-fake"
-    # `%` doubled: the summary is a printf format in the fake (coverage lines contain `100%`).
-    body = summary.replace("%", "%%")
-    fake.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{log}"\nprintf "....\\n{body}\\n"\nexit {code}\n')
+    payload = tmp_path / "pytest.out"
+    payload.write_text("....\n" + summary + "\n")
+    emit = f'cat "{payload}"'
+    if coloured is not None:
+        coloured_payload = tmp_path / "pytest-coloured.out"
+        coloured_payload.write_text("....\n" + coloured + "\n")
+        emit = (
+            f'case " $* " in *" --color=no "*) {emit} ;; *)\n'
+            f'  if [ "${{PY_COLORS:-}}" = 1 ] || [ -n "${{FORCE_COLOR:-}}" ]; then '
+            f'cat "{coloured_payload}"; else {emit}; fi ;;\nesac'
+        )
+    fake.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > "{log}"\n{emit}\nexit {code}\n')
     fake.chmod(0o755)
     return fake, log
 
@@ -520,6 +543,16 @@ def _fake_python(tmp_path: Path, summary: str, code: int) -> tuple[Path, Path]:
         pytest.param("=== 1 failed in 0.10s ===", 1, 1, id="banner-failed"),
         pytest.param("=== 1 failed, 1 passed in 0.10s ===", 0, 1, id="banner-failed-and-passed"),
         pytest.param("=== 1 passed, 1 error in 0.10s ===", 0, 1, id="banner-passed-and-error"),
+        pytest.param("=== 1 passed, 1 xfailed in 0.10s ===", 0, 1, id="banner-passed-and-xfailed"),
+        pytest.param("=== 1 passed, 1 xpassed in 0.10s ===", 0, 1, id="banner-passed-and-xpassed"),
+        pytest.param(
+            "=== 1 passed, 1 warning, 1 error in 0.10s ===", 0, 1, id="banner-passed-warning-error"
+        ),
+        # Shell metacharacters in pytest's output reach the script verbatim (N1).
+        pytest.param(
+            'note: "quoted" $HOME `echo injected` C:\\temp\\new 100%\n=== 1 passed in 0.10s ===',
+            0, 0, id="shell-metacharacters-in-output",
+        ),
         pytest.param("=== 11 passed in 0.10s ===", 0, 1, id="banner-eleven-passed"),
         pytest.param("=== 1 passed in 0.10s ===", 1, 1, id="banner-passed-nonzero-exit"),
         # "1 passed" only in an earlier line; the real summary says otherwise.
@@ -546,7 +579,30 @@ def test_check_requires_exactly_one_pass(
     proc = _script(tmp_path, "check", PARITY_NODE, extra={"PYTHON": str(fake)})
 
     assert proc.returncode == expected, proc.stdout + proc.stderr
-    assert log.read_text().splitlines() == ["-m", "pytest", PARITY_NODE, "-q", "-p", "no:cacheprovider"]
+    assert summary in proc.stdout
+    assert log.read_text().splitlines() == [
+        "-m", "pytest", PARITY_NODE, "-q", "-p", "no:cacheprovider", "--color=no",
+    ]
+
+
+@pytest.mark.parametrize(
+    "forcing",
+    [
+        pytest.param({"PY_COLORS": "1"}, id="py-colors"),
+        pytest.param({"FORCE_COLOR": "1"}, id="force-color"),
+    ],
+)
+def test_check_accepts_a_real_pass_when_the_runner_forces_colour(
+    tmp_path: Path, forcing: dict[str, str]
+) -> None:
+    # L1: a runner that forces colour must not turn a genuine pass into a failure.
+    fake, log = _fake_python(tmp_path, "=== 1 passed in 0.00s ===", 0, coloured=_COLOURED_PASS)
+
+    proc = _script(tmp_path, "check", PARITY_NODE, extra={"PYTHON": str(fake), **forcing})
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "\x1b" not in proc.stdout
+    assert "--color=no" in log.read_text().splitlines()
 
 
 # C3: the workflow runs the script, with fakes ------------------------------
