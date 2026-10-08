@@ -24,6 +24,11 @@ jobs:
           source .venv/bin/activate
           pip install -e '.[dev]' 2>&1 | tail -5
 
+      # Install the tracked P9 hooks (core.hooksPath) so the real-checkout gate
+      # test runs against them instead of failing under CI (terms-analysis#175).
+      - name: Install tracked git hooks
+        run: bash scripts/install-hooks.sh
+
       - name: Lint
         run: |
           source .venv/bin/activate
