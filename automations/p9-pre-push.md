@@ -30,6 +30,9 @@ two drift apart.
     range: range.base (a commit the remote already has) .. tip. Without
     range.base the reviewed range is the tip alone, so a push that carries
     an unreviewed intermediate commit along is refused.
+  - What the remote already has is read from its live advertisement for
+    the push URL (git ls-remote), never from local remote-tracking refs.
+    If the advertisement cannot be read or parsed, the push is refused.
   - A complete override (used: true + reason + authorized_by) replaces the
     verdict, findings and range checks, and is announced on stderr.
   - Deletions need no signoff. A push with nothing to send exits 0.
@@ -75,13 +78,24 @@ let any other branch, sha or `--all` push through).
    - `range`, when present, is an object, and `range.base`, when present,
      is a 40- or 64-hex commit sha (a ref name such as `origin/main` is
      refused: refs move, shas do not).
-7. Unless an override is active, the hook checks the reviewed range. The
-   commits new to the remote are
-   `git rev-list <tip> --not --remotes=<remote> <remote_sha>...`: the
-   remote-tracking refs plus the `remote_sha` values git read from the
-   remote for this push. (A remote name holding characters other than
-   letters, digits, `.`, `_` or `-` is not used as a `--remotes` pattern,
-   so only the `remote_sha` values count.)
+7. Unless an override is active, the hook checks the reviewed range. It
+   reads what the destination has from its live advertisement,
+   `git ls-remote -- <push-url>` (the URL git passes as the hook's second
+   argument), once per push. The commits new to the remote are
+   `git rev-list <tip> --not <advertised commits>`. Local
+   `refs/remotes/*` are never consulted: they go stale after a
+   server-side delete or a `git remote set-url`, and would vouch for
+   history the destination does not hold. The remote's name is only
+   printed, so a name with `/` or glob characters, or a push straight to
+   a URL, is judged the same way.
+   - If `ls-remote` fails, prints a line that is not `<id><TAB><ref>`,
+     or the advertised ids cannot be resolved, the ref is refused with
+     `cannot establish which commits are new to <remote>`.
+   - An advertised id that is not a commit in this clone (never fetched,
+     or a ref to a blob or tree) is left out, and nothing is fetched.
+     That can only make more commits count as new, which refuses; it
+     never lets an unreviewed commit through. Run `git fetch` and push
+     again if the refusal names commits the remote already has.
    - Without `range.base`, the tip must be the only new commit (or there
      are none). Otherwise the push is refused with
      `<n> commits are new to <remote>, but the signoff ... has no
@@ -212,7 +226,8 @@ Any pushed ref with no signoff, invalid JSON, a `head_sha` that differs
 from the pushed sha, a non-PASS verdict, a PASS with findings, a malformed
 `range`, an unreviewed new commit, a `range.base` that is not an ancestor
 or not on the remote, an object that is not a commit, a missing
-`python3`, or an incomplete override: the push is refused, the hook exits
+`python3`, a remote advertisement that cannot be read or parsed, or an
+incomplete override: the push is refused, the hook exits
 1, and a diagnostic naming the ref and the signoff path goes to stderr.
 
 ## Limits and server-side enforcement
@@ -227,10 +242,12 @@ mistakes, not a determined author. It is bypassed by:
   runs its own tracked hook;
 - a hand-written signoff, since signoffs are unsigned local JSON files.
 
-"Already on the remote" is judged from the remote-tracking refs and the
-`remote_sha` values of the push. A tracking ref for a branch that was
-since deleted on the remote still counts; the commits below it were
-gated when they were first pushed.
+"Already on the remote" is judged from the destination's live
+advertisement at push time. A branch deleted on the server, or a remote
+whose URL was changed, no longer vouches for its old history, so that
+history must be covered by the review range again. The hook contacts
+the push URL a second time for this; a remote that needs credentials may
+ask for them again.
 
 The enforcing control is server-side. `main` is branch-protected on
 GitHub in both terms-analysis and legal-corpus-ingester (PR required,
@@ -282,6 +299,31 @@ The hook runs against the dry-run transaction. With no signoff present
 it prints the "signoff not found" diagnostic and exits 1; nothing leaves
 the machine. If the remote is already up to date, git sends the hook no
 refs; it prints "nothing to push" and exits 0.
+
+## Cross-repo parity in CI
+
+The hook must stay byte-identical in terms-analysis and
+legal-corpus-ingester. Each repo's CI runs
+`test_pre_push_hook_matches_the_sibling_repos_published_hook`, which
+fetches the sibling's `.githooks/pre-push` from GitHub and compares
+sha256 digests. It fails closed when the fetch fails, and CI ignores the
+local opt-out `P9_SKIP_SIBLING_PARITY=1`. A dedicated CI step runs it
+alone and fails unless the summary is exactly `1 passed`, so a skip is
+red.
+
+The sibling ref is `P9_SIBLING_REF`. CI sets it to the PR's head branch
+(`github.head_ref`) when the sibling repo has a branch of that name, and
+to `main` otherwise (pushes to `main`, and PRs that do not touch the
+hook). If CI cannot ask GitHub whether that branch exists, the step
+fails.
+
+Bootstrap order for a hook change: push the same hook on a branch with
+the same name in both repos, then open both PRs. Each PR's parity step is
+red until the sibling branch carries the identical hook, and green once
+both do. Merge the two PRs back to back. Between the two merges, the
+first-merged repo's `main` build compares against the sibling's `main`,
+which still has the old hook, and is red; re-run it after the second
+merge.
 
 <!-- p9-shared:end -->
 

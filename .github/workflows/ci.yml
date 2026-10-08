@@ -34,7 +34,26 @@ jobs:
           source .venv/bin/activate
           mypy src/
 
+      # Cross-repo P9 hook parity (terms-analysis#175, Copilot C3): compare
+      # against the sibling's branch of the same name when it exists, else main.
+      - name: Resolve sibling ref for P9 hook parity
+        id: p9_sibling
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          ref="$(bash scripts/ci/p9-sibling-parity.sh resolve-ref jennifer-mckinney/terms-analysis "${HEAD_REF}")"
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+
+      - name: P9 hook parity with terms-analysis (must run, never skip)
+        env:
+          P9_SIBLING_REF: ${{ steps.p9_sibling.outputs.ref }}
+        run: |
+          source .venv/bin/activate
+          bash scripts/ci/p9-sibling-parity.sh check tests/unit/test_p9_gate_copilot.py::test_pre_push_hook_matches_the_sibling_repos_published_hook
+
       - name: Unit tests
+        env:
+          P9_SIBLING_REF: ${{ steps.p9_sibling.outputs.ref }}
         run: |
           source .venv/bin/activate
           pytest tests/unit tests/snapshot tests/cli -v --cov=src/legal_corpus_ingester --cov-report=xml --cov-fail-under=0 2>&1 | tail -30

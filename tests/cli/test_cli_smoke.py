@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import typer.main
 from typer.testing import CliRunner
 
 from legal_corpus_ingester.cli import app
@@ -48,8 +49,13 @@ def test_status_no_checkpoints(tmp_path: object, monkeypatch: object) -> None:  
 def test_fetch_dry_run_help() -> None:
     result = runner.invoke(app, ["fetch", "--help"])
     assert result.exit_code == 0
-    # ANSI-independent: Rich may split "--dry-run" across style codes under CI.
-    assert "--dry-run" in strip_ansi(result.output)
+    # Assert on the registered parameters, not the help text: the fetch
+    # docstring mentions --dry-run, so a text check passes without the option.
+    commands = getattr(typer.main.get_command(app), "commands", {})
+    assert "fetch" in commands, f"no fetch command: {sorted(commands)}"
+    fetch = commands["fetch"]
+    options = {opt for param in fetch.params for opt in getattr(param, "opts", [])}
+    assert "--dry-run" in options, f"fetch has no --dry-run option: {sorted(options)}"
 
 
 # ---------------------------------------------------------------------------

@@ -46,7 +46,7 @@ from tests.unit.test_p9_prepush_gate import (  # noqa: F401
 
 # Shared pin: the same constant appears in the sibling repo's copy of this
 # test, so a one-sided edit of the shared doc section fails that repo's suite.
-CANONICAL_P9_DOC_SHA256 = "6d4f2d58b8a900d8fdb8e756c4331209bc9a32563c7de690705f6f7bfe8705eb"
+CANONICAL_P9_DOC_SHA256 = "0cbb696f5477c458cbc4ad003d234c799bb00ef102ee616c051cc0ca24e837f3"
 SHARED_BEGIN = "<!-- p9-shared:begin -->"
 SHARED_END = "<!-- p9-shared:end -->"
 
@@ -62,9 +62,14 @@ def installed(tmp_path: Path) -> Sandbox:
 
 
 def _hook_as(
-    sb: Sandbox, cwd: Path, remote_name: str, stdin: str, path: str | None = None
+    sb: Sandbox,
+    cwd: Path,
+    remote_name: str,
+    stdin: str,
+    path: str | None = None,
+    url: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run the installed hook as git would, with a chosen remote name / PATH."""
+    """Run the installed hook as git would, with a chosen remote name / PATH / URL."""
     root = sb.env["P9_SANDBOX_ROOT"]
     real_cwd = Path(cwd).resolve()
     assert real_cwd == Path(root) or Path(root) in real_cwd.parents
@@ -72,7 +77,7 @@ def _hook_as(
     if path is not None:
         env["PATH"] = path
     return subprocess.run(
-        [str(cwd / ".githooks" / "pre-push"), remote_name, str(sb.remote)],
+        [str(cwd / ".githooks" / "pre-push"), remote_name, str(url or sb.remote)],
         cwd=cwd,
         env=env,
         input=stdin,
@@ -204,17 +209,23 @@ def _one_new_commit(sb: Sandbox) -> tuple[str, str]:
 
 
 def test_glob_remote_name_does_not_borrow_tracking_refs(installed: Sandbox) -> None:
-    """`--remotes=orig*` would match origin/main and wave the seed through."""
+    """A glob-like name pushing to an EMPTY remote: refs/remotes/origin/main
+    (the seed) must not count as published there, so 2 commits are new.
+    `--remotes=orig*` would have matched origin/main and waved the seed through."""
     _seed, tip = _one_new_commit(installed)
+    empty = installed.root / "glob-empty.git"
+    _git(installed.root, installed.env, "init", "-q", "--bare", str(empty))
     line = f"refs/heads/main {tip} refs/heads/main {ZERO_SHA}\n"
 
-    proc = _hook_as(installed, installed.main, "orig*", line)
+    proc = _hook_as(installed, installed.main, "orig*", line, url=empty)
 
     assert proc.returncode != 0
     assert "2 commits are new to orig*" in proc.stderr, proc.stderr
 
 
-def test_remote_sha_from_stdin_counts_as_published(installed: Sandbox) -> None:
+def test_glob_remote_name_is_judged_by_the_url_advertisement(installed: Sandbox) -> None:
+    """The name is only printed: the real remote advertises the seed, so the
+    tip is the one new commit (the stdin remote_sha column is not consulted)."""
     seed, tip = _one_new_commit(installed)
     line = f"refs/heads/main {tip} refs/heads/main {seed}\n"
 
