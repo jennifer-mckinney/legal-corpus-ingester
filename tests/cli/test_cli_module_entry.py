@@ -3,6 +3,9 @@
 Today cli.py has no `__main__` guard and the package has no `__main__.py`, so
 `python -m legal_corpus_ingester.cli <anything>` imports the module, defines the
 app, never calls it, and exits 0 having done nothing.
+
+The subprocess tests prove `python -m`; the in-process main() tests below measure
+its branches and pin the argv=None path (folded in from a separate file, #173).
 """
 from __future__ import annotations
 
@@ -11,9 +14,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
-from legal_corpus_ingester.cli import app
+from legal_corpus_ingester.cli import EXIT_USAGE, app, main
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SRC = _REPO_ROOT / "src"
@@ -66,3 +70,45 @@ def test_python_dash_m_cli_runs_subcommand(tmp_path: Path) -> None:
     assert result.returncode == expected.exit_code, result.stderr
     # Same observable output as the console-script entry point: proves the app ran.
     assert result.stdout == expected.stdout
+
+
+# ---------------------------------------------------------------------------
+# main() in-process
+# ---------------------------------------------------------------------------
+
+
+def test_cli_exit_usage_matches_click_convention() -> None:
+    assert EXIT_USAGE == _EXIT_USAGE
+
+
+def test_main_without_args_prints_usage_to_stderr_and_exits_usage(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["ingester"])
+    with pytest.raises(SystemExit) as info:
+        main()
+    captured = capsys.readouterr()
+    assert info.value.code == EXIT_USAGE
+    assert captured.out == ""
+    assert "Usage:" in captured.err
+    assert captured.err.rstrip().endswith("Error: Missing command.")
+
+
+def test_main_with_args_runs_the_app(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    sources = tmp_path / "sources"
+    state = tmp_path / "state"
+    sources.mkdir()
+    state.mkdir()
+    with pytest.raises(SystemExit) as info:
+        main(["status", "--sources-dir", str(sources), "--state-dir", str(state)])
+    captured = capsys.readouterr()
+    assert info.value.code == 0
+    assert captured.out.strip()
+    assert "Usage:" not in captured.out, "main() showed help instead of running the command"
+
+
+def test_main_unknown_command_is_a_usage_error(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as info:
+        main(["no-such-command"])
+    assert info.value.code == EXIT_USAGE
+    assert "no-such-command" in capsys.readouterr().err

@@ -6,22 +6,33 @@ MISSING config dir case. This file covers an EXISTING dir that yields zero
 usable source configs, plus the QUALITY-BAR attack list A for that input.
 
 Contract pinned here: exit 2 (config problem), message on stderr.
+
+Owner ruling (terms-analysis#173): the shared scripts/_yaml_dir.py is folded into
+health_check.py and check_approvals.py, so the directory-listing and log-path
+rules it held are tested here against BOTH scripts' copies, and each script must
+run on its own with no helper module beside it.
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
+import subprocess
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 # scripts/ is not a package; inject it into the path.
-sys.path.insert(0, str(Path(__file__).parent.parent.parent / "scripts"))
+_SCRIPTS = Path(__file__).parent.parent.parent / "scripts"
+sys.path.insert(0, str(_SCRIPTS))
 
+import check_approvals
+import health_check
 from health_check import main
 
 _EXIT_CONFIG = 2
@@ -115,21 +126,45 @@ def test_symlink_to_empty_dir_exits_config_error(tmp_path: Path, capsys: pytest.
     assert "No sources configured" in err
 
 
+_NOT_A_MAPPING = "is empty or not a YAML mapping"
+
+
+@pytest.mark.parametrize("beside_real_config", [False, True], ids=["alone", "beside-real-config"])
 @pytest.mark.parametrize(
-    "content",
-    ["", "# only a comment\n# and another\n", "---\n", "~\n"],
-    ids=["empty-file", "comments-only", "bare-document-marker", "yaml-null"],
+    ("content", "expected"),
+    [
+        ("", _NOT_A_MAPPING),
+        ("# only a comment\n# and another\n", _NOT_A_MAPPING),
+        ("---\n", _NOT_A_MAPPING),
+        ("~\n", _NOT_A_MAPPING),
+        ("{}\n", _NOT_A_MAPPING),
+        ("- a\n- b\n", _NOT_A_MAPPING),
+        ("just a string\n", _NOT_A_MAPPING),
+        ("key: [unclosed\n", "is not valid YAML (line "),
+    ],
+    ids=[
+        "empty-file", "comments-only", "bare-document-marker", "yaml-null",
+        "empty-mapping", "list", "scalar", "parse-error",
+    ],
 )
 def test_yaml_that_parses_to_nothing_exits_config_error(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str], content: str
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], content: str, expected: str,
+    beside_real_config: bool,
 ) -> None:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
+    if beside_real_config:
+        # One unusable file fails the run even when a good config sits next to it.
+        (config_dir / "eurlex.yaml").write_text(_FIXTURE_SOURCE.read_text())
     (config_dir / "ghost.yaml").write_text(content)
-    rc, _out, err = _run(config_dir, tmp_path, capsys)
+    rc, out, err = _run(config_dir, tmp_path, capsys)
     assert rc == _EXIT_CONFIG
     # The message names the offending file so the operator can fix it.
     assert "ghost.yaml" in err
+    assert expected in err
+    assert "[unclosed" not in err  # the parser's quote of file bytes is not echoed (F8)
+    assert out == ""
+    assert not (tmp_path / "out").exists(), "no report is written for a config error"
 
 
 def test_unreadable_config_dir_exits_config_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -140,8 +175,47 @@ def test_unreadable_config_dir_exits_config_error(tmp_path: Path, capsys: pytest
         rc, _out, err = _run(config_dir, tmp_path, capsys)
     assert rc == _EXIT_CONFIG
     assert "locked-config" in err
+    assert "cannot read config dir " in err
+    assert "Errno" not in err  # strerror only, not the exception's repr with the raw path
     # Honest reason: the dir holds a config, so "no sources" would be a false diagnosis.
     assert "No sources configured" not in err
+
+
+def test_yaml_directory_beside_real_config_is_config_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "eurlex.yaml").write_text(_FIXTURE_SOURCE.read_text())
+    (config_dir / "stray.yaml").mkdir()
+    rc, out, err = _run(config_dir, tmp_path, capsys)
+    assert rc == _EXIT_CONFIG
+    assert "stray.yaml in config dir" in err
+    assert "is not a regular file" in err
+    assert out == ""
+    assert not (tmp_path / "out").exists(), "no report is written for a config error"
+
+
+def test_non_utf8_source_yaml_is_config_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    (config_dir / "latin.yaml").write_bytes(b"name: caf\xe9\n")
+    rc, _out, err = _run(config_dir, tmp_path, capsys)
+    assert rc == _EXIT_CONFIG
+    assert "cannot read source config latin.yaml" in err
+    assert "UnicodeDecodeError" in err
+    assert "\xe9" not in err and "\ufffd" not in err  # no raw or replaced file bytes
+
+
+def test_unreadable_source_file_is_config_error(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    locked = config_dir / "locked.yaml"
+    locked.write_text(_FIXTURE_SOURCE.read_text())
+    with _unreadable(locked):
+        rc, _out, err = _run(config_dir, tmp_path, capsys)
+    assert rc == _EXIT_CONFIG
+    assert "cannot read source config locked.yaml" in err
 
 
 def test_hostile_config_dir_name_is_sanitised_on_stderr(
@@ -158,6 +232,123 @@ def test_hostile_config_dir_name_is_sanitised_on_stderr(
         assert "\x1b" not in text
         assert "\u202e" not in text
     assert not any(line.startswith("FORGED") for line in err.splitlines())
+
+
+# ---------------------------------------------------------------------------
+# Folded helper (terms-analysis#173 owner ruling): each script carries its own
+# copy of the listing and log-path rules; both copies must behave identically.
+# ---------------------------------------------------------------------------
+
+_SCRIPT_MODULES = pytest.mark.parametrize(
+    "mod", [health_check, check_approvals], ids=["health_check", "check_approvals"]
+)
+
+
+@pytest.mark.parametrize("script", ["health_check.py", "check_approvals.py"])
+def test_script_runs_standalone_without_helper_module(tmp_path: Path, script: str) -> None:
+    # The scheduled jobs run `python scripts/<script>`; after the fold no sibling
+    # helper module may be needed, so a lone copy must reach its own config check.
+    alone = tmp_path / "alone"
+    alone.mkdir()
+    shutil.copy2(_SCRIPTS / script, alone / script)
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    missing = tmp_path / "no-such-dir"
+    args = (
+        ["--config-dir", str(missing), "--state-dir", str(tmp_path / "s"), "--out-dir", str(tmp_path / "o")]
+        if script == "health_check.py"
+        else ["--sources-dir", str(missing), "--approvals-dir", str(missing)]
+    )
+    result = subprocess.run(
+        [sys.executable, str(alone / script), *args],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60, check=False,
+    )
+    assert "ModuleNotFoundError" not in result.stderr, result.stderr
+    assert result.returncode == _EXIT_CONFIG, result.stderr
+    assert "no-such-dir" in result.stderr
+
+
+@_SCRIPT_MODULES
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("plain/dir", "plain/dir"),
+        ("a\nb", "a\\x0ab"),
+        ("a\rb", "a\\x0db"),
+        ("v\x0bt\x0cf", "v\\x0bt\\x0cf"),
+        ("nel\x85x", "nel\\x85x"),
+        ("nul\x00x", "nul\\x00x"),
+        ("esc\x1b[2J", "esc\\x1b[2J"),
+        ("del\x7f", "del\\x7f"),
+        ("bidi\u202eRLO", "bidi\\u202eRLO"),
+        ("zw\u200bsp", "zw\\u200bsp"),
+        ("bom\ufeffx", "bom\\ufeffx"),
+        ("line\u2028sep", "line\\u2028sep"),
+        ("para\u2029sep", "para\\u2029sep"),
+        ("bad\udcffbyte", "bad\\udcffbyte"),
+        ("pua\ue000x", "pua\\ue000x"),
+        ("caf\u00e9 r\u00e9sum\u00e9", "caf\u00e9 r\u00e9sum\u00e9"),
+    ],
+    ids=[
+        "plain", "lf", "cr", "vt-ff", "nel", "nul", "ansi-escape", "del", "bidi-override",
+        "zero-width", "bom", "line-separator", "paragraph-separator", "lone-surrogate",
+        "private-use", "printable-unicode-kept",
+    ],
+)
+def test_display_path_escapes_unsafe_characters(mod: ModuleType, raw: str, expected: str) -> None:
+    assert mod.display_path(raw) == expected
+
+
+@_SCRIPT_MODULES
+def test_display_path_output_is_one_encodable_line(mod: ModuleType) -> None:
+    shown = mod.display_path("x\udcff\n\u2028\x85\x00y")
+    assert len(shown.splitlines()) == 1
+    shown.encode("utf-8")  # a lone surrogate would raise here if left raw
+
+
+@_SCRIPT_MODULES
+def test_display_path_caps_length_at_boundary(mod: ModuleType) -> None:
+    # Limit read from the script's own constant (F13), not restated here.
+    cap = mod._MAX_DISPLAY_CHARS
+    assert cap > 0
+    assert mod.display_path("a" * cap) == "a" * cap
+    assert mod.display_path("a" * (cap + 1)) == "a" * cap + "...(truncated)"
+    huge = mod.display_path("\n" * (2 * 1024 * 1024))  # 2 MB of line breaks
+    assert len(huge) == cap + len("...(truncated)")
+
+
+def test_both_scripts_share_one_display_cap() -> None:
+    assert health_check._MAX_DISPLAY_CHARS == check_approvals._MAX_DISPLAY_CHARS
+
+
+@_SCRIPT_MODULES
+def test_scan_lists_regular_and_hidden_yaml_files_sorted(mod: ModuleType, tmp_path: Path) -> None:
+    for name in ("b.yaml", "a.yaml", ".hidden.yaml", "notes.yml", "c.json"):
+        (tmp_path / name).write_text("k: v\n")
+    listing = mod.scan_yaml_dir(tmp_path, "config dir")
+    # Hidden *.yaml counts, matching the registry's glob("*.yaml"); *.yml does not.
+    assert [p.name for p in listing.files] == [".hidden.yaml", "a.yaml", "b.yaml"]
+    assert listing.non_files == []
+
+
+@_SCRIPT_MODULES
+def test_scan_follows_symlink_to_file_and_flags_broken_symlink(mod: ModuleType, tmp_path: Path) -> None:
+    target = tmp_path / "real.txt"
+    target.write_text("k: v\n")
+    d = tmp_path / "d"
+    d.mkdir()
+    (d / "linked.yaml").symlink_to(target)
+    (d / "dangling.yaml").symlink_to(tmp_path / "gone")
+    listing = mod.scan_yaml_dir(d, "config dir")
+    assert [p.name for p in listing.files] == ["linked.yaml"]
+    assert [p.name for p in listing.non_files] == ["dangling.yaml"]
+
+
+@_SCRIPT_MODULES
+def test_scan_rejects_a_file_given_as_the_dir(mod: ModuleType, tmp_path: Path) -> None:
+    f = tmp_path / "not-a-dir"
+    f.write_text("")
+    with pytest.raises(mod.YamlDirError, match="is not a directory"):
+        mod.scan_yaml_dir(f, "config dir")
 
 
 # ---------------------------------------------------------------------------

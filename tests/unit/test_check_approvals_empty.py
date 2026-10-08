@@ -81,11 +81,17 @@ def test_empty_approvals_dir_with_source_configs_exits_nonzero(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     sources = _sources(tmp_path / "srcs")
+    (sources / "second.yaml").write_text(_FIXTURE_SOURCE.read_text())
+    n_configs = len(list(sources.glob("*.yaml")))
     approvals = tmp_path / "empty-approvals"
     approvals.mkdir()
-    rc, _out, err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
+    rc, out, err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
     assert rc == _EXIT_CONFIG
     assert "empty-approvals" in err
+    # Honest message: says how many gated sources are left unverified.
+    assert f"{n_configs} source config(s)" in err
+    assert "unverified" in err
+    assert out == ""
 
 
 def test_missing_approvals_dir_exits_nonzero(
@@ -146,6 +152,20 @@ def test_approvals_dir_with_no_approval_files_exits_config_error(
     rc, _out, err = _run(["--approvals-dir", str(approvals)], capsys)
     assert rc == _EXIT_CONFIG
     assert "hollow-approvals" in err
+
+
+def test_yaml_directory_beside_real_approval_is_config_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sources = _sources(tmp_path / "srcs")
+    approvals = tmp_path / "appr"
+    approvals.mkdir()
+    (approvals / "eurlex.yaml").write_text(_VALID_APPROVAL)
+    (approvals / "stray.yaml").mkdir()
+    rc, out, err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
+    assert rc == _EXIT_CONFIG
+    assert "stray.yaml in approvals dir" in err
+    assert out == ""
 
 
 def test_symlink_to_empty_approvals_dir_exits_config_error(
@@ -222,6 +242,20 @@ def test_unreadable_sources_dir_exits_config_error(tmp_path: Path, capsys: pytes
     assert "locked-sources" in err
 
 
+def test_yaml_directory_in_sources_dir_is_config_error(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sources = _sources(tmp_path / "srcs")
+    (sources / "stray.yaml").mkdir()
+    approvals = tmp_path / "appr"
+    approvals.mkdir()
+    (approvals / "eurlex.yaml").write_text(_VALID_APPROVAL)
+    rc, out, err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
+    assert rc == _EXIT_CONFIG
+    assert "stray.yaml in sources dir" in err
+    assert out == ""
+
+
 # ---------------------------------------------------------------------------
 # Attack list A: output safety for an untrusted dir name
 # ---------------------------------------------------------------------------
@@ -252,6 +286,19 @@ def test_valid_approval_with_explicit_sources_dir_exits_zero(
 ) -> None:
     sources = _sources(tmp_path / "srcs")
     approvals = tmp_path / "approvals"
+    approvals.mkdir()
+    (approvals / "eurlex.yaml").write_text(_VALID_APPROVAL)
+    rc, out, _err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
+    assert rc == 0
+    assert "| eurlex | OK |" in out
+
+
+def test_zero_sources_but_real_approvals_still_checks(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Approvals present means there is work to do; an empty sources dir alone is not exit 2.
+    sources = _sources(tmp_path / "srcs", configs=0)
+    approvals = tmp_path / "appr"
     approvals.mkdir()
     (approvals / "eurlex.yaml").write_text(_VALID_APPROVAL)
     rc, out, _err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
