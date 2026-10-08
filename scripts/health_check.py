@@ -32,11 +32,13 @@ EXIT_CONFIG_MISSING: int = 2
 # ---------------------------------------------------------------------------
 # Directory listing and log-path rendering (terms-analysis#173).
 # This block is byte-identical in health_check.py and check_approvals.py so each
-# scheduled job runs standalone as `python scripts/<name>.py`. The parity test in
-# tests/unit/test_health_check_empty.py runs both copies and checks the cap matches.
+# scheduled job runs standalone as `python scripts/<name>.py`. A test in
+# tests/unit/test_health_check_empty.py compares the two copies byte for byte.
 # What counts as a config file: a regular *.yaml file (symlinks to files followed,
 # hidden names included, as the source registry's glob("*.yaml") does). Untrusted
-# paths reach a terminal or CI log only through display_path (DEV-FUNDAMENTALS F2, F8).
+# text (file names, YAML values, checkpoint fields) reaches a terminal, CI log or
+# report only through display_path, and a markdown table cell only through
+# table_cell (DEV-FUNDAMENTALS F2, F8).
 # ---------------------------------------------------------------------------
 
 YAML_SUFFIX: str = ".yaml"
@@ -50,7 +52,7 @@ _ESCAPED_CATEGORIES: frozenset[str] = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "
 
 
 class YamlDirError(Exception):
-    """The directory cannot be listed: missing, not a directory, or unreadable."""
+    """The directory cannot be used: missing, not a directory, unreadable, or empty."""
 
 
 @dataclass(frozen=True)
@@ -65,23 +67,40 @@ class YamlDirListing:
 
 
 def display_path(path: Path | str) -> str:
-    """Render an untrusted path for a terminal or log (DEV-FUNDAMENTALS F2, F8).
+    """Render untrusted text for a terminal or log (DEV-FUNDAMENTALS F2, F8).
 
-    Every character in an escaped category becomes a visible ``\\xNN`` or
-    ``\\uNNNN`` escape, so the result is one line with no terminal control,
-    no bidi reordering and nothing that fails to encode. Output is capped.
+    Every character in an escaped category becomes a visible fixed-width escape
+    (``\\xNN``, ``\\uNNNN``, or ``\\UNNNNNNNN`` above U+FFFF) and a literal
+    backslash becomes ``\\\\``, so each escape reads one way only. The result is
+    one line with no terminal control, no bidi reordering and nothing that fails
+    to encode. Output is capped.
     """
     out: list[str] = []
     for ch in str(path):
-        if unicodedata.category(ch) in _ESCAPED_CATEGORIES:
-            code = ord(ch)
-            out.append(f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}")
-        else:
+        code = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif unicodedata.category(ch) not in _ESCAPED_CATEGORIES:
             out.append(ch)
+        elif code <= 0xFF:
+            out.append(f"\\x{code:02x}")
+        elif code <= 0xFFFF:
+            out.append(f"\\u{code:04x}")
+        else:
+            out.append(f"\\U{code:08x}")
     text = "".join(out)
     if len(text) > _MAX_DISPLAY_CHARS:
         text = text[:_MAX_DISPLAY_CHARS] + "...(truncated)"
     return text
+
+
+def table_cell(value: object) -> str:
+    """Render untrusted text as one markdown table cell (DEV-FUNDAMENTALS F2).
+
+    display_path makes it one escaped line; ``|`` then becomes ``\\|`` so the
+    value cannot add or close a cell.
+    """
+    return display_path(str(value)).replace("|", "\\|")
 
 
 def scan_yaml_dir(directory: Path, label: str) -> YamlDirListing:
@@ -131,12 +150,19 @@ def _utc_now() -> datetime:
 def _source_names(config_dir: Path) -> list[str]:
     """Return sorted list of source names from config YAML filenames.
 
-    Uses the shared listing rule, so only regular *.yaml files count; main()
-    rejects every other config problem before this runs.
+    Uses the shared listing rule, so only regular *.yaml files count.
+
+    Raises:
+        YamlDirError: config_dir is missing, not a directory, unreadable, or holds
+            no source configs. Nothing to check is never a clean report (#173).
     """
-    if not config_dir.is_dir():
-        return []
-    return sorted(p.stem for p in scan_yaml_dir(config_dir, "config dir").files)
+    names = sorted(p.stem for p in scan_yaml_dir(config_dir, "config dir").files)
+    if not names:
+        raise YamlDirError(
+            f"No sources configured: config dir {display_path(config_dir)} "
+            "has no *.yaml source configs."
+        )
+    return names
 
 
 def _config_problems(config_dir: Path) -> list[str]:
@@ -248,14 +274,15 @@ def build_report(
 ) -> tuple[str, bool]:
     """Build the markdown report string and return (report, any_problem).
 
-    any_problem is True if any source is stale or never-run.
+    any_problem is True if any source is stale or never-run. Every table cell
+    goes through table_cell: names and stages come from untrusted files (F2).
+
+    Raises:
+        YamlDirError: from _source_names; there is no report without sources.
     """
     sources = _source_names(config_dir)
 
     header = f"# Legal Corpus Health -- {today}\n\n"
-
-    if not sources:
-        return header + "No sources configured.\n", False
 
     rows: list[str] = []
     any_problem = False
@@ -268,7 +295,8 @@ def build_report(
         if status in ("stale", "never-run"):
             any_problem = True
 
-        rows.append(f"| {source} | {last_run} | {stage} | {lag_str} | {status} |")
+        cells = (source, last_run, stage, lag_str, status)
+        rows.append("| " + " | ".join(table_cell(cell) for cell in cells) + " |")
 
     table = (
         "| Source | Last Run (UTC) | Stage | Lag (days) | Status |\n"
@@ -323,13 +351,18 @@ def main(argv: list[str] | None = None) -> int:
         return EXIT_CONFIG_MISSING
 
     today = _utc_now().strftime("%Y-%m-%d")
-    report, any_problem = build_report(
-        config_dir=config_dir,
-        state_dir=state_dir,
-        out_dir=out_dir,
-        stale_days=stale_days,
-        today=today,
-    )
+    try:
+        report, any_problem = build_report(
+            config_dir=config_dir,
+            state_dir=state_dir,
+            out_dir=out_dir,
+            stale_days=stale_days,
+            today=today,
+        )
+    except YamlDirError as exc:
+        # The dir changed after the check above: still a config error, never success.
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_CONFIG_MISSING
 
     # Write report to out/health/YYYY-MM-DD.md.
     health_dir = out_dir / "health"

@@ -32,11 +32,13 @@ EXIT_CONFIG: int = 2
 # ---------------------------------------------------------------------------
 # Directory listing and log-path rendering (terms-analysis#173).
 # This block is byte-identical in health_check.py and check_approvals.py so each
-# scheduled job runs standalone as `python scripts/<name>.py`. The parity test in
-# tests/unit/test_health_check_empty.py runs both copies and checks the cap matches.
+# scheduled job runs standalone as `python scripts/<name>.py`. A test in
+# tests/unit/test_health_check_empty.py compares the two copies byte for byte.
 # What counts as a config file: a regular *.yaml file (symlinks to files followed,
 # hidden names included, as the source registry's glob("*.yaml") does). Untrusted
-# paths reach a terminal or CI log only through display_path (DEV-FUNDAMENTALS F2, F8).
+# text (file names, YAML values, checkpoint fields) reaches a terminal, CI log or
+# report only through display_path, and a markdown table cell only through
+# table_cell (DEV-FUNDAMENTALS F2, F8).
 # ---------------------------------------------------------------------------
 
 YAML_SUFFIX: str = ".yaml"
@@ -50,7 +52,7 @@ _ESCAPED_CATEGORIES: frozenset[str] = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "
 
 
 class YamlDirError(Exception):
-    """The directory cannot be listed: missing, not a directory, or unreadable."""
+    """The directory cannot be used: missing, not a directory, unreadable, or empty."""
 
 
 @dataclass(frozen=True)
@@ -65,23 +67,40 @@ class YamlDirListing:
 
 
 def display_path(path: Path | str) -> str:
-    """Render an untrusted path for a terminal or log (DEV-FUNDAMENTALS F2, F8).
+    """Render untrusted text for a terminal or log (DEV-FUNDAMENTALS F2, F8).
 
-    Every character in an escaped category becomes a visible ``\\xNN`` or
-    ``\\uNNNN`` escape, so the result is one line with no terminal control,
-    no bidi reordering and nothing that fails to encode. Output is capped.
+    Every character in an escaped category becomes a visible fixed-width escape
+    (``\\xNN``, ``\\uNNNN``, or ``\\UNNNNNNNN`` above U+FFFF) and a literal
+    backslash becomes ``\\\\``, so each escape reads one way only. The result is
+    one line with no terminal control, no bidi reordering and nothing that fails
+    to encode. Output is capped.
     """
     out: list[str] = []
     for ch in str(path):
-        if unicodedata.category(ch) in _ESCAPED_CATEGORIES:
-            code = ord(ch)
-            out.append(f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}")
-        else:
+        code = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif unicodedata.category(ch) not in _ESCAPED_CATEGORIES:
             out.append(ch)
+        elif code <= 0xFF:
+            out.append(f"\\x{code:02x}")
+        elif code <= 0xFFFF:
+            out.append(f"\\u{code:04x}")
+        else:
+            out.append(f"\\U{code:08x}")
     text = "".join(out)
     if len(text) > _MAX_DISPLAY_CHARS:
         text = text[:_MAX_DISPLAY_CHARS] + "...(truncated)"
     return text
+
+
+def table_cell(value: object) -> str:
+    """Render untrusted text as one markdown table cell (DEV-FUNDAMENTALS F2).
+
+    display_path makes it one escaped line; ``|`` then becomes ``\\|`` so the
+    value cannot add or close a cell.
+    """
+    return display_path(str(value)).replace("|", "\\|")
 
 
 def scan_yaml_dir(directory: Path, label: str) -> YamlDirListing:
@@ -143,6 +162,18 @@ def classify_approval(expiry: date, today: date, warn_days: int) -> str:
     return "OK"
 
 
+def _load_failure(exc: Exception) -> str:
+    """Describe why an approval file could not be loaded, without its bytes or path (F8).
+
+    A YAML error gives the line number only, since the parser's message quotes the
+    file. Any other error gives its strerror or type, since str(exc) repeats the path.
+    """
+    if isinstance(exc, yaml.YAMLError):
+        mark = getattr(exc, "problem_mark", None)
+        return f"not valid YAML (line {mark.line + 1})" if mark is not None else "not valid YAML"
+    return f"cannot read: {getattr(exc, 'strerror', None) or type(exc).__name__}"
+
+
 def check_approvals_dir(
     approvals_dir: Path,
     today: date,
@@ -158,24 +189,30 @@ def check_approvals_dir(
     Returns:
         A tuple of (rows, any_expired) where rows is a list of dicts with keys
         source_id, status, expiry, days_remaining; and any_expired is True if at
-        least one approval is EXPIRED.
+        least one approval is EXPIRED or invalid. Row values are raw; render them
+        only through _render_table.
+
+    Raises:
+        YamlDirError: approvals_dir is missing, not a directory, unreadable, or
+            holds no approval files. Nothing to check is never "all OK" (#173).
     """
     rows: list[dict[str, str | int]] = []
     any_expired = False
 
-    # main() rejects a missing, unreadable or empty dir before this runs (exit 2).
-    if not approvals_dir.is_dir():
-        return rows, any_expired
     yaml_files = scan_yaml_dir(approvals_dir, "approvals dir").files
+    if not yaml_files:
+        raise YamlDirError(
+            f"no approval files (*.yaml) in approvals dir {display_path(approvals_dir)}."
+        )
     for yaml_path in yaml_files:
         try:
             data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-        except Exception as exc:  # noqa: BLE001 — surface parse errors as rows
+        except Exception as exc:  # noqa: BLE001 — any read or parse failure is an ERROR row
             rows.append(
                 {
                     "source_id": yaml_path.stem,
                     "status": "ERROR",
-                    "expiry": str(exc),
+                    "expiry": _load_failure(exc),
                     "days_remaining": "-",
                 }
             )
@@ -216,7 +253,7 @@ def check_approvals_dir(
                 {
                     "source_id": source_id,
                     "status": "ERROR",
-                    "expiry": f"invalid date: {raw_expiry!r}",
+                    "expiry": f"invalid date: {raw_expiry}",
                     "days_remaining": "-",
                 }
             )
@@ -314,7 +351,7 @@ def _config_problems(sources_dir: Path, approvals_dir: Path) -> list[str]:
 
 
 def _render_table(rows: list[dict[str, str | int]]) -> str:
-    """Render rows as a markdown table string."""
+    """Render rows as a markdown table string; every cell goes through table_cell (F2)."""
     header = (
         "| source_id | status | expiry | days_remaining (EXPIRED=days past) |\n"
         "|-----------|--------|--------|------------------------------------|\n"
@@ -322,10 +359,10 @@ def _render_table(rows: list[dict[str, str | int]]) -> str:
     lines: list[str] = []
     for row in rows:
         lines.append(
-            f"| {row['source_id']} "
-            f"| {row['status']} "
-            f"| {row['expiry']} "
-            f"| {row['days_remaining']} |"
+            f"| {table_cell(row['source_id'])} "
+            f"| {table_cell(row['status'])} "
+            f"| {table_cell(row['expiry'])} "
+            f"| {table_cell(row['days_remaining'])} |"
         )
     return header + "\n".join(lines) + "\n"
 
@@ -375,7 +412,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Error: {problem}", file=sys.stderr)
         return EXIT_CONFIG
 
-    rows, any_expired = check_approvals_dir(approvals_dir, today, warn_days)
+    try:
+        rows, any_expired = check_approvals_dir(approvals_dir, today, warn_days)
+    except YamlDirError as exc:
+        # The dir changed after the check above: still a config error, never success.
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
 
     print(_render_table(rows))
 

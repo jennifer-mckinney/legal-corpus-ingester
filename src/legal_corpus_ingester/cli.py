@@ -470,7 +470,9 @@ def prune(
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Entry point for `python -m legal_corpus_ingester.cli` (terms-analysis#173).
+    """Entry point for the `ingester` console script and `python -m legal_corpus_ingester.cli`.
+
+    Both go through here, so they behave the same on the same input (terms-analysis#173).
 
     With no subcommand, Typer's `no_args_is_help` prints help to STDOUT, which a
     caller capturing stdout could mistake for real output. Print the help to
