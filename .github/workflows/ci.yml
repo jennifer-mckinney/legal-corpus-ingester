@@ -91,3 +91,11 @@ jobs:
         with:
           name: coverage-report-${{ github.run_id }}
           path: coverage.xml
+
+      # The self-hosted runner reuses this checkout's .git/config across every
+      # workflow, and actions/checkout never resets core.hooksPath. Remove it
+      # however the job ended, so later workflows do not inherit the P9 gate
+      # (grumpy r6 #2).
+      - name: Uninstall tracked git hooks (shared self-hosted checkout)
+        if: always()
+        run: git config --local --unset-all core.hooksPath || true

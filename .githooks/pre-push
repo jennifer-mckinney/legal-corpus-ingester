@@ -15,7 +15,8 @@
 #     the push URL (git ls-remote), never from local remote-tracking refs.
 #     If url.*.insteadOf would send that read to another URL, or the
 #     advertisement cannot be read within P9_ADVERT_TIMEOUT_SECONDS and
-#     P9_ADVERT_MAX_BYTES, or cannot be parsed, the push is refused.
+#     P9_ADVERT_MAX_BYTES, or cannot be parsed, the push is refused. A read
+#     that runs out of time is killed with every process it started.
 #   - Text that comes from the remote or from a signoff file is printed
 #     with control and format characters escaped, on one line, cut short.
 #   - A complete override (used: true + reason + authorized_by) replaces the
@@ -69,6 +70,8 @@ SIGNOFF_DIR="${GIT_COMMON_DIR}/reviews"
 #     `git cat-file --batch-check`. On success it prints `^<commit>` for each
 #     advertised commit this clone has, then `OK <commits> <unresolved>`,
 #     where <unresolved> counts advertised ids that are not commits here.
+#   waitable <seconds>: checks that every selector class on this platform
+#     can wait that long, and prints `OK`.
 # The shell requires the final OK line, so a crash or a silent exit never
 # reads as a pass. Any problem exits 1 with the reasons on stderr.
 P9_PY='
@@ -76,6 +79,7 @@ import json
 import os
 import re
 import selectors
+import signal
 import subprocess
 import sys
 import time
@@ -183,12 +187,17 @@ def check_signoff(path, sha):
 
 
 def run_ls_remote(url, timeout, max_bytes, cannot_read):
-    """The stdout of `git ls-remote -- <url>`, read within the limits."""
+    """The stdout of `git ls-remote -- <url>`, read within the limits.
+
+    git runs in a session (and process group) of its own, so a timeout kills
+    it together with the transport it started (remote helper, ssh, ext
+    command), and it has no terminal to ask for credentials on."""
     proc = subprocess.Popen(
         ["git", "ls-remote", "--", url],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=True,
     )
     out, err = bytearray(), bytearray()
     deadline = time.monotonic() + timeout
@@ -218,14 +227,19 @@ def run_ls_remote(url, timeout, max_bytes, cannot_read):
                 except subprocess.TimeoutExpired:
                     problem = "timeout"
         finally:
-            if proc.poll() is None:
-                proc.kill()
+            # Kill the whole group, not only git: its transport helpers would
+            # otherwise outlive the hook, holding the connection open.
+            if proc.poll() is None or problem is not None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
                 proc.wait()
     if problem == "timeout":
         fail(
             f"{cannot_read}: git ls-remote timed out after {timeout}s (P9_ADVERT_TIMEOUT_SECONDS).",
-            "  If git was waiting for credentials, set up a credential helper, or raise",
-            "  P9_ADVERT_TIMEOUT_SECONDS for this push.",
+            "  If the remote is just slow, raise P9_ADVERT_TIMEOUT_SECONDS for this push.",
+            "  The read has no terminal, so a remote that needs credentials needs a credential helper.",
         )
     if problem == "size":
         fail(f"{cannot_read}: the advertisement is larger than {max_bytes} bytes (P9_ADVERT_MAX_BYTES)")
@@ -278,7 +292,35 @@ def read_advert(name, url, timeout, max_bytes):
     print(f"OK {len(commits)} {unresolved}")
 
 
-MODES = {"signoff": check_signoff, "advert": read_advert}
+def check_waitable(timeout):
+    """Refuses a timeout that some selector class on this platform cannot
+    wait for (poll stops at INT_MAX milliseconds, select earlier on some
+    systems). Every class is tried, so the bound does not depend on which
+    one DefaultSelector picks. The value itself is never printed."""
+    seconds = int(timeout)
+    for name in ("PollSelector", "EpollSelector", "DevpollSelector", "KqueueSelector", "SelectSelector"):
+        cls = getattr(selectors, name, None)
+        if cls is None:
+            continue
+        r, w = os.pipe()
+        try:
+            # A ready pipe: select returns at once for any timeout it accepts.
+            os.write(w, b"x")
+            with cls() as sel:
+                sel.register(r, selectors.EVENT_READ)
+                sel.select(seconds)
+        except (OverflowError, OSError, ValueError):
+            fail(
+                "P9 pre-push gate: P9_ADVERT_TIMEOUT_SECONDS is longer than this platform can wait for;"
+                " set a smaller whole number of seconds, so the push is refused"
+            )
+        finally:
+            os.close(r)
+            os.close(w)
+    print("OK")
+
+
+MODES = {"signoff": check_signoff, "advert": read_advert, "waitable": check_waitable}
 MODES[sys.argv[1]](*sys.argv[2:])
 '
 
@@ -310,6 +352,13 @@ limit() {
 # The limits are checked before anything else, so a bad value is reported
 # even for a push that would not have needed them.
 ADVERT_TIMEOUT="$(limit P9_ADVERT_TIMEOUT_SECONDS)" || exit 1
+# An override must also be a timeout the reader's selector can wait for;
+# a larger one would crash it. The reviewed default needs no check, which
+# keeps a push with nothing to send free of python3.
+if [ -n "${P9_ADVERT_TIMEOUT_SECONDS:-}" ] \
+    && [ "$(python3 -I -c "${P9_PY}" waitable "${ADVERT_TIMEOUT}")" != "OK" ]; then
+    exit 1
+fi
 ADVERT_MAX_BYTES="$(limit P9_ADVERT_MAX_BYTES)" || exit 1
 
 # What the remote already has: the commits its CURRENT advertisement for the

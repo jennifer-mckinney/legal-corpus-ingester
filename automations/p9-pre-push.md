@@ -34,7 +34,8 @@ two drift apart.
     the push URL (git ls-remote), never from local remote-tracking refs.
     If url.*.insteadOf would send that read to another URL, or the
     advertisement cannot be read within P9_ADVERT_TIMEOUT_SECONDS and
-    P9_ADVERT_MAX_BYTES, or cannot be parsed, the push is refused.
+    P9_ADVERT_MAX_BYTES, or cannot be parsed, the push is refused. A read
+    that runs out of time is killed with every process it started.
   - Text that comes from the remote or from a signoff file is printed
     with control and format characters escaped, on one line, cut short.
   - A complete override (used: true + reason + authorized_by) replaces the
@@ -110,8 +111,13 @@ let any other branch, sha or `--all` push through).
      print; the defaults are set once, at the top of the hook. Either
      variable, when set and not empty, must be a positive whole number,
      or every push is refused with a message naming it: no value
-     switches a limit off. A read that times out, or prints more
-     than the cap, is killed and the ref refused.
+     switches a limit off. A timeout must also be one that every
+     selector on the platform can wait for (poll stops at INT_MAX
+     milliseconds); a larger one is refused the same way, without
+     echoing the value. A read that times out, or prints more than the
+     cap, is killed together with every process it started (`ls-remote`
+     runs in its own process group, so its remote helper or ssh dies with
+     it), and the ref refused.
    - If `ls-remote` fails, times out, prints too much, prints a line that
      is not `<id><TAB><ref>`, or the advertised ids cannot be resolved,
      the ref is refused with `cannot establish which commits are new to
@@ -276,10 +282,11 @@ mistakes, not a determined author. It is bypassed by:
 advertisement at push time. A branch deleted on the server, or a remote
 whose URL was changed, no longer vouches for its old history, so that
 history must be covered by the review range again. The hook contacts
-the push URL a second time for this; a remote that needs credentials may
-ask for them again. That second read counts against
-`P9_ADVERT_TIMEOUT_SECONDS`, so typing a password slowly can time it
-out: use a credential helper, or raise the limit for that push.
+the push URL a second time for this. That read runs in a session of its
+own, with no terminal, so a remote that needs credentials must get them
+from a credential helper, an askpass program or an ssh agent: a terminal
+prompt fails at once and the ref is refused with git's own error. A slow remote can be
+given more time with `P9_ADVERT_TIMEOUT_SECONDS` for that push.
 
 The enforcing control is server-side. `main` is branch-protected on
 GitHub in both terms-analysis and legal-corpus-ingester (PR required,

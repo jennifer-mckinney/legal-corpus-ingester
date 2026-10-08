@@ -46,7 +46,7 @@ from tests.unit.test_p9_prepush_gate import (  # noqa: F401
 
 # Shared pin: the same constant appears in the sibling repo's copy of this
 # test, so a one-sided edit of the shared doc section fails that repo's suite.
-CANONICAL_P9_DOC_SHA256 = "a2dc001b853c3a1dcf15f74bb0bcb16337623186f532d68c6619723a494cd33c"
+CANONICAL_P9_DOC_SHA256 = "e94d8d7ae8b635d58e9da100b5924650dc823af294f4ea253251415fad1ef0eb"
 SHARED_BEGIN = "<!-- p9-shared:begin -->"
 SHARED_END = "<!-- p9-shared:end -->"
 

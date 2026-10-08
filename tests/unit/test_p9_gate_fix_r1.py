@@ -39,7 +39,7 @@ from tests.unit.test_p9_prepush_gate import (  # noqa: F401
 
 # Shared pins. The same constants appear in the sibling repo's copy of this
 # test, so a one-sided edit of either file fails that repo's suite.
-CANONICAL_PRE_PUSH_SHA256 = "86ab230230467d6c572ee41745805d6b83a431ec6f25f77b0691fd085283106f"
+CANONICAL_PRE_PUSH_SHA256 = "1389eb2d4edc92891aa5b4c92459bf805bc63ee473b53aa625c6e1280f8b40d0"
 CANONICAL_INSTALLER_SHA256 = "3dd85d1670d11a6dea98ba9a8d79c75d89990bcc25979e5dfac59964822a736c"
 
 ZERO_SHA = "0" * 40
