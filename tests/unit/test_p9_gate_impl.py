@@ -152,3 +152,45 @@ def test_ci_workflow_default_shell_is_pipefail() -> None:
     # (grumpy F7, docs/evidence/2026-10-07-g0-5-grumpy.md).
     workflow = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())
     assert _shell_enables_pipefail(workflow["defaults"]["run"]["shell"])
+
+
+def _always(step: dict[str, object]) -> bool:
+    cond = str(step.get("if", "")).strip()
+    if cond.startswith("${{") and cond.endswith("}}"):
+        cond = cond[3:-2].strip()
+    return cond == "always()"
+
+
+@pytest.mark.parametrize("already_unset", [False, True], ids=["hooks-installed", "already-unset"])
+def test_ci_job_that_installs_hooks_always_uninstalls_them(tmp_path: Path, already_unset: bool) -> None:
+    """Grumpy r6 #2: the CI job runs on a shared self-hosted checkout, and
+    actions/checkout never resets core.hooksPath. The job that runs
+    install-hooks.sh must end with an `if: always()` step that removes it,
+    so later workflows on that runner do not inherit the P9 gate. Runs the
+    workflow's own step(s) in a sandbox clone, not a text match."""
+    workflow = yaml.safe_load((REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text())
+    jobs = [
+        (name, list(job["steps"]))
+        for name, job in workflow["jobs"].items()
+        if any("scripts/install-hooks.sh" in str(s.get("run", "")) for s in job["steps"])
+    ]
+    assert jobs, "no CI job installs the tracked hooks"
+    for name, steps in jobs:
+        installed_at = max(n for n, s in enumerate(steps) if "scripts/install-hooks.sh" in str(s.get("run", "")))
+        cleanup = [s for s in steps[installed_at + 1 :] if _always(s) and "run" in s]
+        assert cleanup, f"job '{name}' installs hooks but has no later `if: always()` run step"
+
+        (tmp_path / name).mkdir()
+        box = Sandbox(tmp_path / name)
+        proc = box.install("main")
+        assert proc.returncode == 0, proc.stderr
+        assert _git(box.main, box.env, "config", "--local", "--get", "core.hooksPath") == ".githooks"
+        if already_unset:
+            _git(box.main, box.env, "config", "--local", "--unset-all", "core.hooksPath")
+
+        for step in cleanup:
+            ran = _run(["bash", "--noprofile", "--norc", "-eo", "pipefail", "-c", str(step["run"])], box.main, box.env)
+            assert ran.returncode == 0, f"cleanup step '{step.get('name')}' failed: {ran.stderr}"
+
+        left = _run(["git", "config", "--local", "--get-all", "core.hooksPath"], box.main, box.env)
+        assert left.returncode == 1 and left.stdout == "", f"job '{name}' leaves core.hooksPath={left.stdout!r}"

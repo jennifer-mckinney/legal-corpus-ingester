@@ -25,14 +25,20 @@ Contract pinned here (the Coder implements it; nothing here constrains how):
   "timed out"; an oversized advertisement refuses with a message saying
   it is too large. Any other value of either variable (0, negative, not a
   plain decimal integer) refuses and names the variable; empty means unset.
+  r6 F7: when the read times out, the reader AND every process it started
+  (the transport helper, ssh, a fake server) are gone by the time the hook
+  exits; nothing is left holding the connection or the terminal.
+  r6 overflow residual: a timeout above what the platform's selectors can
+  wait for is refused at validation (before any remote is contacted),
+  without a traceback and without echoing the value.
 - F4 many refs: 60,000 advertised refs at 60,000 distinct commits this clone
   has (above Linux's 2 MiB and macOS's 1 MiB ARG_MAX once expanded onto
   argv, and immune to dedupe) with a legitimate push PASS.
 - Grumpy MEDIUM honest message: when the remote advertises commits this
   clone has not fetched, the refusal says to run `git fetch <remote>` and
   never claims range.base is "not on" the remote.
-- Grumpy LOW + F6 parity: the hook, scripts/ci/p9-sibling-parity.sh and the
-  shared doc block are compared with the sibling repo at an immutable
+- Grumpy LOW + F6 parity: the hook, scripts/ci/p9-sibling-parity.sh,
+  scripts/install-hooks.sh (grumpy r6 #1) and the shared doc block are compared with the sibling repo at an immutable
   commit sha (P9_SIBLING_SHA), never at a branch name. `resolve-ref` prints
   `ref=<name>` and `sha=<hex>` lines, ready to append to GITHUB_OUTPUT.
 
@@ -46,6 +52,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import selectors
 import shutil
 import signal
 import subprocess
@@ -175,6 +182,30 @@ class Hook:
         self.pids.write_text("")
         self.advert = tmp_path / "advert.txt"
         self.advert.write_bytes(b"")
+        # r6 F7: helper pids still alive when the hook returned, read BEFORE
+        # _kill tidies up (that teardown used to hide the orphans).
+        self.survivors: list[int] = []
+
+    def started_pids(self) -> list[int]:
+        return [int(pid) for pid in self.pids.read_text().split()]
+
+    def _survivors(self) -> list[int]:
+        """Helper pids still alive, after a short grace for init to reap
+        processes the hook killed (a killed orphan is a zombie until then)."""
+        deadline = time.monotonic() + REAP_GRACE
+        while True:
+            alive = []
+            for pid in self.started_pids():
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    continue
+                except PermissionError:
+                    pass
+                alive.append(pid)
+            if not alive or time.monotonic() >= deadline:
+                return alive
+            time.sleep(0.05)
 
     def run(
         self,
@@ -204,13 +235,14 @@ class Hook:
         )
         try:
             out, err = proc.communicate(stdin.encode(), timeout=timeout)
+            elapsed = time.monotonic() - started
+            self.survivors = self._survivors()
         except subprocess.TimeoutExpired:
             self._kill(proc)
             proc.communicate()
             pytest.fail(f"the hook did not return within {timeout}s for {url}")
         finally:
             self._kill(proc)
-        elapsed = time.monotonic() - started
         return subprocess.CompletedProcess(proc.args, proc.returncode, out, err), elapsed
 
     def _kill(self, proc: subprocess.Popen[bytes]) -> None:
@@ -423,6 +455,9 @@ def test_override_announcement_is_sanitised_and_one_line(
 
 HANG_TIMEOUT = 2
 SLACK = 10
+# Test tolerance, not a product limit: how long a process the hook killed may
+# stay a zombie before init reaps it.
+REAP_GRACE = 2
 
 
 @pytest.mark.parametrize(
@@ -453,6 +488,10 @@ def test_hanging_advertisement_is_refused_within_the_timeout(
     text = _assert_terminal_safe(proc.stderr)
     assert CANNOT_READ in text, text
     assert "timed out" in text, text
+    # r6 F7: the reader's children die with it, before the harness cleans up.
+    if url.startswith("p9fake::"):
+        assert hook.started_pids(), "the fake helper never started, so this case proves nothing"
+    assert hook.survivors == [], f"processes the reader started outlived the hook: {hook.survivors}"
 
 
 def test_default_timeout_is_bounded(installed: Sandbox, hook: Hook) -> None:
@@ -536,6 +575,82 @@ def test_unusable_limit_override_refuses_and_names_the_variable(
 
     assert proc.returncode == REFUSED, proc.stdout + proc.stderr
     assert name in proc.stderr.decode("utf-8", "replace")
+
+
+def _selector_ceiling() -> int:
+    """The largest whole-second timeout every selector class on this platform
+    accepts (poll and epoll stop at INT_MAX milliseconds; select stops earlier
+    on some systems). Measured here, never restated as a literal."""
+    ceilings = []
+    for cls_name in ("PollSelector", "EpollSelector", "DevpollSelector", "KqueueSelector", "SelectSelector"):
+        cls = getattr(selectors, cls_name, None)
+        if cls is None:
+            continue
+        r, w = os.pipe()
+        try:
+            os.write(w, b"x")
+
+            def accepts(seconds: int, cls: Any = cls, r: int = r) -> bool:
+                with cls() as sel:
+                    sel.register(r, selectors.EVENT_READ)
+                    try:
+                        sel.select(seconds)
+                    except (OverflowError, OSError, ValueError, TypeError):
+                        return False
+                    return True
+
+            low, high = 1, 10**12
+            assert accepts(low) and not accepts(high), cls_name
+            while high - low > 1:
+                mid = (low + high) // 2
+                low, high = (mid, high) if accepts(mid) else (low, mid)
+            ceilings.append(low)
+        finally:
+            os.close(r)
+            os.close(w)
+    assert ceilings, "no selector class is available"
+    return min(ceilings)
+
+
+def _overflow_values() -> list[Any]:
+    above = _selector_ceiling() + 1
+    return [
+        pytest.param(str(above), id="one-above-the-selector-ceiling"),
+        pytest.param("9" * len(str(above)), id="same-width-all-nines"),
+        pytest.param("999999999", id="previously-documented-maximum"),
+    ]
+
+
+@pytest.mark.parametrize("value", _overflow_values())
+def test_timeout_above_what_select_can_wait_is_refused_at_validation(
+    installed: Sandbox, hook: Hook, value: str
+) -> None:
+    """r6 residual: such a value used to pass validation, contact the remote,
+    then crash `select` with OverflowError (a traceback) on Linux."""
+    seed = _seed(installed)
+    tip = _signed_tip(installed, "overflow.txt")
+    hook.advert.write_bytes(f"{seed} refs/heads/main\n".encode())
+
+    proc, _elapsed = hook.run("p9fake::overflow", _tip_line(tip), env={TIMEOUT_ENV: value})
+
+    text = _assert_terminal_safe(proc.stderr)
+    assert proc.returncode == REFUSED, proc.stdout.decode("utf-8", "replace") + text
+    assert TIMEOUT_ENV in text, text
+    assert "Traceback" not in text and "OverflowError" not in text, text
+    assert value not in text, f"the refused value was echoed: {text}"
+    assert hook.started_pids() == [], "the remote was contacted before the limit was validated"
+
+
+def test_timeout_at_the_selector_ceiling_still_passes(installed: Sandbox, hook: Hook) -> None:
+    """Positive control: the largest value every selector can wait for works."""
+    seed = _seed(installed)
+    tip = _signed_tip(installed, "ceiling.txt")
+    hook.advert.write_bytes(f"{seed} refs/heads/main\n".encode())
+
+    proc, _elapsed = hook.run("p9fake::ceiling", _tip_line(tip), env={TIMEOUT_ENV: str(_selector_ceiling())})
+
+    assert proc.returncode == 0, proc.stderr
+    assert f"signoff OK for refs/heads/main at {tip[:12]}" in proc.stdout.decode()
 
 
 @pytest.mark.parametrize("name", [TIMEOUT_ENV, MAX_BYTES_ENV])
@@ -706,7 +821,7 @@ def test_known_advertisement_refusal_does_not_suggest_fetching(installed: Sandbo
 
 # Grumpy LOW + F6: parity of every shared artifact, at a commit sha ----------
 
-PARITY_FILES = (".githooks/pre-push", "scripts/ci/p9-sibling-parity.sh")
+PARITY_FILES = (".githooks/pre-push", "scripts/ci/p9-sibling-parity.sh", "scripts/install-hooks.sh")
 DOC_PATH = "automations/p9-pre-push.md"
 SHARED_BEGIN = "<!-- p9-shared:begin -->"
 SHARED_END = "<!-- p9-shared:end -->"
