@@ -13,11 +13,11 @@ import importlib
 import os
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
-import click
 import pytest
+import tomllib
+import typer
 from typer.testing import CliRunner
 
 from legal_corpus_ingester.cli import EXIT_USAGE, app, main
@@ -86,9 +86,21 @@ def test_python_dash_m_cli_runs_subcommand(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_cli_exit_usage_matches_click_convention() -> None:
-    # Checked against click itself, not against a literal restated here.
-    assert click.exceptions.UsageError("x").exit_code == EXIT_USAGE
+def test_cli_exit_usage_matches_typer_usage_error_code() -> None:
+    # Checked against what Typer itself returns for a usage error, not a literal restated
+    # here. Typer >= 0.27 bundles click privately and no longer installs it, so the code
+    # comes from behaviour: a throwaway app (not ours) given an option it does not have.
+    probe = typer.Typer()
+
+    @probe.command()
+    def first() -> None: ...
+
+    @probe.command()
+    def second() -> None: ...
+
+    result = CliRunner().invoke(probe, ["--no-such-option"])
+    assert "No such option" in result.output, "control: the probe did not hit a usage error"
+    assert result.exit_code == EXIT_USAGE
 
 
 def test_console_script_without_args_prints_usage_to_stderr_and_exits_usage(

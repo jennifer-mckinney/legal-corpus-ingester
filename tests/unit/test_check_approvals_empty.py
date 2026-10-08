@@ -315,6 +315,35 @@ def test_hostile_stem_and_parse_error_are_escaped_on_exit_one_path(
     assert "<unicode string>" not in out + err
 
 
+@pytest.mark.parametrize(
+    ("body", "expected_cell"),
+    [
+        # M8: a reader error (a control character) is a YAMLError with no line mark.
+        (b"expiry: \x07BELL-LEAK\n", "not valid YAML"),
+        # M9: bytes that are not UTF-8; current fail behaviour is the type name only.
+        (b'source_id: "caf\xe9 LATIN-LEAK"\nexpiry: "2099-01-01"\n', "cannot read: UnicodeDecodeError"),
+    ],
+    ids=["yaml-error-without-line-mark", "non-utf8-bytes"],
+)
+def test_unloadable_approval_file_is_an_error_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], body: bytes, expected_cell: str
+) -> None:
+    sources = _sources(tmp_path / "srcs")
+    approvals = tmp_path / "appr"
+    approvals.mkdir()
+    (approvals / "ghost.yaml").write_bytes(body)
+    if expected_cell == "not valid YAML":  # control: the case really has no mark to report
+        with pytest.raises(yaml.YAMLError) as parsed:
+            yaml.safe_load(body.decode())
+        assert getattr(parsed.value, "problem_mark", None) is None
+    rc, out, err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
+    assert rc == _EXIT_EXPIRED_OR_INVALID
+    assert f"| ghost | ERROR | {expected_cell} | - |" in out.splitlines()
+    # Neither the parser's message nor the file's bytes reach the output (F8).
+    for leak in ("BELL-LEAK", "LATIN-LEAK", "<unicode string>", "\x07"):
+        assert leak not in out + err
+
+
 _HOSTILE_VALUE = "a\\e[2J|FORGED\\nx\\L\\u202e"  # YAML escapes: ESC, |, LF, U+2028, RLO
 
 

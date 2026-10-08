@@ -328,7 +328,37 @@ def test_display_path_caps_length_at_boundary(mod: ModuleType) -> None:
     assert mod.display_path("a" * cap) == "a" * cap
     assert mod.display_path("a" * (cap + 1)) == "a" * cap + "...(truncated)"
     huge = mod.display_path("\n" * (2 * 1024 * 1024))  # 2 MB of line breaks
-    assert len(huge) == cap + len("...(truncated)")
+    # At most the cap: the cut may stop short of it to keep a whole escape (security F2).
+    assert huge.endswith("...(truncated)")
+    assert len(huge) <= cap + len("...(truncated)")
+
+
+# One character per escape width the renderer emits: \\ (2), \xNN (4), \uNNNN (6), \UNNNNNNNN (10).
+_ESCAPE_CHARS = {"backslash": "\\", "x-escape": "\n", "u-escape": "\u202e", "big-u-escape": "\U000e0001"}
+_CAP_SPLITS = [
+    pytest.param(ch, before, id=f"{name}-{before}-before-cap")
+    for name, ch in _ESCAPE_CHARS.items()
+    # Width from the renderer itself (both copies are byte-identical, tested below).
+    for before in range(len(health_check.display_path(ch)) + 1)  # 0 = starts at the cap, w = ends at it
+]
+
+
+@_SCRIPT_MODULES
+@pytest.mark.parametrize(("ch", "before"), _CAP_SPLITS)
+def test_display_path_truncation_never_splits_an_escape(mod: ModuleType, ch: str, before: int) -> None:
+    # Security F2 residual: the cap must not cut "\x0a" to "\x0" or "\\" to a lone "\",
+    # which would make the next character read as part of an escape. The escape starts
+    # `before` characters ahead of the cap, so 1..w-1 put the cap inside it.
+    cap = mod._MAX_DISPLAY_CHARS  # F13: read, not restated
+    raw = "a" * (cap - before) + ch + "tail"
+    tokens = [mod.display_path(c) for c in raw]  # each character's whole escape
+    assert all(len(t) <= cap for t in tokens)
+    kept = ""
+    for token in tokens:  # longest run of whole escapes that fits under the cap
+        if len(kept) + len(token) > cap:
+            break
+        kept += token
+    assert mod.display_path(raw) == kept + "...(truncated)"
 
 
 def test_folded_block_is_byte_identical_in_both_scripts() -> None:
