@@ -33,7 +33,8 @@ EXIT_CONFIG_MISSING: int = 2
 # Directory listing and log-path rendering (terms-analysis#173).
 # This block is byte-identical in health_check.py and check_approvals.py so each
 # scheduled job runs standalone as `python scripts/<name>.py`. A test in
-# tests/unit/test_health_check_empty.py compares the two copies byte for byte.
+# tests/unit/test_health_check_empty.py compares the two copies byte for byte, up to
+# the end marker below. It also holds the one load-failure and empty-dir wording.
 # What counts as a config file: a regular *.yaml file (symlinks to files followed,
 # hidden names included, as the source registry's glob("*.yaml") does). Untrusted
 # text (file names, YAML values, checkpoint fields) reaches a terminal, CI log or
@@ -145,6 +146,27 @@ def scan_yaml_dir(directory: Path, label: str) -> YamlDirListing:
     return YamlDirListing(files=files, non_files=non_files)
 
 
+def _load_failure(exc: Exception) -> str:
+    """Describe why a YAML file could not be loaded, without its bytes or path (F8).
+
+    A YAML error gives the line number only, since the parser's message quotes the
+    file. Any other error (OSError, UnicodeDecodeError, RecursionError on deep
+    nesting) gives its strerror or type, since str(exc) can repeat the path.
+    """
+    if isinstance(exc, yaml.YAMLError):
+        mark = getattr(exc, "problem_mark", None)
+        return f"not valid YAML (line {mark.line + 1})" if mark is not None else "not valid YAML"
+    return f"cannot read: {getattr(exc, 'strerror', None) or type(exc).__name__}"
+
+
+def _empty_dir_problem(directory: Path, label: str) -> str:
+    """The one wording for a usable directory that holds no ``*.yaml`` files (#173)."""
+    return f"no *.yaml files in {label} {display_path(directory)}."
+
+
+# End of the byte-identical block (terms-analysis#173).
+
+
 def _utc_now() -> datetime:
     """Return current UTC datetime."""
     return datetime.now(tz=UTC)
@@ -161,10 +183,7 @@ def _source_names(config_dir: Path) -> list[str]:
     """
     names = sorted(p.stem for p in scan_yaml_dir(config_dir, "config dir").files)
     if not names:
-        raise YamlDirError(
-            f"No sources configured: config dir {display_path(config_dir)} "
-            "has no *.yaml source configs."
-        )
+        raise YamlDirError(_empty_dir_problem(config_dir, "config dir"))
     return names
 
 
@@ -188,22 +207,16 @@ def _config_problems(config_dir: Path) -> list[str]:
         shown = display_path(path.name)
         try:
             data = yaml.safe_load(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError) as exc:
-            reason = getattr(exc, "strerror", None) or type(exc).__name__
-            problems.append(f"cannot read source config {shown} in {shown_dir}: {reason}.")
-            continue
-        except yaml.YAMLError as exc:
-            # Line number only: the parser's message can quote untrusted file bytes (F8).
-            mark = getattr(exc, "problem_mark", None)
-            where = f" (line {mark.line + 1})" if mark is not None else ""
-            problems.append(f"source config {shown} in {shown_dir} is not valid YAML{where}.")
+        except Exception as exc:  # noqa: BLE001 — any read or parse failure (incl. RecursionError) is a config problem
+            # The shared reason: line number or strerror/type only, never file bytes (F8).
+            problems.append(f"source config {shown} in {shown_dir}: {_load_failure(exc)}.")
             continue
         if not isinstance(data, dict) or not data:
             problems.append(
                 f"source config {shown} in {shown_dir} is empty or not a YAML mapping."
             )
     if not listing.files:
-        problems.append(f"No sources configured: config dir {shown_dir} has no *.yaml source configs.")
+        problems.append(_empty_dir_problem(config_dir, "config dir"))
     return problems
 
 

@@ -33,7 +33,8 @@ EXIT_CONFIG: int = 2
 # Directory listing and log-path rendering (terms-analysis#173).
 # This block is byte-identical in health_check.py and check_approvals.py so each
 # scheduled job runs standalone as `python scripts/<name>.py`. A test in
-# tests/unit/test_health_check_empty.py compares the two copies byte for byte.
+# tests/unit/test_health_check_empty.py compares the two copies byte for byte, up to
+# the end marker below. It also holds the one load-failure and empty-dir wording.
 # What counts as a config file: a regular *.yaml file (symlinks to files followed,
 # hidden names included, as the source registry's glob("*.yaml") does). Untrusted
 # text (file names, YAML values, checkpoint fields) reaches a terminal, CI log or
@@ -145,6 +146,27 @@ def scan_yaml_dir(directory: Path, label: str) -> YamlDirListing:
     return YamlDirListing(files=files, non_files=non_files)
 
 
+def _load_failure(exc: Exception) -> str:
+    """Describe why a YAML file could not be loaded, without its bytes or path (F8).
+
+    A YAML error gives the line number only, since the parser's message quotes the
+    file. Any other error (OSError, UnicodeDecodeError, RecursionError on deep
+    nesting) gives its strerror or type, since str(exc) can repeat the path.
+    """
+    if isinstance(exc, yaml.YAMLError):
+        mark = getattr(exc, "problem_mark", None)
+        return f"not valid YAML (line {mark.line + 1})" if mark is not None else "not valid YAML"
+    return f"cannot read: {getattr(exc, 'strerror', None) or type(exc).__name__}"
+
+
+def _empty_dir_problem(directory: Path, label: str) -> str:
+    """The one wording for a usable directory that holds no ``*.yaml`` files (#173)."""
+    return f"no *.yaml files in {label} {display_path(directory)}."
+
+
+# End of the byte-identical block (terms-analysis#173).
+
+
 # ---------------------------------------------------------------------------
 # Pure functions (exposed for unit tests)
 # ---------------------------------------------------------------------------
@@ -163,18 +185,6 @@ def classify_approval(expiry: date, today: date, warn_days: int) -> str:
     if (expiry - today).days <= warn_days:
         return "EXPIRING_SOON"
     return "OK"
-
-
-def _load_failure(exc: Exception) -> str:
-    """Describe why an approval file could not be loaded, without its bytes or path (F8).
-
-    A YAML error gives the line number only, since the parser's message quotes the
-    file. Any other error gives its strerror or type, since str(exc) repeats the path.
-    """
-    if isinstance(exc, yaml.YAMLError):
-        mark = getattr(exc, "problem_mark", None)
-        return f"not valid YAML (line {mark.line + 1})" if mark is not None else "not valid YAML"
-    return f"cannot read: {getattr(exc, 'strerror', None) or type(exc).__name__}"
 
 
 def check_approvals_dir(
@@ -204,9 +214,7 @@ def check_approvals_dir(
 
     yaml_files = scan_yaml_dir(approvals_dir, "approvals dir").files
     if not yaml_files:
-        raise YamlDirError(
-            f"no approval files (*.yaml) in approvals dir {display_path(approvals_dir)}."
-        )
+        raise YamlDirError(_empty_dir_problem(approvals_dir, "approvals dir"))
     for yaml_path in yaml_files:
         try:
             data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
@@ -234,8 +242,36 @@ def check_approvals_dir(
             any_expired = True
             continue
 
-        source_id = str(data.get("source_id", yaml_path.stem))
+        # Type checks come before any str() or f-string: a YAML alias graph is cheap to
+        # load but expands in full when rendered, before any display cap (security r2 F3).
+        raw_source_id = data.get("source_id", yaml_path.stem)
+        if not isinstance(raw_source_id, str):
+            # Never shown: the row is named by the file stem. An explicit null counts too.
+            rows.append(
+                {
+                    "source_id": yaml_path.stem,
+                    "status": "ERROR",
+                    "expiry": "source_id is not a string",
+                    "days_remaining": "-",
+                }
+            )
+            any_expired = True
+            continue
+        source_id = raw_source_id
         raw_expiry = data.get("expiry")
+
+        # date covers an unquoted YAML date; an int, float or bool must never parse as one.
+        if raw_expiry is not None and not isinstance(raw_expiry, (str, date)):
+            rows.append(
+                {
+                    "source_id": source_id,
+                    "status": "ERROR",
+                    "expiry": "invalid date: not a date or string",
+                    "days_remaining": "-",
+                }
+            )
+            any_expired = True
+            continue
 
         if not raw_expiry:
             rows.append(
@@ -264,7 +300,19 @@ def check_approvals_dir(
             continue
 
         # HR9: signed_artifact_sha256 must be present, non-empty, and valid hex format.
-        sha256 = str(data.get("signed_artifact_sha256", "")).strip()
+        raw_sha256 = data.get("signed_artifact_sha256", "")
+        if not isinstance(raw_sha256, str):
+            rows.append(
+                {
+                    "source_id": source_id,
+                    "status": "ERROR",
+                    "expiry": f"sha256-invalid-format (expiry={expiry_date})",
+                    "days_remaining": "-",
+                }
+            )
+            any_expired = True
+            continue
+        sha256 = raw_sha256.strip()
         if not sha256:
             rows.append(
                 {
@@ -337,14 +385,12 @@ def _config_problems(sources_dir: Path, approvals_dir: Path) -> list[str]:
     sources = _scan(sources_dir, "sources dir", problems)
     approvals = _scan(approvals_dir, "approvals dir", problems)
     if approvals is not None and not approvals:
-        unverified = (
-            f"; {len(sources)} source config(s) in {display_path(sources_dir)} are unverified"
-            if sources
-            else ""
-        )
-        problems.append(
-            f"no approval files (*.yaml) in approvals dir {display_path(approvals_dir)}{unverified}."
-        )
+        problems.append(_empty_dir_problem(approvals_dir, "approvals dir"))
+        if sources:
+            # Its own line, so the empty-dir line keeps the one shared wording.
+            problems.append(
+                f"{len(sources)} source config(s) in {display_path(sources_dir)} are unverified."
+            )
     return problems
 
 
