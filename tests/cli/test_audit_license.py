@@ -8,6 +8,7 @@ from typing import Any
 from typer.testing import CliRunner
 
 from legal_corpus_ingester.cli import app
+from tests.cli.helpers import strip_ansi
 
 runner = CliRunner()
 
@@ -50,7 +51,7 @@ def test_audit_license_help() -> None:
     """audit-license --help exits 0."""
     result = runner.invoke(app, ["audit-license", "--help"])
     assert result.exit_code == 0
-    assert "audit-license" in result.output.lower() or "license" in result.output.lower()
+    assert "license" in strip_ansi(result.output).lower()
 
 
 def test_audit_license_unknown_source(tmp_path: Path, monkeypatch: Any) -> None:

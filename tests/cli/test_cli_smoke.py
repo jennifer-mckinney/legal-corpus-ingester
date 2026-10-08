@@ -6,6 +6,7 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 from legal_corpus_ingester.cli import app
+from tests.cli.helpers import strip_ansi
 
 runner = CliRunner()
 
@@ -47,7 +48,8 @@ def test_status_no_checkpoints(tmp_path: object, monkeypatch: object) -> None:  
 def test_fetch_dry_run_help() -> None:
     result = runner.invoke(app, ["fetch", "--help"])
     assert result.exit_code == 0
-    assert "dry-run" in result.output.lower() or "dry_run" in result.output.lower()
+    # ANSI-independent: Rich may split "--dry-run" across style codes under CI.
+    assert "--dry-run" in strip_ansi(result.output)
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +123,9 @@ def test_prune_help() -> None:
     """prune --help exits 0 and mentions expected flags."""
     result = runner.invoke(app, ["prune", "--help"])
     assert result.exit_code == 0
-    assert "dry-run" in result.output or "force" in result.output
+    out = strip_ansi(result.output)
+    assert "--dry-run" in out
+    assert "--force" in out
 
 
 def test_prune_no_flags_prints_guidance(tmp_path: Path, monkeypatch: object) -> None:
