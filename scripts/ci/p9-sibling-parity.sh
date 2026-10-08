@@ -86,7 +86,22 @@ check() {
         echo "p9-sibling-parity: the parity test failed" >&2
         exit 1
     fi
-    summary="$(printf '%s\n' "${out}" | tail -n 1)"
+    # The LAST real pytest summary line: "<n> <word>[, <n> <word>]... in <t>s" or
+    # "no tests ran in <t>s", with the `=` banner padding stripped. Coverage output,
+    # prose and other trailing lines are not summaries and are skipped.
+    local line stripped re_counts re_summary
+    re_counts='[0-9]+ [a-z]+(, [0-9]+ [a-z]+)*'
+    re_summary="^(${re_counts}|no tests ran) in [0-9.]+s( \\([0-9:.]+\\))?\$"
+    summary=""
+    while IFS= read -r line; do
+        stripped="${line#"${line%%[!= ]*}"}"
+        stripped="${stripped%"${stripped##*[!= ]}"}"
+        if [[ "${stripped}" =~ ${re_summary} ]]; then
+            summary="${stripped}"
+        fi
+    done <<< "${out}"
+    # Passes only on exactly one passed test (warnings are not outcomes); any
+    # failed/error/skipped/deselected count or a missing summary fails.
     if [[ "${summary}" =~ ^1\ passed(,\ [0-9]+\ warnings?)?\ in\  ]]; then
         echo "p9-sibling-parity: parity test ran and passed"
         return 0
