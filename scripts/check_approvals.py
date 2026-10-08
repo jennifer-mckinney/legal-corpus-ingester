@@ -146,6 +146,27 @@ def scan_yaml_dir(directory: Path, label: str) -> YamlDirListing:
     return YamlDirListing(files=files, non_files=non_files)
 
 
+class _NoAliasLoader(yaml.SafeLoader):
+    """SafeLoader that refuses every YAML alias, so merge-key bombs fail at load.
+
+    Config and approval files never need anchors or ``<<`` merges. A ComposerError
+    carries a mark, so ``_load_failure`` reports "not valid YAML (line N)" (F8).
+    """
+
+    def compose_node(self, parent, index):  # type: ignore[no-untyped-def]
+        if self.check_event(yaml.events.AliasEvent):
+            event = self.peek_event()
+            raise yaml.composer.ComposerError(
+                None, None, "YAML aliases are not allowed", event.start_mark
+            )
+        return super().compose_node(parent, index)
+
+
+def _load_yaml(text: str) -> object:
+    """Parse YAML text with aliases refused (the one load path for both scripts)."""
+    return yaml.load(text, Loader=_NoAliasLoader)
+
+
 def _load_failure(exc: Exception) -> str:
     """Describe why a YAML file could not be loaded, without its bytes or path (F8).
 
@@ -217,7 +238,7 @@ def check_approvals_dir(
         raise YamlDirError(_empty_dir_problem(approvals_dir, "approvals dir"))
     for yaml_path in yaml_files:
         try:
-            data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+            data = _load_yaml(yaml_path.read_text(encoding="utf-8"))
         except Exception as exc:  # noqa: BLE001 — any read or parse failure is an ERROR row
             rows.append(
                 {
