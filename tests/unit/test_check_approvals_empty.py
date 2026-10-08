@@ -495,7 +495,7 @@ def test_non_scalar_is_rejected_without_rendering_it(
     loaded[field] = _NoStr(["x"])
     # Whichever entry the script loads through (safe_load, or load with a no-alias Loader, r3 F4).
     monkeypatch.setattr(check_approvals.yaml, "safe_load", lambda _text: loaded)
-    monkeypatch.setattr(check_approvals.yaml, "load", lambda _text, Loader=None: loaded)  # noqa: N803
+    monkeypatch.setattr(check_approvals.yaml, "load", lambda _text, Loader=None: loaded)
     rc, out, _err = _run(["--sources-dir", str(sources), "--approvals-dir", str(approvals)], capsys)
     assert rc == _EXIT_EXPIRED_OR_INVALID
     row_id = "ghost" if field == "source_id" else "eurlex"
