@@ -1,0 +1,6 @@
+# actionlint configuration (legal-corpus-ingester#21).
+# Custom labels of the project's self-hosted runner; actionlint rejects any
+# runs-on label it does not know.
+self-hosted-runner:
+  labels:
+    - legal-corpus-ingester

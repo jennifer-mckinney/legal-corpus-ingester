@@ -27,10 +27,11 @@ command piped into `tail` still fails the step (terms-analysis#90).
 3. `Install` - creates `.venv` and runs `pip install -e '.[dev]'`. Output is tail-truncated to 5 lines.
 4. `Lint` - runs `ruff check .` against the full codebase. Failures block the job.
 5. `Type check` - runs `mypy src/`. Failures block the job.
-6. `Unit tests` - runs `pytest tests/unit tests/snapshot tests/cli` with coverage collection. Coverage XML is written for the upload step. Output is tail-truncated to 30 lines.
-7. `Integration tests` - runs `pytest tests/integration`. Output is tail-truncated to 30 lines.
-8. `E2E tests` - runs `pytest tests/e2e`. Output is tail-truncated to 20 lines.
-9. `Upload coverage` - uploads `coverage.xml` as a GitHub Actions artifact named `coverage-report-<run_id>`. Runs even if earlier steps fail (`if: always()`).
+6. `Install actionlint` - downloads the pinned actionlint release for the runner's platform, verifies its SHA-256 and version, and puts it on `PATH`. An unpinned platform, a checksum or version mismatch, or a failed download fails the job.
+7. `Unit tests` - runs `pytest tests/unit tests/snapshot tests/cli` with coverage collection. This includes `tests/unit/test_workflow_validation.py`, which fails if any file in `.github/workflows/` does not parse or fails actionlint (config: `.github/actionlint.yaml`), so a broken workflow fails PR CI. Coverage XML is written for the upload step. Output is tail-truncated to 30 lines.
+8. `Integration tests` - runs `pytest tests/integration`. Output is tail-truncated to 30 lines.
+9. `E2E tests` - runs `pytest tests/e2e`. Output is tail-truncated to 20 lines.
+10. `Upload coverage` - uploads `coverage.xml` as a GitHub Actions artifact named `coverage-report-<run_id>`. Runs even if earlier steps fail (`if: always()`).
 
 ## Concurrency
 

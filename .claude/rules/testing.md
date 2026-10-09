@@ -88,7 +88,7 @@ examples:
 
 - Dev (local): `record_mode='new_episodes'` — records missing cassettes, replays existing
 - CI: `record_mode='none'` — hard failure if cassette missing (no network in CI)
-- Weekly drift canary: `record_mode='all'` — re-records all cassettes against live upstream (CI cron `0 4 * * 0`)
+- Weekly drift canary: `--record-mode=rewrite` — deletes then re-records all cassettes against live upstream (CI cron `0 4 * * 0`)
 - Cassette directory: `tests/fixtures/cassettes/<source_id>/`
 - On schema change: test fails, diff shown, `ALERTS.md` updated; cassette diff committed as PR for review
 

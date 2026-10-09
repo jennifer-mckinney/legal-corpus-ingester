@@ -1,0 +1,150 @@
+# G0-3 red run (terms-analysis#92), 2026-10-07, base e184b8a
+# cmd: .venv/bin/python -m pytest tests/unit/test_vcr_canary_contract.py -q --no-cov -rA
+# expected: a, c1-c4, d FAIL (pre-fix); b PASS (regression guard)
+
+============================= test session starts ==============================
+platform darwin -- Python 3.14.3, pytest-9.1.1, pluggy-1.6.0
+rootdir: <repo>
+configfile: pyproject.toml
+plugins: recording-0.13.4, cov-7.1.0, anyio-4.14.1, syrupy-5.4.0
+collected 7 items
+
+tests/unit/test_vcr_canary_contract.py F.FFFFF                           [100%]
+
+=================================== FAILURES ===================================
+_____________ test_a_empty_dirs_exit_nonzero_and_say_zero_compared _____________
+
+tmp_path = PosixPath('<tmp>/test_a_empty_dirs_exit_nonzero0')
+
+    def test_a_empty_dirs_exit_nonzero_and_say_zero_compared(tmp_path: Path) -> None:
+        """Both dirs empty must be an error, not 'no drift' (silent green)."""
+        baseline = tmp_path / "baseline"
+        current = tmp_path / "current"
+        baseline.mkdir()
+        current.mkdir()
+        out = tmp_path / "drift-report.md"
+    
+        proc = _run_script(
+            "--baseline", str(baseline), "--current", str(current), "--output", str(out)
+        )
+        combined = (proc.stdout + proc.stderr).lower()
+    
+>       assert proc.returncode != 0, (
+            "drift script exited 0 after comparing zero cassettes; "
+            f"stdout={proc.stdout!r} stderr={proc.stderr!r}"
+        )
+E       AssertionError: drift script exited 0 after comparing zero cassettes; stdout='No drift detected. Report written to <tmp>/test_a_empty_dirs_exit_nonzero0/drift-report.md.\n' stderr=''
+E       assert 0 != 0
+E        +  where 0 = CompletedProcess(args=['<projects>/le...<tmp>/test_a_empty_dirs_exit_nonzero0/drift-report.md.\n', stderr='').returncode
+
+tests/unit/test_vcr_canary_contract.py:116: AssertionError
+_____________________ test_c1_piped_run_steps_use_pipefail _____________________
+
+    def test_c1_piped_run_steps_use_pipefail() -> None:
+        """A pipe without pipefail masks the left-hand failure (B2: '| tail -40')."""
+        wf = _load_workflow()
+        job = _drift_job(wf)
+        workflow_shell = ((wf.get("defaults") or {}).get("run") or {}).get("shell")
+        job_shell = ((job.get("defaults") or {}).get("run") or {}).get("shell")
+        if _shell_has_pipefail(job_shell) or (
+            job_shell is None and _shell_has_pipefail(workflow_shell)
+        ):
+            return
+    
+        offenders = []
+        for step in _run_steps(job):
+            script = step["run"]
+            if not _PIPE_RE.search(script):
+                continue
+            if _shell_has_pipefail(step.get("shell")):
+                continue
+            if re.search(r"^\s*set\s+(-[a-z]*o\s+pipefail|-o\s+pipefail)", script, re.M):
+                continue
+            offenders.append(step.get("name", "<unnamed>"))
+    
+>       assert not offenders, f"piped run steps without pipefail: {offenders}"
+E       AssertionError: piped run steps without pipefail: ['Install', 'Re-record cassettes (live fetch)']
+E       assert not ['Install', 'Re-record cassettes (live fetch)']
+
+tests/unit/test_vcr_canary_contract.py:168: AssertionError
+_____________________ test_c2_no_step_uses_pytest_vcr_flag _____________________
+
+    def test_c2_no_step_uses_pytest_vcr_flag() -> None:
+        """--vcr-record is pytest-vcr; the installed plugin is pytest-recording (B2)."""
+        job = _drift_job(_load_workflow())
+        offenders = [s.get("name", "<unnamed>") for s in _run_steps(job) if "--vcr-record" in s["run"]]
+>       assert not offenders, f"steps using unsupported --vcr-record flag: {offenders}"
+E       AssertionError: steps using unsupported --vcr-record flag: ['Re-record cassettes (live fetch)']
+E       assert not ['Re-record cassettes (live fetch)']
+
+tests/unit/test_vcr_canary_contract.py:175: AssertionError
+______________ test_c3_report_baseline_is_dir_stash_step_creates _______________
+
+    def test_c3_report_baseline_is_dir_stash_step_creates() -> None:
+        """B1: 'cp -r cassettes/ /tmp/vcr-baseline/' never creates .../cassettes."""
+        job = _drift_job(_load_workflow())
+        stash = _step_using(job, "cp ")
+        report = _step_using(job, "vcr_drift_report.py")
+    
+        created = _stash_created_dir(stash["run"])
+        baseline = _report_baseline_arg(report["run"])
+>       assert baseline == created, (
+            f"report reads --baseline {baseline!r} but stash step creates {created!r}"
+        )
+E       AssertionError: report reads --baseline '/tmp/vcr-baseline/cassettes' but stash step creates '/tmp/vcr-baseline'
+E       assert '/tmp/vcr-baseline/cassettes' == '/tmp/vcr-baseline'
+E         
+E         - /tmp/vcr-baseline
+E         + /tmp/vcr-baseline/cassettes
+E         ?                  ++++++++++
+
+tests/unit/test_vcr_canary_contract.py:227: AssertionError
+___________ test_c4_issue_step_does_not_depend_solely_on_report_file ___________
+
+    def test_c4_issue_step_does_not_depend_solely_on_report_file() -> None:
+        """B4: a setup error writes no report, so a report-gated alert never fires."""
+        job = _drift_job(_load_workflow())
+        issue_steps = [s for s in _run_steps(job) if "gh issue create" in s["run"]]
+        assert issue_steps, "no step opens an issue"
+    
+        for step in issue_steps:
+            script = step["run"]
+            gated = re.search(r"if\s+\[\s*-f\s+\S*drift-report\.md\s*\]", script)
+            if not gated:
+                return
+            # Gated on the report: an else branch must still open an issue.
+            parts = re.split(r"^\s*else\b", script, maxsplit=1, flags=re.M)
+            else_part = parts[1] if len(parts) == 2 else ""
+            if "gh issue create" in else_part:
+                return
+    
+>       pytest.fail("every issue-opening path is gated on drift-report.md existing")
+E       Failed: every issue-opening path is gated on drift-report.md existing
+
+tests/unit/test_vcr_canary_contract.py:249: Failed
+_______ test_d_integration_vcr_config_does_not_hardcode_record_mode_none _______
+
+    def test_d_integration_vcr_config_does_not_hardcode_record_mode_none() -> None:
+        """B3: vcr_config record_mode overrides the CLI --record-mode in pytest-recording."""
+        pattern = re.compile(r"""["']record_mode["']\s*:\s*["']none["']""")
+        offenders = [
+            f"{p.relative_to(REPO_ROOT)}:{n}"
+            for p in sorted(INTEGRATION_DIR.rglob("*.py"))
+            for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), start=1)
+            if pattern.search(line)
+        ]
+>       assert not offenders, f"vcr_config hard-codes record_mode none: {offenders}"
+E       AssertionError: vcr_config hard-codes record_mode none: ['tests/integration/test_eurlex_fetcher.py:14']
+E       assert not ['tests/integration/test_eurlex_fetcher.py:14']
+
+tests/unit/test_vcr_canary_contract.py:266: AssertionError
+==================================== PASSES ====================================
+=========================== short test summary info ============================
+PASSED tests/unit/test_vcr_canary_contract.py::test_b_missing_baseline_exits_nonzero
+FAILED tests/unit/test_vcr_canary_contract.py::test_a_empty_dirs_exit_nonzero_and_say_zero_compared
+FAILED tests/unit/test_vcr_canary_contract.py::test_c1_piped_run_steps_use_pipefail
+FAILED tests/unit/test_vcr_canary_contract.py::test_c2_no_step_uses_pytest_vcr_flag
+FAILED tests/unit/test_vcr_canary_contract.py::test_c3_report_baseline_is_dir_stash_step_creates
+FAILED tests/unit/test_vcr_canary_contract.py::test_c4_issue_step_does_not_depend_solely_on_report_file
+FAILED tests/unit/test_vcr_canary_contract.py::test_d_integration_vcr_config_does_not_hardcode_record_mode_none
+========================= 6 failed, 1 passed in 0.31s ==========================

@@ -12,11 +12,20 @@ concurrency:
   group: vcr-drift
   cancel-in-progress: false  # never cancel a drift check mid-run
 
+defaults:
+  run:
+    shell: bash -eo pipefail {0}
+
 jobs:
   drift:
     runs-on: [self-hosted, legal-corpus-ingester]
     steps:
+      # persist-credentials: false keeps the issues:write token out of
+      # .git/config while pip install and live network tests run (security F4).
+      # Nothing in this job pushes; gh gets its token via GH_TOKEN, last step only.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         run: python3 --version
@@ -27,39 +36,157 @@ jobs:
           source .venv/bin/activate
           pip install -e '.[dev]' 2>&1 | tail -5
 
+      # Fresh per-run baseline under RUNNER_TEMP (not shared /tmp on the
+      # self-hosted runner). Destination does not exist before the copy, so
+      # `cp -R src dst` creates dst as a copy of src on both BSD and GNU cp:
+      # the cassette tree (eurlex/...) sits directly under $RUNNER_TEMP/vcr-baseline.
       - name: Stash committed cassettes
         run: |
-          mkdir -p /tmp/vcr-baseline
-          cp -r tests/fixtures/cassettes/ /tmp/vcr-baseline/
+          rm -rf "$RUNNER_TEMP/vcr-baseline"
+          cp -R tests/fixtures/cassettes "$RUNNER_TEMP/vcr-baseline"
+          test -d "$RUNNER_TEMP/vcr-baseline/eurlex"
+          # Delete the committed cassettes so ONLY cassettes a test re-records
+          # this run exist on the current side. A cassette no test re-records
+          # shows as "missing on current side" (baseline-only drift, red)
+          # instead of being compared with itself (grumpy r2 #1).
+          find tests/fixtures/cassettes -type f -name '*.yaml' -delete
 
+      # pytest-recording's flag is --record-mode (not pytest-vcr's --vcr-record).
+      # `rewrite` deletes each cassette before recording, so the file holds ONLY
+      # fresh interactions. `all` loads the committed interactions and appends,
+      # which made every run report a meaningless count change and never diffed
+      # the fresh body (grumpy #1). A test that stops recording now leaves its
+      # cassette missing, which the report flags as baseline-only drift.
+      # pipefail (workflow default) makes a pytest failure fail this step.
       - name: Re-record cassettes (live fetch)
         run: |
           source .venv/bin/activate
-          pytest tests/integration/ --vcr-record=all -v 2>&1 | tail -40
+          pytest tests/integration/ --record-mode=rewrite -v -rs \
+            --junitxml="$RUNNER_TEMP/vcr-rerecord-junit.xml" 2>&1 | tail -40
 
-      - name: Generate drift report
+      # A skipped test records nothing, so its endpoint went unchecked while
+      # pytest still exits 0. The JUnit XML (not console text) is the robust
+      # signal: fail on any <skipped> testcase or on zero tests (round-4 LOW).
+      - name: Fail on skipped re-record tests
         run: |
           source .venv/bin/activate
+          python scripts/vcr_skip_guard.py "$RUNNER_TEMP/vcr-rerecord-junit.xml"
+
+      # The exit code is recorded as a step output for the issue step's
+      # outcome classifier (grumpy #4). RUN_URL lets the report's truncation
+      # marker point at this run and its artifact.
+      - name: Generate drift report
+        id: report
+        env:
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          source .venv/bin/activate
+          rc=0
           python scripts/vcr_drift_report.py \
-            --baseline /tmp/vcr-baseline/cassettes \
+            --baseline "$RUNNER_TEMP/vcr-baseline" \
             --current tests/fixtures/cassettes \
-            --output drift-report.md
+            --output drift-report.md || rc=$?
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
       - name: Upload drift report
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
         if: always()
         with:
           name: vcr-drift-report-${{ github.run_id }}
-          path: drift-report.md
+          # The re-recorded cassettes ride along so a truncated report still
+          # has its full detail one click away (security F1). Response
+          # Set-Cookie/auth headers are scrubbed at record time (security F3).
+          path: |
+            drift-report.md
+            tests/fixtures/cassettes/
+          if-no-files-found: warn
 
-      - name: Open issue on drift
+      # Opens (or updates) an issue on ANY failure.
+      # - Title, labels and body text come ONLY from the outcome
+      #   table ISSUE_OUTCOMES in scripts/vcr_drift_report.py, called through
+      #   the scripts/vcr_issue_outcome.py wrapper (--classify-outcome);
+      #   automations/vcr-drift.md embeds the same table. Do not restate the
+      #   mapping here: tests/unit/test_vcr_outcome_table.py and
+      #   test_vcr_runbook_contract.py fail on drift.
+      # - Labels are created from the classifier's own label list, so a new
+      #   label in the table can never make `gh issue create` fail (grumpy r7).
+      # - Interpreter: the job's venv python when it runs, else bare python3.
+      #   The classifier is stdlib-only, so a broken venv still alerts. If
+      #   neither can run it, the step falls back to the table's `broken`
+      #   outcome (pinned by the same test).
+      # - The script caps the report at 60000 bytes on whole-block (UTF-8 safe)
+      #   boundaries (security F1). `head -c 64000` is only a backstop: larger
+      #   than the script cap, so it never cuts a valid report mid-character,
+      #   and below GitHub's 65536-char limit once the run link is added.
+      # - Dedupe (grumpy #3 / security F5, mirrors refresh.yml and
+      #   approval-expiry.yml): if a corpus-drift issue is already open, comment
+      #   on it instead of opening a duplicate every Sunday. The search label
+      #   is DEDUPE_LABEL in the table, which every outcome carries (pinned by
+      #   test_vcr_outcome_table.py).
+      # - Labels use `--force` (idempotent create-or-update), so real auth or
+      #   network errors still fail the step (grumpy #5).
+      # Only trusted github.* context is used, passed via env rather than
+      # interpolated into the script.
+      - name: Open issue on failure
         if: failure()
         env:
           GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_ID: ${{ github.run_id }}
+          REPORT_RC: ${{ steps.report.outputs.rc }}
         run: |
-          if [ -f drift-report.md ]; then
+          day=$(date -u +%Y-%m-%d)
+          body_file="$RUNNER_TEMP/vcr-issue-body.md"
+          report_exists=0
+          if [ -f drift-report.md ]; then report_exists=1; fi
+          py=python3
+          if [ -x .venv/bin/python ] && .venv/bin/python -I -c 'import sys' >/dev/null 2>&1; then
+            py=.venv/bin/python
+          fi
+          classify() {
+            "$py" -I scripts/vcr_issue_outcome.py --date="$day" "$@"
+          }
+          outcome_args=(--rc="$REPORT_RC" --report-exists="$report_exists")
+          if ! { title=$(classify "${outcome_args[@]}") \
+              && labels=$(classify "${outcome_args[@]}" --field=labels) \
+              && label_specs=$(classify "${outcome_args[@]}" --field=label_specs) \
+              && attach=$(classify "${outcome_args[@]}" --field=attach_report) \
+              && why=$(classify "${outcome_args[@]}" --field=why); }; then
+            echo "::error::outcome classifier failed under $py; alerting with the table's broken outcome" >&2
+            title="VCR drift canary broken $day"
+            labels="corpus-drift,needs-review"
+            label_specs="${labels//,/$'\n'}"
+            attach=0
+            why="the outcome classifier could not run, so the failure class is unknown; see the run log."
+          fi
+          while IFS=$'\t' read -r name color desc; do
+            [ -n "$name" ] || continue
+            label_args=(--force)
+            if [ -n "${color:-}" ]; then label_args+=(--color "$color"); fi
+            if [ -n "${desc:-}" ]; then label_args+=(--description "$desc"); fi
+            gh label create "$name" "${label_args[@]}"
+          done <<< "$label_specs"
+          if [ "$attach" = "1" ]; then
+            {
+              head -c 64000 drift-report.md
+              printf '\n\n---\nRun: %s (artifact `vcr-drift-report-%s`)\n' "$RUN_URL" "$RUN_ID"
+            } > "$body_file"
+          else
+            printf 'The VCR drift canary failed: %s\n\nFailed run: %s\n' "$why" "$RUN_URL" > "$body_file"
+          fi
+          open_issue=$(gh issue list --label "corpus-drift" --state open --json number --jq '.[0].number // empty') || {
+            echo "Warning: gh issue list failed; creating issue unconditionally." >&2
+            open_issue=""
+          }
+          if [ -n "$open_issue" ]; then
+            comment_file="$RUNNER_TEMP/vcr-issue-comment.md"
+            { printf '**%s**\n\n' "$title"; cat "$body_file"; } > "$comment_file"
+            gh issue comment "$open_issue" --body-file "$comment_file"
+            echo "corpus-drift issue #$open_issue already open; commented instead of opening a duplicate."
+          else
             gh issue create \
-              --title "VCR drift detected $(date -u +%Y-%m-%d)" \
-              --body-file drift-report.md \
-              --label "corpus-drift,needs-review"
+              --title "$title" \
+              --body-file "$body_file" \
+              --label "$labels"
           fi

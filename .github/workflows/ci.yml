@@ -39,6 +39,48 @@ jobs:
           source .venv/bin/activate
           mypy src/
 
+      # tests/unit/test_workflow_validation.py runs actionlint over every
+      # workflow; under CI it fails, never skips, if actionlint is missing
+      # (#21: two invalid workflows never ran their schedules). The upstream
+      # release is pinned by version and per-platform SHA-256 (from its
+      # checksums file); a platform with no pin fails rather than skips.
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256_DARWIN_ARM64: aba9ced2dee8d27fecca3dc7feb1a7f9a52caefa1eb46f3271ea66b6e0e6953f
+          ACTIONLINT_SHA256_LINUX_AMD64: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+          ACTIONLINT_RELEASES: https://github.com/rhysd/actionlint/releases/download
+          ACTIONLINT_MAX_SECONDS: "120"
+          ACTIONLINT_MAX_BYTES: "20000000"
+        run: |
+          os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+          arch="$(uname -m)"
+          case "${os}_${arch}" in
+            darwin_arm64) platform=darwin_arm64; want="$ACTIONLINT_SHA256_DARWIN_ARM64" ;;
+            linux_x86_64) platform=linux_amd64; want="$ACTIONLINT_SHA256_LINUX_AMD64" ;;
+            *)
+              echo "::error::no pinned actionlint checksum for ${os}_${arch}; add one to ci.yml" >&2
+              exit 1
+              ;;
+          esac
+          dir="$(mktemp -d "${RUNNER_TEMP}/actionlint.XXXXXX")"
+          asset="actionlint_${ACTIONLINT_VERSION}_${platform}.tar.gz"
+          curl -fsSL --max-time "$ACTIONLINT_MAX_SECONDS" --max-filesize "$ACTIONLINT_MAX_BYTES" \
+            -o "${dir}/${asset}" "${ACTIONLINT_RELEASES}/v${ACTIONLINT_VERSION}/${asset}"
+          got="$(shasum -a 256 "${dir}/${asset}" | cut -d' ' -f1)"
+          if [ "$got" != "$want" ]; then
+            echo "::error::actionlint checksum mismatch for ${asset}" >&2
+            exit 1
+          fi
+          tar -xzf "${dir}/${asset}" -C "$dir" actionlint
+          version="$("${dir}/actionlint" -version | head -n 1)"
+          if [ "$version" != "$ACTIONLINT_VERSION" ]; then
+            echo "::error::actionlint reports a different version; expected ${ACTIONLINT_VERSION}" >&2
+            exit 1
+          fi
+          echo "actionlint ${version} verified"
+          echo "$dir" >> "$GITHUB_PATH"
+
       # The jurisdiction sync test reads terms-analysis's schemas.py; under CI
       # it fails, never skips, when this checkout is missing (r5 F5). It sits
       # inside the workspace, so ruff and mypy exclude companion/.

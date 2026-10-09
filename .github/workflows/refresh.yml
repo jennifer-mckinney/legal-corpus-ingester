@@ -20,12 +20,29 @@ defaults:
 jobs:
   refresh:
     runs-on: [self-hosted, legal-corpus-ingester]
-    # No job-level GH_TOKEN: only the issue step gets the token, so Install
-    # (third-party build hooks) and Run refresh cannot read it (terms-analysis#90).
+    # No job-level GH_TOKEN: only Preflight and the issue step get the token, so
+    # Install (third-party build hooks) and Run refresh cannot read it (terms-analysis#90).
+    env:
+      ISSUE_LABEL: corpus-refresh
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           persist-credentials: false  # no step needs git credentials; keep the token out of .git/config
+
+      # Fail loudly up front when the runner lacks gh or the issue label is
+      # missing, instead of failing only when an issue must be filed (#21).
+      - name: Preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::error::gh CLI not found on the runner; install it and restart the runner service" >&2
+            exit 1
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/labels/${ISSUE_LABEL}" --silent; then
+            echo "::error::Issue label '${ISSUE_LABEL}' could not be read (missing, or the token lacks access); create it: gh label create ${ISSUE_LABEL}" >&2
+            exit 1
+          fi
 
       - name: Set up Python
         run: python3 --version
@@ -59,12 +76,11 @@ jobs:
           BUNDLE_VER: ${{ steps.detect_change.outputs.new_target }}
           RUN_ID: ${{ github.run_id }}
           EVENT_NAME: ${{ github.event_name }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           # The label must exist or `gh issue create --label` fails; --force makes this idempotent
           # and any real error (auth, permissions) fails the step loudly (terms-analysis#90).
-          gh label create "corpus-refresh" --force --color 0E8A16 --description "Weekly corpus refresh published a new bundle"
-          open_count=$(gh issue list --label "corpus-refresh" --state open --json number --jq 'length') || {
+          gh label create "$ISSUE_LABEL" --force --color 0E8A16 --description "Weekly corpus refresh published a new bundle"
+          open_count=$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq 'length') || {
             echo "Warning: gh issue list failed; creating issue unconditionally." >&2
             open_count=0
           }
@@ -76,11 +92,11 @@ jobs:
           Run \`ingester validate-round-trip out/current\` from an environment with terms-analysis installed to verify consumer compatibility (it exits 4 if the consumer is not importable) before updating the terms-analysis consumer.
 
           Triggered by: ${EVENT_NAME} (run \`${RUN_ID}\`)" \
-              --label "corpus-refresh"
+              --label "$ISSUE_LABEL"
           else
             # Do not drop the news: name the new bundle on the open issue so the record step
             # below can advance without the change going unannounced (terms-analysis#90).
-            open_issue=$(gh issue list --label "corpus-refresh" --state open --json number --jq '.[0].number')
+            open_issue=$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq '.[0].number')
             gh issue comment "$open_issue" \
               --body "A newer corpus bundle was published: \`${BUNDLE_VER}\` (run \`${RUN_ID}\`, triggered by ${EVENT_NAME})."
           fi
