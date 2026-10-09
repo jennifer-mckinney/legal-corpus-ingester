@@ -13,13 +13,17 @@ Contract (written by the reviewer, see .github/p9/*.md):
      "findings": [{"severity": ..., "title": ..., "file": ..., "line": ...}]}
 Key sets are exact. severity is one of SEVERITIES (exact spelling), title and
 file are non-blank strings, line is a non-negative int (bool is refused).
+The verdict must agree with the findings: "FAIL" if and only if at least one
+finding is in BLOCKING_SEVERITIES, otherwise "PASS" (LOW and NIT findings are
+listed under PASS). A contradictory verdict is off the contract.
 
 Exit codes:
     0  PASS with zero findings (prints "P9 verdict: PASS, 0 findings"), or
-       only non-blocking findings (prints "P9 verdict: <verdict>, <n>
+       PASS with only non-blocking findings (prints "P9 verdict: PASS, <n>
        finding(s), 0 blocking" and one line per finding, to stdout)
-    1  any blocking finding, or FAIL with no findings listed (to stderr)
-    2  the file is missing, unreadable, not JSON, or off the contract
+    1  FAIL with at least one blocking finding (to stderr)
+    2  the file is missing, unreadable, not JSON, or off the contract,
+       including a verdict that contradicts its findings
 
 Standard library only, so the step needs nothing installed.
 """
@@ -116,7 +120,23 @@ def load(path: Path) -> dict[str, object]:
             f"{path.name} does not match the verdict contract "
             '{"verdict": "PASS"|"FAIL", "findings": [{...}]}'
         )
+    # The verdict is consistent with the findings, or the file is off the
+    # contract: FAIL if and only if a blocking finding is listed. This refuses
+    # a FAIL with only LOW/NIT findings, a FAIL with none, and a PASS that
+    # lists a blocking finding (PR #218 review thread).
+    blocking = _count_blocking(findings)
+    if (verdict == "FAIL") != (blocking > 0):
+        raise InvalidVerdict(
+            f"{path.name} does not match the verdict contract: verdict {verdict} "
+            f"with {blocking} blocking finding(s); the verdict is FAIL if and only "
+            f"if a finding is {'/'.join(sorted(BLOCKING_SEVERITIES))}"
+        )
     return doc
+
+
+def _count_blocking(findings: list[dict[str, object]]) -> int:
+    """How many findings carry a severity in BLOCKING_SEVERITIES."""
+    return sum(item["severity"] in BLOCKING_SEVERITIES for item in findings)
 
 
 def main(argv: list[str]) -> int:
@@ -133,12 +153,11 @@ def main(argv: list[str]) -> int:
     if verdict == "PASS" and not findings:
         print("P9 verdict: PASS, 0 findings")
         return EXIT_PASS
-    blocking = sum(item["severity"] in BLOCKING_SEVERITIES for item in findings)
+    blocking = _count_blocking(findings)
     header = f"P9 verdict: {verdict}, {len(findings)} finding(s), {blocking} blocking"
-    # A FAIL that names nothing gives no reason to pass: fail closed.
-    rejected = blocking > 0 or not findings
-    if not findings:
-        header += "; a FAIL verdict must list its findings"
+    # load() has already proved verdict and findings agree, so a FAIL here
+    # always carries at least one blocking finding.
+    rejected = blocking > 0
     stream = sys.stderr if rejected else sys.stdout
     print(header, file=stream)
     for item in findings:

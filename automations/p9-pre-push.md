@@ -100,9 +100,9 @@ fail the job; reviewers still post them inline and the gate prints them as
 
 | Exit | Meaning |
 |---|---|
-| 0 | verdict `PASS` and `findings` is `[]` (prints `P9 verdict: PASS, 0 findings`), or every finding is `LOW` or `NIT` (prints `<n> finding(s), 0 blocking` and each finding marked `non-blocking`) |
-| 1 | any `CRITICAL`, `HIGH` or `MEDIUM` finding, or verdict `FAIL` with no findings (each finding printed on one sanitised line, marked `blocking` or `non-blocking`) |
-| 2 | file missing, unreadable, not JSON, duplicate keys, or not the contract shape |
+| 0 | verdict `PASS` and `findings` is `[]` (prints `P9 verdict: PASS, 0 findings`), or verdict `PASS` and every finding is `LOW` or `NIT` (prints `<n> finding(s), 0 blocking` and each finding marked `non-blocking`) |
+| 1 | verdict `FAIL` with at least one `CRITICAL`, `HIGH` or `MEDIUM` finding (each finding printed on one sanitised line, marked `blocking` or `non-blocking`) |
+| 2 | file missing, unreadable, not JSON, duplicate keys, not the contract shape, or a verdict that contradicts its findings (`FAIL` with no blocking finding, `PASS` with one) |
 
 Only exit 0 passes the job. A reviewer that crashes, runs out of turns or
 writes nothing fails the job.

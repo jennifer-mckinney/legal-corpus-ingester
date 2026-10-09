@@ -73,7 +73,7 @@ When the review is complete, do exactly these two things.
    {"verdict": "PASS", "findings": []}
    ```
 
-   or, when there is any finding at any severity, NIT included:
+   or, when there is at least one `CRITICAL`, `HIGH` or `MEDIUM` finding:
 
    ```json
    {"verdict": "FAIL", "findings": [
@@ -84,14 +84,17 @@ When the review is complete, do exactly these two things.
    - `verdict` is exactly `"PASS"` or `"FAIL"`.
    - `severity` is one of `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `NIT`.
    - `file` is repo-relative; `line` is an integer (use `0` when no line applies).
-   - `PASS` means zero findings. Any finding means `FAIL`.
+   - `verdict` is `FAIL` if any finding is `CRITICAL`, `HIGH` or `MEDIUM`,
+     else `PASS`. List every finding either way: `LOW` or `NIT` findings
+     go under `PASS`.
    - Blocking severities: `CRITICAL`, `HIGH`, `MEDIUM`.
 
 The job fails when the file is missing, does not parse or is off the
-contract, when a `FAIL` lists no findings, or when any finding has a
-blocking severity (owner decision 2026-10-09). A `FAIL` whose findings are
-all `LOW` or `NIT` passes the job; the gate prints those findings as non-blocking so
-they can be filed as cards. Report every finding anyway, inline and in the
+contract, or when any finding has a blocking severity (owner decision
+2026-10-09). A verdict that contradicts its findings is off the contract:
+`FAIL` with no blocking finding, or `PASS` with one. A `PASS` whose
+findings are all `LOW` or `NIT` passes the job; the gate prints those findings
+as non-blocking so they can be filed as cards. Report every finding anyway, inline and in the
 verdict, at its true severity; never change a severity to change the job
 result.
 
