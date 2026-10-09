@@ -39,6 +39,11 @@ concurrency:
   group: p9-review-${{ github.event.pull_request.number }}
   cancel-in-progress: true
 
+# Explicit pipefail: GitHub's default `bash -e` lets `cmd | tail` hide cmd's failure (terms-analysis#90).
+defaults:
+  run:
+    shell: bash -eo pipefail {0}
+
 jobs:
   security-review:
     name: security-review

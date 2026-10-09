@@ -29,15 +29,16 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+import yaml
 
 # scripts/ is not a package; inject it into the path.
 _SCRIPTS = Path(__file__).parent.parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS))
 
-import check_approvals
-import health_check
-import yaml
-from health_check import main
+# These live in scripts/, so they can only be imported after the path insert.
+import check_approvals  # noqa: E402
+import health_check  # noqa: E402
+from health_check import main  # noqa: E402
 
 _EXIT_CONFIG = 2
 _FIXTURE_SOURCE = Path(__file__).resolve().parents[1] / "fixtures" / "sources" / "eurlex.yaml"
