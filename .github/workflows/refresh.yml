@@ -17,8 +17,22 @@ jobs:
     runs-on: [self-hosted, legal-corpus-ingester]
     env:
       GH_TOKEN: ${{ github.token }}
+      ISSUE_LABEL: corpus-refresh
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      # Fail loudly up front when the runner lacks gh or the issue label is
+      # missing, instead of failing only when an issue must be filed (#21).
+      - name: Preflight
+        run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::error::gh CLI not found on the runner; install it and restart the runner service" >&2
+            exit 1
+          fi
+          if ! gh api "repos/${GITHUB_REPOSITORY}/labels/${ISSUE_LABEL}" --silent; then
+            echo "::error::Issue label '${ISSUE_LABEL}' could not be read (missing, or the token lacks access); create it: gh label create ${ISSUE_LABEL}" >&2
+            exit 1
+          fi
 
       - name: Set up Python
         run: python3 --version
@@ -85,9 +99,8 @@ jobs:
           BUNDLE_VER: ${{ steps.detect_change.outputs.new_target }}
           RUN_ID: ${{ github.run_id }}
           EVENT_NAME: ${{ github.event_name }}
-          GH_TOKEN: ${{ github.token }}
         run: |
-          open_count=$(gh issue list --label "corpus-refresh" --state open --json number --jq 'length') || {
+          open_count=$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq 'length') || {
             echo "Warning: gh issue list failed; creating issue unconditionally." >&2
             open_count=0
           }
@@ -96,10 +109,10 @@ jobs:
               --title "Weekly corpus refresh -- $(date -u +%Y-%m-%d)" \
               --body "Corpus refreshed to bundle \`${BUNDLE_VER}\`.
 
-  Run \`ingester validate-round-trip out/current\` to verify consumer compatibility before updating the terms-analysis consumer.
+          Run \`ingester validate-round-trip out/current\` to verify consumer compatibility before updating the terms-analysis consumer.
 
-  Triggered by: ${EVENT_NAME} (run \`${RUN_ID}\`)" \
-              --label "corpus-refresh"
+          Triggered by: ${EVENT_NAME} (run \`${RUN_ID}\`)" \
+              --label "$ISSUE_LABEL"
           else
             echo "Corpus refresh issue already open; skipping duplicate."
           fi
