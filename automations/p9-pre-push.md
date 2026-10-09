@@ -23,8 +23,10 @@ Workflow: `.github/workflows/p9-review.yml`.
      reviewer can touch the tree;
   3. writes `git diff origin/<base>...HEAD` to `$RUNNER_TEMP/p9/pr.diff`,
      the changed-file list to `$RUNNER_TEMP/p9/changed-files.txt` and
-     `git log --oneline origin/<base>..HEAD` to `$RUNNER_TEMP/p9/commits.txt`
-     (the base branch passes through `env`, not inline);
+     `git log --oneline origin/<base>..<PR head sha>` to
+     `$RUNNER_TEMP/p9/commits.txt` (the checkout is GitHub's synthetic merge
+     commit, so the list ends at `github.event.pull_request.head.sha`, not
+     `HEAD`; the base branch and head sha pass through `env`, not inline);
   4. runs `anthropics/claude-code-action` (pinned by commit SHA) with a prompt
      that has it read the changed-file list and the diff first, then its brief,
      `.github/p9/security-engineer.md` or `.github/p9/grumpy-developer.md`;

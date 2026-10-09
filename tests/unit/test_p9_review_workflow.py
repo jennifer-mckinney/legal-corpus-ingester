@@ -21,6 +21,7 @@ Covered here:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -73,6 +74,7 @@ RUNNER_TEMP_EXPR = "${{ runner.temp }}"
 READ_PATH_PREFIXES = ("//", "~/", "./")
 AUTOMATION_DOC = REPO_ROOT / "automations" / "p9-pre-push.md"
 BASE_REF_EXPR = "${{ github.base_ref }}"
+HEAD_SHA_EXPR = "${{ github.event.pull_request.head.sha }}"
 JOB_PERMISSIONS = {"contents": "read", "pull-requests": "write"}
 PASS_DOC = {"verdict": "PASS", "findings": []}
 FINDING = {"severity": "HIGH", "title": "Swallowed error", "file": "app/x.py", "line": 3}
@@ -240,19 +242,33 @@ def test_gate_rejects_duplicate_keys_that_hide_a_fail(tmp_path: Path) -> None:
 
 _SEVERITY_RULE = re.compile(r"^\s*-\s*`severity` is one of (.+)\.\s*$", re.MULTILINE)
 
-
-def _brief_severities() -> list[str]:
-    """Severity tags the reviewer briefs allow, read from the briefs (F10/F13)."""
-    tags: set[str] = set()
-    for brief in BRIEFS.values():
-        rules = _SEVERITY_RULE.findall(brief.read_text(encoding="utf-8"))
-        assert len(rules) == 1, f"{brief.name}: expected one severity rule, got {rules}"
-        tags.update(re.findall(r"`([A-Z]+)`", rules[0]))
-    assert tags, "no severity tags found in the briefs"
-    return sorted(tags)
+# The contract, stated once as literals: each brief's tag list, and the gate's
+# accepted set (their union: the grumpy brief adds NIT).
+BRIEF_SEVERITIES = {
+    "security-review": ["CRITICAL", "HIGH", "MEDIUM", "LOW"],
+    "grumpy-review": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "NIT"],
+}
+GATE_SEVERITIES = frozenset({"CRITICAL", "HIGH", "MEDIUM", "LOW", "NIT"})
 
 
-SEVERITIES = _brief_severities()
+def _brief_severity_tags(brief: Path) -> list[str]:
+    rules = _SEVERITY_RULE.findall(brief.read_text(encoding="utf-8"))
+    assert len(rules) == 1, f"{brief.name}: expected one severity rule, got {rules}"
+    return re.findall(r"`([A-Z]+)`", rules[0])
+
+
+def _gate_module() -> Any:
+    spec = importlib.util.spec_from_file_location("p9_check_verdict", GATE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_severity_sets_match_the_contract_literals() -> None:
+    assert _gate_module().SEVERITIES == GATE_SEVERITIES
+    for name, brief in BRIEFS.items():
+        assert _brief_severity_tags(brief) == BRIEF_SEVERITIES[name], brief.name
 
 
 def _finding_doc(**overrides: object) -> dict[str, object]:
@@ -331,7 +347,7 @@ def test_gate_rejects_one_bad_finding_among_valid_ones(tmp_path: Path) -> None:
     assert proc.returncode == EXIT_INVALID, proc.stderr
 
 
-@pytest.mark.parametrize("severity", SEVERITIES)
+@pytest.mark.parametrize("severity", sorted(GATE_SEVERITIES))
 def test_gate_accepts_every_brief_severity_as_a_valid_fail(tmp_path: Path, severity: str) -> None:
     # Positive control: every tag a brief allows must reach EXIT_REJECTED, not
     # EXIT_INVALID (F3: what the writer is told to emit, the reader accepts).
@@ -345,13 +361,6 @@ def test_gate_accepts_non_negative_int_lines(tmp_path: Path, line: int) -> None:
     proc = _run_gate(_write(tmp_path, json.dumps(_finding_doc(line=line))))
     assert proc.returncode == EXIT_REJECTED, proc.stderr
     assert f"(app/x.py:{line})" in proc.stderr
-
-
-def test_severity_table_has_positive_and_negative_cases() -> None:
-    # Contract test (QUALITY-BAR 9): each allowed tag has a lower-case
-    # variant that must be refused; the briefs' list is non-trivial.
-    assert len(SEVERITIES) >= 2
-    assert all(s.isupper() and s.lower() not in SEVERITIES for s in SEVERITIES)
 
 
 @pytest.mark.parametrize("args", [(), ("a.json", "b.json")], ids=["no-args", "two-args"])
@@ -508,7 +517,7 @@ def test_diff_prep_step_runs_before_the_reviewer() -> None:
         assert len(prep) == 1, name
         assert steps.index(prep[0]) < steps.index(_action_step(job)), name
         # The base branch arrives through env, never inline in the script.
-        assert prep[0]["env"] == {"BASE_REF": BASE_REF_EXPR}, name
+        assert prep[0]["env"] == {"BASE_REF": BASE_REF_EXPR, "HEAD_SHA": HEAD_SHA_EXPR}, name
         assert "${{" not in prep[0]["run"], name
 
 
@@ -560,32 +569,40 @@ _needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="git is requ
 GIT_TIMEOUT = 30
 
 
-def _git(repo: Path, *args: str) -> None:
+def _git(repo: Path, *args: str) -> str:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
-    subprocess.run(
+    return subprocess.run(
         ["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
         cwd=repo,
         env=env,
         check=True,
         capture_output=True,
+        text=True,
         timeout=GIT_TIMEOUT,
-    )
+    ).stdout.strip()
 
 
-def _step_env(step: dict[str, Any]) -> dict[str, str]:
-    """The step's env, with the base-branch expression resolved to main."""
+def _step_env(step: dict[str, Any], head_sha: str) -> dict[str, str]:
+    """The step's env, with the base branch resolved to main and the PR head sha."""
+    values = {BASE_REF_EXPR: "main", HEAD_SHA_EXPR: head_sha}
     resolved: dict[str, str] = {}
     for key, value in step.get("env", {}).items():
-        assert value == BASE_REF_EXPR, f"unexpected env expression {key}={value!r}"
-        resolved[key] = "main"
+        assert value in values, f"unexpected env expression {key}={value!r}"
+        resolved[key] = values[value]
     return resolved
 
 
 def _run_job(
     tmp_path: Path, job: dict[str, Any], reviewer: Reviewer, committed: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
-    """Run the job's shell steps in a git workspace: origin/main, then the PR."""
+    """Run the job's shell steps in a workspace shaped like a pull_request run.
+
+    The PR commit branches from `base`; main then moves on (`main-later`), and
+    HEAD is a real merge of the PR into main, like GitHub's synthetic merge
+    checkout. So `..HEAD` would list the merge commit and `...` would list
+    `main-later`; only `origin/main..<PR head>` lists just the PR's commit.
+    """
     workspace = tmp_path / "ws"
     runner_temp = tmp_path / "runner-temp"
     (workspace / ".github" / "p9").mkdir(parents=True)
@@ -594,17 +611,30 @@ def _run_job(
     _git(workspace, "init", "-q")
     _git(workspace, "add", "-A")
     _git(workspace, "commit", "-q", "-m", "base")
-    _git(workspace, "update-ref", "refs/remotes/origin/main", "HEAD")
+    base_sha = _git(workspace, "rev-parse", "HEAD")
     for rel, content in {"app/changed.py": "x = 1\n", **(committed or {})}.items():
         (workspace / rel).parent.mkdir(parents=True, exist_ok=True)
         (workspace / rel).write_text(content, encoding="utf-8")
     _git(workspace, "add", "-A")
     _git(workspace, "commit", "-q", "-m", "pr")
+    head_sha = _git(workspace, "rev-parse", "HEAD")
+    _git(workspace, "checkout", "-q", "--detach", base_sha)
+    (workspace / "app").mkdir(exist_ok=True)
+    (workspace / "app" / "main_only.py").write_text("y = 2\n", encoding="utf-8")
+    _git(workspace, "add", "-A")
+    _git(workspace, "commit", "-q", "-m", "main-later")
+    _git(workspace, "update-ref", "refs/remotes/origin/main", "HEAD")
+    _git(workspace, "merge", "-q", "--no-ff", "-m", "synthetic merge", head_sha)
+    assert _git(workspace, "rev-list", "--parents", "-n", "1", "HEAD").count(" ") == 2, "HEAD must be a merge"
     env = {"PATH": os.environ["PATH"], "RUNNER_TEMP": str(runner_temp), "HOME": str(tmp_path)}
     before, after = _shell_steps(job)
     for step in before:
         subprocess.run(
-            ["bash", "-e", "-c", step["run"]], cwd=workspace, env={**env, **_step_env(step)}, check=True, timeout=30
+            ["bash", "-e", "-c", step["run"]],
+            cwd=workspace,
+            env={**env, **_step_env(step, head_sha)},
+            check=True,
+            timeout=30,
         )
     reviewer(workspace)  # stands in for anthropics/claude-code-action
     result = None
@@ -612,7 +642,7 @@ def _run_job(
         result = subprocess.run(
             ["bash", "-e", "-c", step["run"]],
             cwd=workspace,
-            env={**env, **_step_env(step)},
+            env={**env, **_step_env(step, head_sha)},
             text=True,
             capture_output=True,
             timeout=30,
@@ -663,7 +693,9 @@ def test_prepare_step_writes_the_pr_diff_for_the_reviewer(tmp_path: Path, name: 
     assert "+++ b/app/changed.py" in diff
     assert ".github/p9/check_verdict.py" not in diff, "the base commit must not be in the diff"
     assert changed == "app/changed.py\n"
-    # Only the PR's own commit, one --oneline row: "<sha> pr".
+    assert "main_only.py" not in diff, "main's later commits must not be in the diff"
+    # Only the PR's own commit, one --oneline row: "<sha> pr". Neither the
+    # synthetic merge commit nor main's later commit may appear.
     assert re.fullmatch(r"[0-9a-f]{7,40} pr\n", commits), commits
 
 

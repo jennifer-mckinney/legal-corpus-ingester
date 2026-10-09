@@ -61,15 +61,17 @@ jobs:
 
       # The reviewer has no shell, so what changed is written to files it can
       # read. The base branch comes through env, never inline in the script.
-      # The review unit is the net diff; commits.txt is context only.
+      # The review unit is the net diff; commits.txt is context only. HEAD is
+      # GitHub's synthetic merge commit, so the commit list ends at the PR head.
       - name: Prepare PR diff
         env:
           BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           mkdir -p "$RUNNER_TEMP/p9"
           git diff "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/p9/pr.diff"
           git diff --name-only "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/p9/changed-files.txt"
-          git log --oneline "origin/$BASE_REF..HEAD" > "$RUNNER_TEMP/p9/commits.txt"
+          git log --oneline "origin/$BASE_REF..$HEAD_SHA" > "$RUNNER_TEMP/p9/commits.txt"
 
       - name: Security review
         uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b # v1
@@ -129,11 +131,12 @@ jobs:
       - name: Prepare PR diff
         env:
           BASE_REF: ${{ github.base_ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           mkdir -p "$RUNNER_TEMP/p9"
           git diff "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/p9/pr.diff"
           git diff --name-only "origin/$BASE_REF...HEAD" > "$RUNNER_TEMP/p9/changed-files.txt"
-          git log --oneline "origin/$BASE_REF..HEAD" > "$RUNNER_TEMP/p9/commits.txt"
+          git log --oneline "origin/$BASE_REF..$HEAD_SHA" > "$RUNNER_TEMP/p9/commits.txt"
 
       - name: Code-quality review
         uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b # v1
