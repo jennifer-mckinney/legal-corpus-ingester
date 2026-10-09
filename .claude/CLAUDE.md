@@ -95,7 +95,7 @@ verify: `scripts/governance/verify-hashes.sh`
 regen: `scripts/governance/regen-manifest.sh --yes`
 
 ### G2: pr-independent-review
-rule: LIB-PRINCIPLES P9 — every PR to `main` runs the CI jobs `security-review` + `grumpy-review` (`.github/workflows/p9-review.yml`, ubuntu-latest); zero-tolerance security gate; zero-tolerance grumpy (2026-07-04 directive)
+rule: LIB-PRINCIPLES P9 — every PR to `main` runs the CI jobs `security-review` + `grumpy-review` (`.github/workflows/p9-review.yml`, ubuntu-latest); CRITICAL/HIGH/MEDIUM findings block (`BLOCKING_SEVERITIES` in `.github/p9/check_verdict.py`); LOW/NIT are posted and carded (owner, 2026-10-09, narrowing the 2026-07-04 zero-tolerance directive)
 retired: local `.githooks/pre-push` signoff gate, its `.sha256` pin, `.git/reviews/` signoffs and `scripts/ci/p9-sibling-parity.sh` (2026-10-09, terms-analysis#191)
 owner_steps: add the `ANTHROPIC_API_KEY` repo secret; after the first green run, require both jobs in branch protection on `main`
 

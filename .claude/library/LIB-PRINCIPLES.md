@@ -107,25 +107,25 @@ retro_anchor: codified 2026-07-03 after tech-spec audit remediation; refined sam
 xref: [[PEAS]] [[LIB-TEST]] [[_AUTOMATION/CLAUDE.md#multi-agent-architecture]]
 
 ### P9: pr-independent-review
-rule: every pull request to `main` gets two independent reviews, security-engineer and grumpy-developer, and cannot merge until both PASS with zero findings; hard requirement, not optional
+rule: every pull request to `main` gets two independent reviews, security-engineer and grumpy-developer, and cannot merge while either reports a blocking finding (CRITICAL / HIGH / MEDIUM); hard requirement, not optional
 scope: every PR to `main` (feature, release, hotfix); runs again on every push to the PR
 review_agents:
   security-engineer: STRIDE-style threat-model review — auth, secrets, user input, dependencies, CI permissions, migration safety, endpoint deprecation contract
   grumpy-developer: blunt code-quality review — swallowed errors, dead code, brittle assumptions, missed edges, tautological tests, dispatch-boundary artifacts from multi-Doer sessions
-gate: security-engineer AND grumpy-developer findings of ANY severity (CRITICAL / HIGH / MEDIUM / LOW / NIT) fail the review — zero tolerance for BOTH per 2026-07-04 user directive, no follow-up-issue path; resolve by fix-Coder + new push (the loop-pattern below); only the owner can waive, and does so at merge time
-security_findings_zero_tolerance: user directive 2026-07-03 — every security-engineer finding is a fix-now item regardless of severity; codified after F1-F7 review where two MEDIUMs would have shipped as follow-ups under prior gate
+gate: owner decision 2026-10-09 (supersedes the 2026-07-03/04 zero-tolerance directives) — security-engineer AND grumpy-developer findings of severity CRITICAL / HIGH / MEDIUM fail the review (`BLOCKING_SEVERITIES` in `.github/p9/check_verdict.py`); LOW / NIT findings do not block, but are still posted as inline PR comments and printed by the gate as non-blocking so an agent can file them as cards; resolve blocking findings by fix-Coder + new push (the loop-pattern below); only the owner can waive, and does so at merge time
+security_findings_threshold: owner decision 2026-10-09 — security-engineer CRITICAL / HIGH / MEDIUM findings are fix-now items; LOW goes to a card. MEDIUM stays blocking, which keeps the lesson of the 2026-07-03 directive (two MEDIUMs would have shipped as follow-ups under the gate before it)
 because: local pytest + orchestrator spot-check is not sufficient for merged code; two independent adversarial reviewers catch what dispatch Coders and orchestrator miss; especially load-bearing after multi-agent sessions where domain boundaries were crossed
-enforcement: CI (terms-analysis#191, replan 2026-10-09). `.github/workflows/p9-review.yml` runs jobs `security-review` and `grumpy-review` on `pull_request` to `main`; each runs `anthropics/claude-code-action` with the vendored brief in `.github/p9/` and an exact tool allowlist (no Bash; Write scoped to `p9-verdict.json`), comments inline on findings and writes `p9-verdict.json`; `.github/p9/check_verdict.py` fails the job unless the verdict is PASS with an empty findings list. Branch protection pending: the owner makes both jobs required checks on `main` after the first green run. See `automations/p9-pre-push.md`
+enforcement: CI (terms-analysis#191, replan 2026-10-09). `.github/workflows/p9-review.yml` runs jobs `security-review` and `grumpy-review` on `pull_request` to `main`; each runs `anthropics/claude-code-action` with the vendored brief in `.github/p9/` and an exact tool allowlist (no Bash; Write scoped to `p9-verdict.json`), comments inline on findings and writes `p9-verdict.json`; `.github/p9/check_verdict.py` fails the job on any CRITICAL / HIGH / MEDIUM finding, a FAIL with no findings, or a missing or off-contract verdict, and passes when every finding is LOW or NIT. Branch protection pending: the owner makes both jobs required checks on `main` after the first green run. See `automations/p9-pre-push.md`
 retired: the local `.githooks/pre-push` signoff gate, `.git/reviews/<sha>.signoff.json` and `enforce-p9-review.yml` (2026-10-09, owner: "follow standard cicd practices")
 loop_pattern: (amendment 2026-07-04, moved to CI 2026-10-09) every PR runs this fixed-point loop until convergence
   1. Coder(s) implement the change and push the feature branch; the PR to `main` triggers both review jobs
-  2. If EITHER job fails (FAIL verdict, any finding, or no verdict) → dispatch fix-Coder scoped to the PR comments → push → the jobs run again
+  2. If EITHER job fails (a blocking finding, or no valid verdict) → dispatch fix-Coder scoped to the blocking PR comments → push → the jobs run again; non-blocking (LOW / NIT) findings become cards
   3. When BOTH jobs pass on the PR head → the PR is ready for the owner to merge
 whack_a_mole_avoidance: when a name-based deny-list / exact-match rule keeps growing across rounds (each round finds another edge case), switch to a STRUCTURAL fix — pattern-based rules, schema-driven ordering, input normalization. Structural fixes close classes of attack instead of individual names. Two structural-fix wins on 2026-07-04:
   - terms-analysis grumpy F2: switched `_ACTION_ITEMS_BY_CHIP.items()` iteration → `typing.get_args(ContextChip)` schema-driven order
   - ingester rounds 6-9 logging redaction: added `_REDACT_SUFFIXES` + `_normalize_key(camelCase→snake_case)` instead of growing exact-name list further
 loop_failure_mode: if the loop does NOT converge after 3-4 rounds on the same axis, PAUSE and ask user whether to keep patching or switch to a structural fix. Silent iteration is a Coder-role violation.
-retro_anchor: codified 2026-07-03 (security zero-tolerance), extended 2026-07-04 (grumpy zero-tolerance + loop_pattern + whack_a_mole guidance), moved from a local pre-push hook to CI jobs 2026-10-09 (#191)
+retro_anchor: codified 2026-07-03 (security zero-tolerance), extended 2026-07-04 (grumpy zero-tolerance + loop_pattern + whack_a_mole guidance), moved from a local pre-push hook to CI jobs 2026-10-09 (#191), blocking threshold set to CRITICAL / HIGH / MEDIUM 2026-10-09 (owner decision)
 xref: [[P8]] [[LIB-TEST]]
 
 ## enforcement-summary

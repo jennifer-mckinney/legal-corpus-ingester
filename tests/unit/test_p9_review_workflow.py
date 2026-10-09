@@ -6,8 +6,11 @@ The local pre-push signoff gate is retired. Two jobs in
 ``.github/workflows/p9-review.yml`` (``security-review`` and
 ``grumpy-review``) run ``anthropics/claude-code-action`` on every pull
 request to ``main``. Each reviewer writes ``p9-verdict.json`` and a final
-step runs ``.github/p9/check_verdict.py``, which passes only on
-``{"verdict": "PASS", "findings": []}``.
+step runs ``.github/p9/check_verdict.py``. The job passes on
+``{"verdict": "PASS", "findings": []}`` or on a PASS whose findings are all
+LOW or NIT (printed as non-blocking); a FAIL with a CRITICAL, HIGH or MEDIUM
+finding fails it (owner decision 2026-10-09). A verdict that contradicts its
+findings is off the contract (PR #218 review thread).
 
 Covered here:
 - the gate script's exit-code contract (behaviour, run as a subprocess);
@@ -46,9 +49,13 @@ BRIEFS = {
 INSTALLER = REPO_ROOT / "scripts" / "install-hooks.sh"
 
 # Exit-code contract of check_verdict.py.
-EXIT_PASS = 0
-EXIT_REJECTED = 1  # the reviewer said FAIL or listed findings
-EXIT_INVALID = 2  # missing, unreadable, malformed or off-contract file
+EXIT_PASS = 0  # PASS with no findings, or only non-blocking findings
+EXIT_REJECTED = 1  # FAIL with at least one blocking finding
+EXIT_INVALID = 2  # missing, unreadable, malformed or off-contract file,
+# including a verdict that contradicts its findings
+# Owner decision 2026-10-09: only these severities fail the job. An
+# independent literal, not read from the gate, so drift either way turns red.
+EXPECTED_BLOCKING = frozenset({"CRITICAL", "HIGH", "MEDIUM"})
 
 ACTION_REPOS = {"actions/checkout", "anthropics/claude-code-action"}
 # Exact allowlist: file reads, writes to the verdict file only (an Edit rule
@@ -150,20 +157,58 @@ def test_gate_rejects_fail_verdict_and_lists_findings(tmp_path: Path) -> None:
     doc = {"verdict": "FAIL", "findings": [FINDING]}
     proc = _run_gate(_write(tmp_path, json.dumps(doc)))
     assert proc.returncode == EXIT_REJECTED
-    assert "P9 verdict: FAIL, 1 finding(s)" in proc.stderr
-    assert "[HIGH] Swallowed error (app/x.py:3)" in proc.stderr
+    assert proc.stderr.splitlines() == [
+        "P9 verdict: FAIL, 1 finding(s), 1 blocking",
+        "  - [HIGH] Swallowed error (app/x.py:3) blocking",
+    ]
+    assert proc.stdout == ""
+
+
+def _mismatch(verdict: str, blocking: int) -> str:
+    """The gate's one-line refusal for a verdict that contradicts its findings."""
+    return (
+        "P9 verdict: invalid: p9-verdict.json does not match the verdict contract: "
+        f"verdict {verdict} with {blocking} blocking finding(s); the verdict is FAIL "
+        "if and only if a finding is CRITICAL/HIGH/MEDIUM"
+    )
 
 
 def test_gate_rejects_fail_verdict_with_no_findings(tmp_path: Path) -> None:
+    # Fail closed: a FAIL that names nothing contradicts its (empty) findings.
     proc = _run_gate(_write(tmp_path, json.dumps({"verdict": "FAIL", "findings": []})))
-    assert proc.returncode == EXIT_REJECTED
-    assert "P9 verdict: FAIL, 0 finding(s)" in proc.stderr
+    assert proc.returncode == EXIT_INVALID
+    assert proc.stderr.splitlines() == [_mismatch("FAIL", 0)]
+    assert proc.stdout == ""
 
 
-def test_gate_rejects_pass_that_still_lists_findings(tmp_path: Path) -> None:
+def test_gate_rejects_pass_that_lists_a_blocking_finding(tmp_path: Path) -> None:
     proc = _run_gate(_write(tmp_path, json.dumps({"verdict": "PASS", "findings": [FINDING]})))
-    assert proc.returncode == EXIT_REJECTED
-    assert "P9 verdict: PASS, 1 finding(s)" in proc.stderr
+    assert proc.returncode == EXIT_INVALID
+    assert proc.stderr.splitlines() == [_mismatch("PASS", 1)]
+    assert proc.stdout == ""
+
+
+# Contradictory verdicts over several findings (PR #218 review thread): the
+# verdict must be FAIL if and only if at least one finding is blocking.
+@pytest.mark.parametrize(
+    ("verdict", "severities", "blocking"),
+    [
+        pytest.param("FAIL", ["LOW"], 0, id="fail-only-low"),
+        pytest.param("FAIL", ["NIT"], 0, id="fail-only-nit"),
+        pytest.param("FAIL", ["LOW", "NIT", "LOW"], 0, id="fail-low-and-nit"),
+        pytest.param("PASS", ["CRITICAL"], 1, id="pass-critical"),
+        pytest.param("PASS", ["LOW", "MEDIUM", "NIT"], 1, id="pass-one-medium-among-non-blocking"),
+        pytest.param("PASS", ["HIGH", "CRITICAL"], 2, id="pass-all-blocking"),
+    ],
+)
+def test_gate_rejects_verdict_that_contradicts_its_findings(
+    tmp_path: Path, verdict: str, severities: list[str], blocking: int
+) -> None:
+    findings = [{**FINDING, "severity": severity} for severity in severities]
+    proc = _run_gate(_write(tmp_path, json.dumps({"verdict": verdict, "findings": findings})))
+    assert proc.returncode == EXIT_INVALID, proc.stdout
+    assert proc.stderr.splitlines() == [_mismatch(verdict, blocking)]
+    assert proc.stdout == ""
 
 
 def test_gate_fails_closed_when_the_file_is_missing(tmp_path: Path) -> None:
@@ -239,7 +284,8 @@ def test_gate_rejects_duplicate_keys_that_hide_a_fail(tmp_path: Path) -> None:
 # --- gate script: exact verdict contract (PR #214 review thread) ------------
 # Lead ruling: the key sets are exact; severity is one of the tags the vendored
 # briefs promise, `line` is a non-negative int (not bool), and `file`/`title`
-# are non-empty strings. Off-contract -> EXIT_INVALID; valid FAIL -> EXIT_REJECTED.
+# are non-empty strings. Off-contract -> EXIT_INVALID at every severity; a valid
+# file exits by the blocking threshold (EXPECTED_BLOCKING).
 
 _SEVERITY_RULE = re.compile(r"^\s*-\s*`severity` is one of (.+)\.\s*$", re.MULTILINE)
 
@@ -272,6 +318,25 @@ def test_severity_sets_match_the_contract_literals() -> None:
         assert _brief_severity_tags(brief) == BRIEF_SEVERITIES[name], brief.name
 
 
+def test_blocking_set_is_the_owner_threshold() -> None:
+    assert _gate_module().BLOCKING_SEVERITIES == EXPECTED_BLOCKING
+    assert EXPECTED_BLOCKING < GATE_SEVERITIES
+
+
+# Each brief and the P9 doc state the threshold in one sentence, pinned here
+# against the same literal (F10: docs are tested against the code's contract).
+_BLOCKING_RULE = re.compile(r"^\s*-?\s*Blocking severities: (.+?)\.", re.MULTILINE)
+
+
+@pytest.mark.parametrize(
+    "doc", [*BRIEFS.values(), AUTOMATION_DOC], ids=[*BRIEFS, "automation-doc"]
+)
+def test_docs_state_the_blocking_threshold(doc: Path) -> None:
+    rules = _BLOCKING_RULE.findall(doc.read_text(encoding="utf-8"))
+    assert len(rules) == 1, f"{doc.name}: expected one 'Blocking severities:' rule, got {rules}"
+    assert frozenset(re.findall(r"`([A-Z]+)`", rules[0])) == EXPECTED_BLOCKING
+
+
 def _finding_doc(**overrides: object) -> dict[str, object]:
     return {"verdict": "FAIL", "findings": [{**FINDING, **overrides}]}
 
@@ -281,6 +346,10 @@ def _finding_doc(**overrides: object) -> dict[str, object]:
     [
         pytest.param({**PASS_DOC, "approved": True}, id="extra-top-level-key"),
         pytest.param({"verdict": "FAIL", "findings": [{**FINDING, "fixed": True}]}, id="extra-finding-key"),
+        pytest.param(
+            {"verdict": "FAIL", "findings": [{**FINDING, "severity": "LOW", "fixed": True}]},
+            id="extra-finding-key-non-blocking",
+        ),
         pytest.param(
             {"verdict": "FAIL", "findings": [{k: v for k, v in FINDING.items() if k != "line"}]},
             id="missing-finding-key",
@@ -342,19 +411,77 @@ def test_gate_rejects_off_contract_finding_values(tmp_path: Path, field: str, va
     assert proc.stdout == ""
 
 
-def test_gate_rejects_one_bad_finding_among_valid_ones(tmp_path: Path) -> None:
-    doc = {"verdict": "FAIL", "findings": [FINDING, {**FINDING, "line": -1}, FINDING]}
+@pytest.mark.parametrize("severity", sorted(GATE_SEVERITIES))
+def test_gate_rejects_one_bad_finding_among_valid_ones(tmp_path: Path, severity: str) -> None:
+    # A contract violation exits 2 at every severity: the non-blocking path
+    # never swallows an off-contract file. The verdict agrees with the
+    # findings, so only the bad line can be the reason.
+    valid = {**FINDING, "severity": severity}
+    verdict = "FAIL" if severity in EXPECTED_BLOCKING else "PASS"
+    doc = {"verdict": verdict, "findings": [valid, {**valid, "line": -1}, valid]}
     proc = _run_gate(_write(tmp_path, json.dumps(doc)))
     assert proc.returncode == EXIT_INVALID, proc.stderr
+    assert "does not match the verdict contract {" in proc.stderr
+    assert proc.stdout == ""
 
 
+@pytest.mark.parametrize("verdict", ["FAIL", "PASS"])
 @pytest.mark.parametrize("severity", sorted(GATE_SEVERITIES))
-def test_gate_accepts_every_brief_severity_as_a_valid_fail(tmp_path: Path, severity: str) -> None:
-    # Positive control: every tag a brief allows must reach EXIT_REJECTED, not
-    # EXIT_INVALID (F3: what the writer is told to emit, the reader accepts).
-    proc = _run_gate(_write(tmp_path, json.dumps(_finding_doc(severity=severity))))
-    assert proc.returncode == EXIT_REJECTED, proc.stderr
-    assert f"[{severity}] Swallowed error (app/x.py:3)" in proc.stderr
+def test_gate_exit_follows_the_blocking_threshold(tmp_path: Path, severity: str, verdict: str) -> None:
+    # Every tag a brief allows is a valid finding (F3). CRITICAL, HIGH and
+    # MEDIUM go under FAIL and fail the job; LOW and NIT go under PASS, pass
+    # it and are printed as non-blocking so they can be carded (owner decision
+    # 2026-10-09). The other verdict contradicts the finding and exits 2.
+    doc = {"verdict": verdict, "findings": [{**FINDING, "severity": severity}]}
+    proc = _run_gate(_write(tmp_path, json.dumps(doc)))
+    blocking = severity in EXPECTED_BLOCKING
+    if verdict != ("FAIL" if blocking else "PASS"):
+        assert proc.returncode == EXIT_INVALID, proc.stdout
+        assert proc.stdout == ""
+        assert proc.stderr.splitlines() == [_mismatch(verdict, int(blocking))]
+    elif blocking:
+        assert proc.returncode == EXIT_REJECTED, proc.stdout
+        assert proc.stdout == ""
+        assert proc.stderr.splitlines() == [
+            f"P9 verdict: {verdict}, 1 finding(s), 1 blocking",
+            f"  - [{severity}] Swallowed error (app/x.py:3) blocking",
+        ]
+    else:
+        assert proc.returncode == EXIT_PASS, proc.stderr
+        assert proc.stderr == ""
+        assert proc.stdout.splitlines() == [
+            f"P9 verdict: {verdict}, 1 finding(s), 0 blocking",
+            f"  - [{severity}] Swallowed error (app/x.py:3) non-blocking",
+        ]
+
+
+def test_gate_blocks_when_one_finding_of_many_is_blocking(tmp_path: Path) -> None:
+    findings = [
+        {**FINDING, "severity": "LOW", "title": "Low one"},
+        {**FINDING, "severity": "MEDIUM", "title": "Medium one"},
+        {**FINDING, "severity": "NIT", "title": "Nit one"},
+    ]
+    proc = _run_gate(_write(tmp_path, json.dumps({"verdict": "FAIL", "findings": findings})))
+    assert proc.returncode == EXIT_REJECTED, proc.stdout
+    assert proc.stdout == ""
+    assert proc.stderr.splitlines() == [
+        "P9 verdict: FAIL, 3 finding(s), 1 blocking",
+        "  - [LOW] Low one (app/x.py:3) non-blocking",
+        "  - [MEDIUM] Medium one (app/x.py:3) blocking",
+        "  - [NIT] Nit one (app/x.py:3) non-blocking",
+    ]
+
+
+def test_gate_passes_when_every_finding_is_non_blocking(tmp_path: Path) -> None:
+    findings = [{**FINDING, "severity": "LOW"}, {**FINDING, "severity": "NIT", "line": 0}]
+    proc = _run_gate(_write(tmp_path, json.dumps({"verdict": "PASS", "findings": findings})))
+    assert proc.returncode == EXIT_PASS, proc.stderr
+    assert proc.stderr == ""
+    assert proc.stdout.splitlines() == [
+        "P9 verdict: PASS, 2 finding(s), 0 blocking",
+        "  - [LOW] Swallowed error (app/x.py:3) non-blocking",
+        "  - [NIT] Swallowed error (app/x.py:0) non-blocking",
+    ]
 
 
 @pytest.mark.parametrize("line", [0, 1, 2**31], ids=["zero-no-line", "one", "large"])
@@ -380,17 +507,29 @@ def test_gate_rejects_wrong_usage(tmp_path: Path, args: tuple[str, ...]) -> None
 # Hostile text goes only in the free-text fields: severity and line are now
 # validated (see test_gate_rejects_off_contract_finding_values), so a hostile
 # value there is a contract mismatch, not a printed finding.
+# Both output paths are checked: a blocking finding prints to stderr (exit 1),
+# a non-blocking one to stdout (exit 0).
+@pytest.mark.parametrize(
+    ("severity", "expected"),
+    [pytest.param("HIGH", EXIT_REJECTED, id="blocking"), pytest.param("LOW", EXIT_PASS, id="non-blocking")],
+)
 @pytest.mark.parametrize("field", ["title", "file"])
 @pytest.mark.parametrize("payload", list(HOSTILE_TEXT.values()), ids=list(HOSTILE_TEXT))
-def test_gate_prints_findings_on_one_sanitised_line(tmp_path: Path, field: str, payload: str) -> None:
-    finding = {**FINDING, field: payload}
-    proc = _run_gate(_write(tmp_path, json.dumps({"verdict": "FAIL", "findings": [finding]})))
-    assert proc.returncode == EXIT_REJECTED
-    lines = proc.stderr.splitlines()
+def test_gate_prints_findings_on_one_sanitised_line(
+    tmp_path: Path, field: str, payload: str, severity: str, expected: int
+) -> None:
+    finding = {**FINDING, "severity": severity, field: payload}
+    verdict = "FAIL" if expected == EXIT_REJECTED else "PASS"
+    proc = _run_gate(_write(tmp_path, json.dumps({"verdict": verdict, "findings": [finding]})))
+    assert proc.returncode == expected
+    shown, silent = (proc.stderr, proc.stdout) if expected == EXIT_REJECTED else (proc.stdout, proc.stderr)
+    lines = shown.splitlines()
     assert len(lines) == 2, lines  # header + exactly one line per finding
     assert all(line.isprintable() for line in lines), lines
-    assert not any(line.startswith(("::", "P9 verdict: PASS")) for line in lines), lines
-    assert proc.stdout == ""
+    assert lines[0] == f"P9 verdict: {verdict}, 1 finding(s), {int(expected == EXIT_REJECTED)} blocking"
+    # The finding line can never pose as a header or a workflow command.
+    assert not lines[1].startswith(("::", "P9 verdict:")), lines
+    assert silent == ""
 
 
 def test_gate_truncates_long_finding_text(tmp_path: Path) -> None:
@@ -666,6 +805,18 @@ def _writes(doc: object) -> Reviewer:
         pytest.param(_writes(PASS_DOC), EXIT_PASS, "P9 verdict: PASS, 0 findings", id="pass"),
         pytest.param(
             _writes({"verdict": "FAIL", "findings": [FINDING]}), EXIT_REJECTED, "P9 verdict: FAIL", id="fail"
+        ),
+        pytest.param(
+            _writes({"verdict": "PASS", "findings": [{**FINDING, "severity": "LOW"}]}),
+            EXIT_PASS,
+            "  - [LOW] Swallowed error (app/x.py:3) non-blocking",
+            id="pass-non-blocking-only",
+        ),
+        pytest.param(
+            _writes({"verdict": "FAIL", "findings": [{**FINDING, "severity": "LOW"}]}),
+            EXIT_INVALID,
+            "verdict FAIL with 0 blocking finding(s)",
+            id="fail-contradicts-non-blocking-only",
         ),
         pytest.param(lambda ws: None, EXIT_INVALID, "was not written", id="reviewer-wrote-nothing"),
     ],

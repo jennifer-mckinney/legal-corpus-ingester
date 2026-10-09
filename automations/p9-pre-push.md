@@ -1,7 +1,7 @@
 # P9 review in CI
 
 P9 (`.claude/library/LIB-PRINCIPLES.md`) requires a security-engineer review
-and a grumpy-developer review of every change, both at zero findings, before
+and a grumpy-developer review of every change, both with no blocking finding, before
 it reaches `main`. Since 2026-10-09 (terms-analysis#191, ported to this repo)
 that review runs as two standard GitHub Actions jobs on the pull request. The earlier local
 pre-push signoff hook is retired. The file keeps its old name so existing
@@ -89,13 +89,20 @@ in the working directory:
 ]}
 ```
 
+Blocking severities: `CRITICAL`, `HIGH`, `MEDIUM`.
+That is the owner decision of 2026-10-09: the gate blocks only findings that
+matter for correctness, security or acceptance. The set lives in one
+constant, `BLOCKING_SEVERITIES` in the gate. `LOW` and `NIT` findings never
+fail the job; reviewers still post them inline and the gate prints them as
+`non-blocking`, so an agent can file them as cards.
+
 `.github/p9/check_verdict.py` decides the job result:
 
 | Exit | Meaning |
 |---|---|
-| 0 | verdict `PASS` and `findings` is `[]`; prints `P9 verdict: PASS, 0 findings` |
-| 1 | verdict `FAIL`, or any finding listed (each printed on one sanitised line) |
-| 2 | file missing, unreadable, not JSON, duplicate keys, or not the contract shape |
+| 0 | verdict `PASS` and `findings` is `[]` (prints `P9 verdict: PASS, 0 findings`), or verdict `PASS` and every finding is `LOW` or `NIT` (prints `<n> finding(s), 0 blocking` and each finding marked `non-blocking`) |
+| 1 | verdict `FAIL` with at least one `CRITICAL`, `HIGH` or `MEDIUM` finding (each finding printed on one sanitised line, marked `blocking` or `non-blocking`) |
+| 2 | file missing, unreadable, not JSON, duplicate keys, not the contract shape, or a verdict that contradicts its findings (`FAIL` with no blocking finding, `PASS` with one) |
 
 Only exit 0 passes the job. A reviewer that crashes, runs out of turns or
 writes nothing fails the job.
