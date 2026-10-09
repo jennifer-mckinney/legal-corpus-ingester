@@ -258,3 +258,83 @@ class TestValidateRoundTripConsumer:
         assert "X-Corpus-Mismatch: terms-analysis error" in result.output
         assert "VALID" not in result.output
         assert "not installed" not in result.output
+
+    @pytest.mark.parametrize(
+        "missing",
+        # A string prefix that is not a package prefix ("back", "backend.app.serv") is not the consumer.
+        ["numpy", "backend.app.services.legal_kb_helpers", "backend.apps", "back", "backend.app.serv"],
+    )
+    def test_transitive_missing_dependency_is_broken_not_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str
+    ) -> None:
+        """An installed consumer whose own import fails on another module exits 1, opt-out or not."""
+        bundle = _make_bundle(tmp_path)
+        original_import_module = importlib.import_module
+
+        def _consumer_dep_missing(name: str, *args: object, **kwargs: object) -> object:
+            if name == "backend.app.services.legal_kb":
+                raise ModuleNotFoundError(f"No module named {missing!r}", name=missing)
+            return original_import_module(name, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(importlib, "import_module", _consumer_dep_missing)
+        for extra in ([], ["--allow-missing-consumer"]):
+            result = runner.invoke(app, ["validate-round-trip", str(bundle), *extra])
+            assert result.exit_code == 1, (extra, result.output)
+            assert "terms-analysis error" in result.stdout
+            assert "VALID" not in result.stdout
+
+    @pytest.mark.parametrize("name", ["backend", "backend.app", "backend.app.services", "backend.app.services.legal_kb"])
+    def test_consumer_or_parent_package_missing_is_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+    ) -> None:
+        bundle = _make_bundle(tmp_path)
+        monkeypatch.setattr(
+            importlib, "import_module",
+            lambda n, *a, **k: (_ for _ in ()).throw(ModuleNotFoundError(f"No module named {name!r}", name=name)),
+        )
+        result = runner.invoke(app, ["validate-round-trip", str(bundle)])
+        assert result.exit_code == cli.EXIT_CONSUMER_SKIPPED, result.output
+
+    def test_module_not_found_without_name_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A ModuleNotFoundError with no .name cannot prove the consumer is absent: exit 1."""
+        bundle = _make_bundle(tmp_path)
+        monkeypatch.setattr(
+            importlib, "import_module",
+            lambda n, *a, **k: (_ for _ in ()).throw(ModuleNotFoundError("No module named ?")),
+        )
+        result = runner.invoke(app, ["validate-round-trip", str(bundle), "--allow-missing-consumer"])
+        assert result.exit_code == 1, result.output
+        assert "VALID" not in result.stdout
+
+    def test_lazy_module_not_found_in_load_is_broken_not_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A lazy import failing inside load_from_bundle exits 1 even with --allow-missing-consumer."""
+        bundle = _make_bundle(tmp_path)
+        _stub_legal_kb(
+            monkeypatch,
+            retrieve_return=[],
+            load_raises=ModuleNotFoundError("No module named 'backend'", name="backend"),
+        )
+        result = runner.invoke(app, ["validate-round-trip", str(bundle), "--allow-missing-consumer"])
+        assert result.exit_code == 1, result.output
+        assert "terms-analysis error" in result.stdout
+        assert "VALID" not in result.stdout
+
+    @pytest.mark.parametrize("err", [ImportError("cannot import name 'X'"), SyntaxError("bad consumer")])
+    def test_consumer_import_error_is_broken_not_absent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, err: Exception
+    ) -> None:
+        """A consumer that is present but fails to import exits 1, opt-out or not."""
+        bundle = _make_bundle(tmp_path)
+
+        def _raise(*_a: object, **_k: object) -> object:
+            raise err
+
+        monkeypatch.setattr(importlib, "import_module", _raise)
+        result = runner.invoke(app, ["validate-round-trip", str(bundle), "--allow-missing-consumer"])
+        assert result.exit_code == 1, result.output
+        assert "terms-analysis error" in result.stdout
+        assert "VALID" not in result.stdout

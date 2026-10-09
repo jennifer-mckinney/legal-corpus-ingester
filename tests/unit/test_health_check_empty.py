@@ -518,13 +518,15 @@ def test_scan_rejects_a_file_given_as_the_dir(mod: ModuleType, tmp_path: Path) -
 
 
 def test_hostile_source_stem_is_escaped_in_report_and_stdout(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     config_dir = tmp_path / "config"
     config_dir.mkdir()
     (config_dir / f"{_HOSTILE_STEM}.yaml").write_text(_FIXTURE_SOURCE.read_text())
+    # Pin refresh as wired so never-run is the source-problem exit, whatever cli.REFRESH_WIRED says.
+    monkeypatch.setattr(health_check, "REFRESH_WIRED", True)
     rc, out, _err = _run(config_dir, tmp_path, capsys)
-    assert rc == 1  # never run: the stale/never-run path, not a config error
+    assert rc == health_check.EXIT_SOURCE_PROBLEM  # never run: not a config error
     (report,) = (tmp_path / "out" / "health").glob("*.md")
     for text in (out, report.read_text()):
         assert "\x1b" not in text

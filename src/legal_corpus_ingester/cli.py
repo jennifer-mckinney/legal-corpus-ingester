@@ -23,11 +23,31 @@ from legal_corpus_ingester.provenance.license_audit import (
 EXIT_NO_SOURCES: int = 2
 # Pipeline not wired to the orchestrator yet (terms-analysis#90): must never look like success
 EXIT_NOT_WIRED: int = 3
+# Single source for "does `ingester refresh` run the pipeline yet?". scripts/health_check.py
+# reads it to tell the expected never-run state (no checkpoint can exist yet) apart from a real
+# failure. Flip it in the change that wires refresh; test_cli_exit_codes pins it to refresh's
+# actual exit code, so wiring refresh without flipping it fails CI (terms-analysis#90).
+REFRESH_WIRED: bool = False
 # validate-round-trip could not import the terms-analysis consumer, so the bundle was NOT
 # verified end to end; must not look like VALID unless --allow-missing-consumer (terms-analysis#90)
 EXIT_CONSUMER_SKIPPED: int = 4
 # No subcommand given: click's conventional usage-error code, as the console script returns
 EXIT_USAGE: int = 2
+# The terms-analysis module validate-round-trip loads. Only a ModuleNotFoundError naming this
+# module or one of its parent packages means "consumer not installed".
+_CONSUMER_MODULE = "backend.app.services.legal_kb"
+
+
+def _is_consumer_missing(exc: ModuleNotFoundError) -> bool:
+    """True only when *exc* names the consumer module itself or one of its parent packages.
+
+    A missing transitive dependency of an installed consumer (exc.name == "numpy") is a
+    broken consumer, not an absent one. exc.name None (cause unknown) fails closed.
+    """
+    name = exc.name
+    if not name:
+        return False
+    return name == _CONSUMER_MODULE or _CONSUMER_MODULE.startswith(name + ".")
 
 # Main app
 app = typer.Typer(
@@ -381,30 +401,13 @@ def validate_round_trip(
     # 5. Attempt terms-analysis consumer round-trip. A missing consumer is NOT a pass by
     # default: it exits EXIT_CONSUMER_SKIPPED unless --allow-missing-consumer (terms-analysis#90).
     consumer_checked = False
-    consumer_module = "backend.app.services.legal_kb"
-    # The consumer is absent only when a package on its own dotted path is missing
-    # ("backend", "backend.app", ...). Any other missing module (a dependency of an
-    # installed consumer, or an unnamed one) is a broken consumer: an error, never a
-    # skip, so --allow-missing-consumer cannot turn it into a VALID verdict.
-    parts = consumer_module.split(".")
-    consumer_packages = {".".join(parts[: i + 1]) for i in range(len(parts))}
+    # The import has its own try so only the import can mean "not installed". A
+    # ModuleNotFoundError for a transitive dependency, or one raised lazily inside
+    # load_from_bundle/retrieve, is a broken consumer: exit 1 even with --allow-missing-consumer.
     try:
-        legal_kb_mod = importlib.import_module(consumer_module)
-        kb_cls = getattr(legal_kb_mod, "LegalKnowledgeBase")
-        kb = kb_cls()
-        kb.load_from_bundle(bundle_dir)
-        result = kb.retrieve("test query")
-        if not result or not any(getattr(r, "text", r) for r in result):
-            typer.echo("X-Corpus-Mismatch: terms-analysis retrieve returned empty result")
-            raise typer.Exit(code=1)
-        typer.echo(f"terms-analysis round-trip: OK ({len(result)} chunks returned)")
-        consumer_checked = True
-    except typer.Exit:
-        raise
-    except Exception as exc:
-        # Only a ModuleNotFoundError naming the consumer's own path means "not installed";
-        # ImportError, module-level errors and missing dependencies are consumer errors.
-        if not (isinstance(exc, ModuleNotFoundError) and exc.name in consumer_packages):
+        legal_kb_mod = importlib.import_module(_CONSUMER_MODULE)
+    except ModuleNotFoundError as exc:
+        if not _is_consumer_missing(exc):
             typer.echo(f"X-Corpus-Mismatch: terms-analysis error: {exc}")
             raise typer.Exit(code=1)
         if not allow_missing_consumer:
@@ -416,6 +419,27 @@ def validate_round_trip(
             )
             raise typer.Exit(code=EXIT_CONSUMER_SKIPPED)
         typer.echo("terms-analysis not installed; skipping consumer round-trip check.")
+        legal_kb_mod = None
+    except Exception as exc:
+        typer.echo(f"X-Corpus-Mismatch: terms-analysis error: {exc}")
+        raise typer.Exit(code=1)
+
+    if legal_kb_mod is not None:
+        try:
+            kb_cls = getattr(legal_kb_mod, "LegalKnowledgeBase")
+            kb = kb_cls()
+            kb.load_from_bundle(bundle_dir)
+            result = kb.retrieve("test query")
+            if not result or not any(getattr(r, "text", r) for r in result):
+                typer.echo("X-Corpus-Mismatch: terms-analysis retrieve returned empty result")
+                raise typer.Exit(code=1)
+            typer.echo(f"terms-analysis round-trip: OK ({len(result)} chunks returned)")
+            consumer_checked = True
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            typer.echo(f"X-Corpus-Mismatch: terms-analysis error: {exc}")
+            raise typer.Exit(code=1)
 
     # 6. Pass; the label says whether the consumer check actually ran
     verdict = "VALID" if consumer_checked else "VALID (consumer check skipped)"
