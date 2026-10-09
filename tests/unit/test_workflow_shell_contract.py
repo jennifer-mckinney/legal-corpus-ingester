@@ -20,12 +20,19 @@
 """
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
+
+from legal_corpus_ingester import cli
 
 _WORKFLOWS_DIR = Path(__file__).resolve().parents[2] / ".github" / "workflows"
 _REQUIRED_SHELL = "bash -eo pipefail {0}"
@@ -294,3 +301,124 @@ def test_refresh_dedupe_branch_comments_instead_of_silently_skipping() -> None:
     assert "${{" not in run
     assert step["env"]["BUNDLE_VER"] == "${{ steps.detect_change.outputs.new_target }}"
     assert "${BUNDLE_VER}" in run.split("gh issue comment", 1)[1]
+
+
+# ---------------------------------------------------------------------------
+# health.yml: the known unwired state is a warning, every other failure is red
+# ---------------------------------------------------------------------------
+# actions/checkout cleans untracked and ignored files (-ffdx) before these steps, which
+# wipes the gitignored state/, so the steps must read checkpoints from outside the
+# checkout. The steps run for real under the workflow's own shell, in a throwaway
+# "checkout" directory.
+
+_REPO_ROOT = _WORKFLOWS_DIR.parents[1]
+_HEALTH_STEPS = ("Run ingester status", "Run health check")
+
+
+def _run_health_step(
+    tmp_path: Path, step_name: str, *, python_rc: int | None = None, xdg: Path | None = None
+) -> tuple[subprocess.CompletedProcess[str], Path, list[str]]:
+    """Run a health.yml step; return (result, checkout dir, argv the fake command got).
+
+    python_rc None runs the real scripts/health_check.py and CLI; an int makes a fake
+    `python`/`ingester` that records its argv and exits with that code.
+    """
+    doc = _load(_WORKFLOWS_DIR / "health.yml")
+    _, step = _step_by_name(doc, step_name)
+    checkout = tmp_path / "checkout"
+    (checkout / ".venv" / "bin").mkdir(parents=True)
+    (checkout / ".venv" / "bin" / "activate").write_text("")
+    (checkout / "scripts").symlink_to(_REPO_ROOT / "scripts")
+    (checkout / "config").symlink_to(_REPO_ROOT / "config")
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    argv_log = tmp_path / "argv.json"
+    for tool in ("python", "ingester"):
+        if python_rc is None:
+            body = (
+                f'exec "{sys.executable}" "$@"\n' if tool == "python"
+                else f'exec "{sys.executable}" -c "from legal_corpus_ingester.cli import app; app()" "$@"\n'
+            )
+        else:
+            body = (
+                f'"{sys.executable}" -c "import json,sys; json.dump(sys.argv[2:], open(sys.argv[1], \'w\'))"'
+                f' "{argv_log}" "$@"\nexit {python_rc}\n'
+            )
+        (fakebin / tool).write_text("#!/bin/bash\n" + body)
+        (fakebin / tool).chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    env = {"PATH": f"{fakebin}{os.pathsep}/usr/bin{os.pathsep}/bin", "HOME": str(home)}
+    if python_rc is None:
+        # Import this checkout's code, as pytest does (pyproject pythonpath), not an install.
+        env["PYTHONPATH"] = str(_REPO_ROOT / "src")
+    if xdg is not None:
+        env["XDG_STATE_HOME"] = str(xdg)
+    script = tmp_path / "step.sh"
+    script.write_text(str(step["run"]))
+    shell = _default_shell(doc)
+    assert shell == _REQUIRED_SHELL
+    result = subprocess.run(
+        shell.replace("{0}", str(script)).split(),
+        cwd=checkout, env=env, capture_output=True, text=True, timeout=60,
+    )
+    argv = json.loads(argv_log.read_text()) if argv_log.exists() else []
+    return result, checkout, argv
+
+
+@pytest.mark.parametrize("step_name", _HEALTH_STEPS)
+@pytest.mark.parametrize("use_xdg", [True, False], ids=["xdg", "home-fallback"])
+def test_health_steps_read_state_outside_the_checkout(tmp_path: Path, step_name: str, use_xdg: bool) -> None:
+    xdg = tmp_path / "xdg" if use_xdg else None
+    result, checkout, argv = _run_health_step(tmp_path, step_name, python_rc=0, xdg=xdg)
+    assert result.returncode == 0, result.stderr
+    state_dir = Path(argv[argv.index("--state-dir") + 1])
+    base = xdg if xdg is not None else tmp_path / "home" / ".local" / "state"
+    assert state_dir == base / "legal-corpus-ingester" / "state"
+    assert not state_dir.resolve().is_relative_to(checkout.resolve())
+
+
+@pytest.mark.parametrize(
+    ("rc", "step_rc", "warns"),
+    [
+        (0, 0, False),
+        (cli.EXIT_NOT_WIRED, 0, True),
+        (1, 1, False),
+        (2, 2, False),
+        (cli.EXIT_CONSUMER_SKIPPED, cli.EXIT_CONSUMER_SKIPPED, False),
+        (127, 127, False),
+    ],
+)
+def test_health_check_step_excuses_only_the_not_wired_code(
+    tmp_path: Path, rc: int, step_rc: int, warns: bool
+) -> None:
+    result, _, argv = _run_health_step(tmp_path, "Run health check", python_rc=rc, xdg=tmp_path / "xdg")
+    assert argv[0] == "scripts/health_check.py"
+    assert result.returncode == step_rc, (result.stdout, result.stderr)
+    assert ("::warning title=Refresh not wired::" in result.stdout) is warns
+
+
+def test_health_check_step_end_to_end_unwired_is_warning_and_ignores_checkout_state(tmp_path: Path) -> None:
+    # A fresh checkpoint inside the checkout must not be read: the real runner wipes it.
+    (tmp_path / "checkout" / "state").mkdir(parents=True)
+    (tmp_path / "checkout" / "state" / "eurlex_gdpr.checkpoint.json").write_text('{"stage": "done"}')
+    result, _, _ = _run_health_step(tmp_path, "Run health check", xdg=tmp_path / "xdg")
+    assert not cli.REFRESH_WIRED
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "::warning title=Refresh not wired::" in result.stdout
+    assert "Refresh is not wired yet" in result.stdout
+    assert "| fresh |" not in result.stdout
+
+
+def test_health_check_step_end_to_end_stale_source_fails(tmp_path: Path) -> None:
+    state = tmp_path / "xdg" / "legal-corpus-ingester" / "state"
+    state.mkdir(parents=True)
+    cp = state / "eurlex_gdpr.checkpoint.json"
+    cp.write_text(json.dumps({"stage": "done"}))
+    old = time.time() - 30 * 86400
+    os.utime(cp, (old, old))
+    result, _, _ = _run_health_step(tmp_path, "Run health check", xdg=tmp_path / "xdg")
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "| eurlex_gdpr |" in result.stdout
+    assert "| stale |" in result.stdout
+    assert "::warning" not in result.stdout
