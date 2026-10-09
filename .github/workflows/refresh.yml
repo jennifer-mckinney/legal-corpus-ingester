@@ -73,6 +73,7 @@ jobs:
       - name: Open issue on corpus change
         if: steps.detect_change.outputs.changed == 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           BUNDLE_VER: ${{ steps.detect_change.outputs.new_target }}
           RUN_ID: ${{ github.run_id }}
           EVENT_NAME: ${{ github.event_name }}
