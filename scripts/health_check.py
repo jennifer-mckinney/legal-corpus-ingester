@@ -5,7 +5,14 @@ Reads source configs, checks checkpoint state, and writes a markdown
 freshness report to out/health/YYYY-MM-DD.md.
 
 Exit 0: all sources are fresh (lag < stale_days).
-Exit 1: one or more sources are stale or have never run.
+Exit 1: a source is stale, or has never run although refresh is wired.
+Exit 2: the config dir is missing (a broken checkout or wrong working dir, not
+        "nothing to do"; terms-analysis#90).
+Exit 3 (cli.EXIT_NOT_WIRED): the only problem is never-run sources while
+        cli.REFRESH_WIRED is False. No checkpoint can exist yet, so this is the
+        known unwired state: not success, and not a broken pipeline either.
+        health.yml turns exactly this code into a warning; every other non-zero
+        code fails the run. health_verdict() is the one place this is decided.
 """
 from __future__ import annotations
 
@@ -15,6 +22,13 @@ import os
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
+
+from legal_corpus_ingester.cli import EXIT_NOT_WIRED, REFRESH_WIRED
+
+# A stale source, or a never-run source once refresh is wired: a real problem.
+EXIT_SOURCE_PROBLEM: int = 1
+# Config dir missing: distinct from 1 (stale sources) so the cause is visible in the exit code.
+EXIT_CONFIG_MISSING: int = 2
 
 
 def _utc_now() -> datetime:
@@ -90,34 +104,48 @@ def _lag_display(lag_hours: float | None) -> str:
     return f"{lag_hours / 24.0:.1f}"
 
 
+def health_verdict(statuses: list[str], refresh_wired: bool) -> int:
+    """Return the exit code for a set of per-source statuses.
+
+    Fails closed: any status other than "fresh" is a problem, unless every
+    problem is "never-run" and refresh is not wired, which is the known
+    unwired state (EXIT_NOT_WIRED). Stale always fails.
+    """
+    problems = {s for s in statuses if s != "fresh"}
+    if not problems:
+        return 0
+    if problems == {"never-run"} and not refresh_wired:
+        return EXIT_NOT_WIRED
+    return EXIT_SOURCE_PROBLEM
+
+
 def build_report(
     config_dir: Path,
     state_dir: Path,
     out_dir: Path,
     stale_days: int,
     today: str,
-) -> tuple[str, bool]:
-    """Build the markdown report string and return (report, any_problem).
+    refresh_wired: bool,
+) -> tuple[str, int]:
+    """Build the markdown report string and return (report, exit_code).
 
-    any_problem is True if any source is stale or never-run.
+    exit_code comes from health_verdict(); see the module docstring.
     """
     sources = _source_names(config_dir)
 
     header = f"# Legal Corpus Health -- {today}\n\n"
 
     if not sources:
-        return header + "No sources configured.\n", False
+        return header + "No sources configured.\n", 0
 
     rows: list[str] = []
-    any_problem = False
+    statuses: list[str] = []
 
     for source in sources:
         last_run, stage, lag_hours = _checkpoint_info(state_dir, source)
         status = _status_label(lag_hours, stale_days)
         lag_str = _lag_display(lag_hours)
-
-        if status in ("stale", "never-run"):
-            any_problem = True
+        statuses.append(status)
 
         rows.append(f"| {source} | {last_run} | {stage} | {lag_str} | {status} |")
 
@@ -128,7 +156,14 @@ def build_report(
         + "\n"
     )
 
-    return header + table, any_problem
+    verdict = health_verdict(statuses, refresh_wired)
+    if verdict == EXIT_NOT_WIRED:
+        # Say why the run is not red, in the report itself, so never-run is not read as fine.
+        table += (
+            "\nRefresh is not wired yet, so no source can have run: never-run is expected"
+            f" (exit {EXIT_NOT_WIRED}), not healthy.\n"
+        )
+    return header + table, verdict
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -164,18 +199,20 @@ def main(argv: list[str] | None = None) -> int:
     out_dir = Path(args.out_dir)
     stale_days: int = args.stale_days
 
-    # Handle missing config dir gracefully.
+    # A missing config dir means the checkout is broken, not that there is nothing
+    # to check; fail loudly instead of reporting success (terms-analysis#90).
     if not config_dir.is_dir():
-        print("No sources configured")
-        return 0
+        print(f"Error: config dir {config_dir} does not exist.", file=sys.stderr)
+        return EXIT_CONFIG_MISSING
 
     today = _utc_now().strftime("%Y-%m-%d")
-    report, any_problem = build_report(
+    report, verdict = build_report(
         config_dir=config_dir,
         state_dir=state_dir,
         out_dir=out_dir,
         stale_days=stale_days,
         today=today,
+        refresh_wired=REFRESH_WIRED,
     )
 
     # Write report to out/health/YYYY-MM-DD.md.
@@ -187,7 +224,7 @@ def main(argv: list[str] | None = None) -> int:
     # Print to stdout as well.
     print(report, end="")
 
-    return 1 if any_problem else 0
+    return verdict
 
 
 if __name__ == "__main__":

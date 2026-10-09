@@ -8,6 +8,11 @@ permissions:
   contents: read
   issues: write
 
+# Explicit pipefail: GitHub's default `bash -e` lets `cmd | tail` hide cmd's failure (terms-analysis#90).
+defaults:
+  run:
+    shell: bash -eo pipefail {0}
+
 jobs:
   approval-expiry:
     runs-on: [self-hosted, legal-corpus-ingester]
@@ -15,6 +20,8 @@ jobs:
       ISSUE_LABEL: approval-expiry
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false  # no step needs git credentials; keep the token out of .git/config
 
       # Fail loudly up front when the runner lacks gh or the issue label is
       # missing, instead of failing only when an issue must be filed (#21).
@@ -53,13 +60,17 @@ jobs:
           fi
           python scripts/check_approvals.py --approvals-dir config/approvals
 
-      # Only a failed approval check means an expiry. A Preflight or install
-      # failure still fails the job, but files no false expiry alert.
+      # Scoped to the check step's own outcome: a checkout, Preflight or Install
+      # failure leaves approval_check skipped, so no misleading expiry alert opens.
+      # Those infra failures stay plain red, which GitHub notifies on (terms-analysis#90, #21).
       - name: Open issue on expiry
         if: failure() && steps.approval_check.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          # The label must exist or `gh issue create --label` fails; --force makes this idempotent
+          # and any real error (auth, permissions) fails the step loudly (terms-analysis#90).
+          gh label create "$ISSUE_LABEL" --force --color B60205 --description "An APPROVAL.yaml has expired or is invalid"
           open_count=$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq 'length') || {
             echo "Warning: gh issue list failed; creating issue unconditionally." >&2
             open_count=0
@@ -67,7 +78,7 @@ jobs:
           if [ "$open_count" -eq 0 ]; then
             gh issue create \
               --title "Approval expiry alert -- $(date -u +%Y-%m-%d)" \
-              --body "One or more APPROVAL.yaml files have expired or are expiring soon.
+              --body "One or more APPROVAL.yaml files have expired or are invalid.
 
           Run 'python scripts/check_approvals.py' to see the full status table.
 

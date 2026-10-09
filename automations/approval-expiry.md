@@ -45,8 +45,10 @@ EXPIRED or ERROR.
 
 ## What it produces
 
-**GitHub issue** (conditional). When the check script exits 1, the workflow opens an
-issue titled `Approval expiry alert -- YYYY-MM-DD` with label `approval-expiry`. The
+**GitHub issue** (conditional). When the check script exits 1, the workflow creates the
+`approval-expiry` label if it is missing (`gh label create --force`, idempotent; a real
+error fails the step). It then opens an issue titled `Approval expiry alert -- YYYY-MM-DD`
+with that label. The
 issue body instructs the operator to run `python scripts/check_approvals.py` locally
 for the full status table and to update the affected APPROVAL.yaml files before the
 next ingester refresh.
@@ -62,9 +64,14 @@ cannot be read, and names the fix (`gh label create approval-expiry`). The label
 is set once, as the job's `ISSUE_LABEL`, and the issue step files under it.
 
 If `check_approvals.py` exits 1 (expired approval detected), the `Run approval
-check` step is marked failed and the `Open issue on expiry` step fires. The workflow
+check` step is marked failed and the `Open issue on expiry` step fires. That step's
+condition is `failure() && steps.approval_check.outcome == 'failure'`. The workflow
 job itself ends in failure, making the problem visible in the Actions summary without
 requiring the operator to inspect logs proactively.
+
+If checkout or `Install` fails, the approval check is skipped and no expiry issue is
+opened, because that alert would be misleading. The run stays plain red, and GitHub
+sends its standard failed-scheduled-workflow notification (terms-analysis#90).
 
 If no `config/approvals/` directory exists (fresh install with no gated sources),
 the script prints "No approvals to check." and exits 0. The workflow passes silently.

@@ -19,6 +19,31 @@ from legal_corpus_ingester.provenance.license_audit import (
 
 # Exit codes for refresh — distinguishes "no sources" from real failure
 EXIT_NO_SOURCES: int = 2
+# Pipeline not wired to the orchestrator yet (terms-analysis#90): must never look like success
+EXIT_NOT_WIRED: int = 3
+# Single source for "does `ingester refresh` run the pipeline yet?". scripts/health_check.py
+# reads it to tell the expected never-run state (no checkpoint can exist yet) apart from a real
+# failure. Flip it in the change that wires refresh; test_cli_exit_codes pins it to refresh's
+# actual exit code, so wiring refresh without flipping it fails CI (terms-analysis#90).
+REFRESH_WIRED: bool = False
+# validate-round-trip could not import the terms-analysis consumer, so the bundle was NOT
+# verified end to end; must not look like VALID unless --allow-missing-consumer (terms-analysis#90)
+EXIT_CONSUMER_SKIPPED: int = 4
+# The terms-analysis module validate-round-trip loads. Only a ModuleNotFoundError naming this
+# module or one of its parent packages means "consumer not installed".
+_CONSUMER_MODULE = "backend.app.services.legal_kb"
+
+
+def _is_consumer_missing(exc: ModuleNotFoundError) -> bool:
+    """True only when *exc* names the consumer module itself or one of its parent packages.
+
+    A missing transitive dependency of an installed consumer (exc.name == "numpy") is a
+    broken consumer, not an absent one. exc.name None (cause unknown) fails closed.
+    """
+    name = exc.name
+    if not name:
+        return False
+    return name == _CONSUMER_MODULE or _CONSUMER_MODULE.startswith(name + ".")
 
 # Main app
 app = typer.Typer(
@@ -163,7 +188,9 @@ def fetch(
 
     # Actual fetch not implemented in this thin CLI layer — delegate to pipeline
     typer.echo(f"Fetching {source!r} from {cfg.base_url} ...")
-    typer.echo("(Full fetch pipeline not yet wired — use orchestrator directly.)")
+    # Fail loudly: exiting 0 here would report a no-op as success (terms-analysis#90)
+    typer.echo("(Full fetch pipeline not yet wired — use orchestrator directly.)", err=True)
+    raise typer.Exit(code=EXIT_NOT_WIRED)
 
 
 @app.command()
@@ -192,7 +219,9 @@ def refresh(
 
     # Full pipeline orchestration not yet wired — placeholder for Phase 1.
     typer.echo(f"Refreshing {len(registry)} source(s): {', '.join(registry)}")
-    typer.echo("(Full refresh pipeline not yet wired — use orchestrator directly.)")
+    # Fail loudly: exiting 0 here would report a no-op as success (terms-analysis#90)
+    typer.echo("(Full refresh pipeline not yet wired — use orchestrator directly.)", err=True)
+    raise typer.Exit(code=EXIT_NOT_WIRED)
 
 
 @app.command("audit-license")
@@ -323,6 +352,14 @@ def audit_license(
 @app.command("validate-round-trip")
 def validate_round_trip(
     bundle_dir: Path = typer.Argument(..., help="Path to the bundle directory to validate."),
+    allow_missing_consumer: bool = typer.Option(
+        False,
+        "--allow-missing-consumer",
+        help=(
+            "Treat a missing terms-analysis consumer as a pass (structural checks only)."
+            f" Without this flag a missing consumer exits {EXIT_CONSUMER_SKIPPED}."
+        ),
+    ),
 ) -> None:
     """Validate a published bundle is structurally sound and consumer-compatible."""
     from legal_corpus_ingester.pipeline.manifest import Manifest, ManifestError
@@ -357,30 +394,53 @@ def validate_round_trip(
             typer.echo(f"X-Corpus-Mismatch: {dir_name}-directory-missing")
             raise typer.Exit(code=1)
 
-    # 5. Attempt terms-analysis consumer round-trip (graceful skip if not installed)
+    # 5. Attempt terms-analysis consumer round-trip. A missing consumer is NOT a pass by
+    # default: it exits EXIT_CONSUMER_SKIPPED unless --allow-missing-consumer (terms-analysis#90).
+    consumer_checked = False
+    # The import has its own try so only the import can mean "not installed". A
+    # ModuleNotFoundError for a transitive dependency, or one raised lazily inside
+    # load_from_bundle/retrieve, is a broken consumer: exit 1 even with --allow-missing-consumer.
     try:
-        legal_kb_mod = importlib.import_module("backend.app.services.legal_kb")
-        kb_cls = getattr(legal_kb_mod, "LegalKnowledgeBase")
-        kb = kb_cls()
-        kb.load_from_bundle(bundle_dir)
-        result = kb.retrieve("test query")
-        if not result or not any(getattr(r, "text", r) for r in result):
-            typer.echo("X-Corpus-Mismatch: terms-analysis retrieve returned empty result")
+        legal_kb_mod = importlib.import_module(_CONSUMER_MODULE)
+    except ModuleNotFoundError as exc:
+        if not _is_consumer_missing(exc):
+            typer.echo(f"X-Corpus-Mismatch: terms-analysis error: {exc}")
             raise typer.Exit(code=1)
-        typer.echo(f"terms-analysis round-trip: OK ({len(result)} chunks returned)")
-    except ModuleNotFoundError:
-        # ModuleNotFoundError (not ImportError) so module-level errors in a partially-installed
-        # terms-analysis raise through to the broad except below instead of being silenced.
+        if not allow_missing_consumer:
+            typer.echo(
+                "Error: terms-analysis not installed; consumer round-trip NOT checked."
+                " Re-run where terms-analysis is importable, or pass --allow-missing-consumer"
+                " for a structural-only check.",
+                err=True,
+            )
+            raise typer.Exit(code=EXIT_CONSUMER_SKIPPED)
         typer.echo("terms-analysis not installed; skipping consumer round-trip check.")
-    except typer.Exit:
-        raise
+        legal_kb_mod = None
     except Exception as exc:
         typer.echo(f"X-Corpus-Mismatch: terms-analysis error: {exc}")
         raise typer.Exit(code=1)
 
-    # 6. Full pass
+    if legal_kb_mod is not None:
+        try:
+            kb_cls = getattr(legal_kb_mod, "LegalKnowledgeBase")
+            kb = kb_cls()
+            kb.load_from_bundle(bundle_dir)
+            result = kb.retrieve("test query")
+            if not result or not any(getattr(r, "text", r) for r in result):
+                typer.echo("X-Corpus-Mismatch: terms-analysis retrieve returned empty result")
+                raise typer.Exit(code=1)
+            typer.echo(f"terms-analysis round-trip: OK ({len(result)} chunks returned)")
+            consumer_checked = True
+        except typer.Exit:
+            raise
+        except Exception as exc:
+            typer.echo(f"X-Corpus-Mismatch: terms-analysis error: {exc}")
+            raise typer.Exit(code=1)
+
+    # 6. Pass; the label says whether the consumer check actually ran
+    verdict = "VALID" if consumer_checked else "VALID (consumer check skipped)"
     typer.echo(
-        f"bundle {bundle_dir.name}: VALID"
+        f"bundle {bundle_dir.name}: {verdict}"
         f" (embedder={manifest.embedder_model},"
         f" chunker={manifest.chunker_version},"
         f" chunks={manifest.chunk_count})"

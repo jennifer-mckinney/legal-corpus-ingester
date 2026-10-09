@@ -3,7 +3,7 @@
 ## Purpose
 
 Runs a full `ingester refresh --all` on a weekly schedule to keep every configured
-source current. When the bundle target changes, the workflow opens a GitHub issue
+source current. When the published bundle changes, the workflow opens a GitHub issue
 prompting the operator to validate consumer compatibility before updating the
 terms-analysis consumer.
 
@@ -20,35 +20,44 @@ invalid bundle.
 
 ## What it does
 
-The `refresh` job runs six steps in order:
+The `refresh` job runs these steps in order. Checkout uses
+`persist-credentials: false` and no job-level token is set; only the Preflight and
+issue steps get `GH_TOKEN` (terms-analysis#90).
 
 1. **Preflight.** Fails the run with an `::error::` annotation when the runner has
    no `gh` CLI or the `corpus-refresh` issue label cannot be read, and names the
    fix (`gh label create corpus-refresh`). The label is set once, as the job's
-   `ISSUE_LABEL`, and step 5 files under it.
+   `ISSUE_LABEL`, and step 4 files under it.
 
-2. **Record pre-refresh bundle target.** Reads `readlink out/current` before the
-   refresh starts and saves the result to `GITHUB_OUTPUT` as `target`. If
-   `out/current` does not yet exist (fresh install), `target` is set to the empty
-   string.
+2. **Run refresh.** Calls `ingester refresh --all` inside the virtualenv, under the
+   workflow-level `bash -eo pipefail` shell. Any non-zero exit fails the job, including
+   2 (`EXIT_NO_SOURCES`: `config/sources/` is tracked, so an empty registry means a
+   broken checkout) and 3 (`EXIT_NOT_WIRED`: intentionally red until G2 wires the
+   orchestrator; terms-analysis#90).
 
-3. **Run refresh.** Calls `ingester refresh --all` inside the virtualenv. If the
-   command exits non-zero because no sources are configured or because of a transient
-   error that `ingester` already handled, the step swallows the failure and exits 0
-   to keep the workflow green. Hard failures (Python exceptions, missing config) are
-   still surfaced through the step's stderr output.
+3. **Detect bundle change.** Runs `scripts/detect_bundle_change.py detect`. It reads
+   the bundle `out/current` points at and fingerprints it (SHA256 of its
+   `checksums.txt` lines, leaving out run-metadata `MANIFEST.yaml`). It compares the
+   version and fingerprint with the record of the last announced bundle, kept in
+   `$XDG_STATE_HOME/legal-corpus-ingester/last-published-bundle.json` (default
+   `~/.local/state/...`) on the runner. Sets `changed=true` on a first publish, a new
+   version or new content. The record lives outside the checkout because
+   `actions/checkout`'s clean deletes the gitignored `out/`. That is why the old
+   "readlink before refresh" comparison always saw an empty value and reported every
+   run as a change. If refresh succeeded but `out/current` is missing, or the version
+   or `checksums.txt` is invalid, the step exits 1. It does not report "no change".
 
-4. **Detect bundle change.** Reads `readlink out/current` again and compares it to
-   the pre-refresh value. Also runs `git status --porcelain out/ state/` to catch
-   any uncommitted changes (new checkpoint files, updated manifest) that indicate
-   ingest activity even when the symlink did not move. Sets `changed=true` if either
-   check sees a difference.
+4. **Open issue on corpus change.** Runs only when `changed=true`. Creates the
+   `corpus-refresh` label first (`gh label create --force`, idempotent; a real error
+   fails the step). Then creates a GitHub issue titled
+   `Weekly corpus refresh -- YYYY-MM-DD` with the bundle version and run ID in the
+   body. The issue tells the operator to run `ingester validate-round-trip out/current`
+   from an environment with terms-analysis installed, which exits 4 otherwise, before
+   updating the terms-analysis consumer. If a `corpus-refresh` issue is already open, no
+   duplicate is created; the step comments on it naming the new bundle version instead.
 
-5. **Open issue on corpus change.** Runs only when `changed=true`. Creates a GitHub
-   issue titled `Weekly corpus refresh -- YYYY-MM-DD` with the bundle version and run
-   ID in the body. The issue instructs the operator to run
-   `ingester validate-round-trip out/current` before updating the terms-analysis
-   consumer.
+5. **Record announced bundle.** Runs `scripts/detect_bundle_change.py record` only
+   after the issue step succeeded. A failed alert is therefore retried on the next run.
 
 6. **Upload health report.** Uploads `out/health/` as a GitHub Actions artifact named
    `health-report-<run_id>`. This step runs with `if: always()` so the artifact is
@@ -56,16 +65,17 @@ The `refresh` job runs six steps in order:
 
 ## What it produces
 
-**GitHub issue** (conditional). When the bundle target changes, an issue is opened
-with label `corpus-refresh`. The issue body contains:
+**GitHub issue** (conditional). When the published bundle's version or content fingerprint differs from the last announced one, an issue is opened
+with label `corpus-refresh`. If one is already open, a comment naming the new bundle version is added to it instead. The issue body contains:
 
-- The new bundle version (the symlink target path, e.g. `out/2026.07.0`)
+- The new bundle version (the version `out/current` resolves to, e.g. `2026.07.0`)
 - The Actions run ID for traceability
 - The event name that triggered the run
-- The instruction to run `ingester validate-round-trip out/current`
+- The instruction to run `ingester validate-round-trip out/current` from an
+  environment with terms-analysis installed (exits 4 if the consumer is not importable)
 
-No issue is opened when the refresh runs but produces no new bundle (all sources
-returned the same content as the prior run). This avoids noise on weeks when nothing
+No issue is opened when the refresh publishes a bundle whose version and content
+fingerprint match the last announced one. This avoids noise on weeks when nothing
 changes.
 
 **Artifact.** `out/health/` is uploaded on every run as `health-report-<run_id>`.
@@ -74,10 +84,9 @@ artifact.
 
 ## Failure mode
 
-If `ingester refresh` exits non-zero, the step prints "Refresh failed or no sources
-configured" and exits 0. The workflow continues, the health report artifact is still
-uploaded, and no issue is opened (because no bundle change is detected). The failure
-is visible in the step's stdout in the Actions run log.
+If `ingester refresh` exits non-zero, the `Run refresh` step fails and the job goes
+red. The later steps are skipped, the health report artifact is still uploaded
+(`if: always()`), and no issue is opened. Nothing is masked (terms-analysis#90).
 
 Operators who want to investigate should:
 
@@ -93,8 +102,11 @@ The GitHub issue opened on corpus change is the primary escalation artifact. An
 operator should:
 
 1. Read the issue body to identify the new bundle version.
-2. Run `ingester validate-round-trip out/current` to confirm the bundle is
-   structurally sound and consumer-compatible.
+2. Run `ingester validate-round-trip out/current` from an environment where
+   terms-analysis is importable, to confirm the bundle is structurally sound and
+   consumer-compatible. If the consumer cannot be imported it exits 4
+   (`EXIT_CONSUMER_SKIPPED`) instead of printing VALID; `--allow-missing-consumer`
+   runs the structural checks only and prints `VALID (consumer check skipped)`.
 3. If validation passes, update the terms-analysis consumer to point at the new
    bundle and close the issue.
 4. If validation fails, inspect the bundle, check `ALERTS.md`, and resolve any
@@ -114,7 +126,11 @@ corpus data leaves the runner.
 ```bash
 source .venv/bin/activate
 ingester refresh --all
-ingester validate-round-trip out/current
+# The consumer check imports backend.app.services.legal_kb from terms-analysis.
+# Point PYTHONPATH at its src/ directory, or the command exits 4 (EXIT_CONSUMER_SKIPPED).
+PYTHONPATH=<terms-analysis>/src ingester validate-round-trip out/current
+# Structural checks only, no consumer: prints "VALID (consumer check skipped)"
+ingester validate-round-trip out/current --allow-missing-consumer
 ```
 
 To trigger the GitHub Actions run manually:

@@ -75,7 +75,7 @@ rule: sources with license risk (e.g. Singapore SSO) require APPROVAL.yaml with 
 | Fetch one source | `ingester fetch eurlex` |
 | Full refresh | `ingester refresh` |
 | Status | `ingester status` |
-| Validate round-trip | `ingester validate-round-trip out/current` |
+| Validate round-trip | `PYTHONPATH=<terms-analysis>/src ingester validate-round-trip out/current` (exits 4 if terms-analysis is not importable; `--allow-missing-consumer` = structural only) |
 
 ## reference-library
 

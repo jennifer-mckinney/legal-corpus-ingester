@@ -12,18 +12,28 @@ concurrency:
   group: refresh
   cancel-in-progress: false  # never cancel a refresh mid-run; partial bundles are invalid
 
+# Explicit pipefail: GitHub's default `bash -e` lets `cmd | tail` hide cmd's failure (terms-analysis#90).
+defaults:
+  run:
+    shell: bash -eo pipefail {0}
+
 jobs:
   refresh:
     runs-on: [self-hosted, legal-corpus-ingester]
+    # No job-level GH_TOKEN: only Preflight and the issue step get the token, so
+    # Install (third-party build hooks) and Run refresh cannot read it (terms-analysis#90).
     env:
-      GH_TOKEN: ${{ github.token }}
       ISSUE_LABEL: corpus-refresh
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false  # no step needs git credentials; keep the token out of .git/config
 
       # Fail loudly up front when the runner lacks gh or the issue label is
       # missing, instead of failing only when an issue must be filed (#21).
       - name: Preflight
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if ! command -v gh >/dev/null 2>&1; then
             echo "::error::gh CLI not found on the runner; install it and restart the runner service" >&2
@@ -43,63 +53,34 @@ jobs:
           source .venv/bin/activate
           pip install -e '.[dev]' 2>&1 | tail -5
 
-      - name: Record pre-refresh bundle target
-        id: pre_refresh
-        run: |
-          # Capture the current symlink target (or empty string if out/current does not exist)
-          if [ -L out/current ]; then
-            echo "target=$(readlink out/current | tr -d '\n\r')" >> "$GITHUB_OUTPUT"
-          else
-            echo "target=" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Run refresh
         run: |
           source .venv/bin/activate
-          ingester refresh --all; rc=$?
-          # Exit 2 = no sources configured (fresh install) — not a failure.
-          # Exit 0 = success. Any other code is a real error; propagate it.
-          if [ $rc -eq 2 ]; then
-            echo "No sources configured; skipping refresh."
-          elif [ $rc -ne 0 ]; then
-            echo "ingester refresh failed with exit code $rc" >&2
-            exit $rc
-          fi
+          # Any non-zero fails the job; exit 3 (EXIT_NOT_WIRED) is intentionally red until G2 wires the orchestrator (terms-analysis#90).
+          ingester refresh --all
 
       - name: Detect bundle change
         id: detect_change
         run: |
-          # Compare symlink target after refresh to the pre-refresh value
-          if [ -L out/current ]; then
-            new_target=$(readlink out/current | tr -d '\n\r')
-          else
-            new_target=""
-          fi
-          pre_target="${{ steps.pre_refresh.outputs.target }}"
-
-          # Also check for any uncommitted changes in out/ or state/
-          git_dirty=$(git status --porcelain out/ state/ 2>/dev/null | wc -l | tr -d ' ')
-
-          # Validate bundle version format (YYYY.M.PATCH) to prevent injection into issue body.
-          if [ -n "$new_target" ] && ! echo "$new_target" | grep -qE '^[0-9]{4}\.[0-9]+\.[0-9]+$'; then
-            echo "Unexpected bundle version format: '$new_target'" >&2
-            exit 1
-          fi
-          if [ "$new_target" != "$pre_target" ] || [ "$git_dirty" -gt "0" ]; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "new_target=$new_target" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "new_target=$new_target" >> "$GITHUB_OUTPUT"
-          fi
+          source .venv/bin/activate
+          # Compares the bundle just published against the record of the last announced
+          # one, kept under $XDG_STATE_HOME (else ~/.local/state; outside the checkout, which checkout's clean wipes).
+          # Exits 1 if refresh succeeded but published no valid bundle (terms-analysis#90).
+          python scripts/detect_bundle_change.py detect \
+            --bundle-link out/current \
+            --github-output "$GITHUB_OUTPUT"
 
       - name: Open issue on corpus change
         if: steps.detect_change.outputs.changed == 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           BUNDLE_VER: ${{ steps.detect_change.outputs.new_target }}
           RUN_ID: ${{ github.run_id }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
+          # The label must exist or `gh issue create --label` fails; --force makes this idempotent
+          # and any real error (auth, permissions) fails the step loudly (terms-analysis#90).
+          gh label create "$ISSUE_LABEL" --force --color 0E8A16 --description "Weekly corpus refresh published a new bundle"
           open_count=$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq 'length') || {
             echo "Warning: gh issue list failed; creating issue unconditionally." >&2
             open_count=0
@@ -109,13 +90,24 @@ jobs:
               --title "Weekly corpus refresh -- $(date -u +%Y-%m-%d)" \
               --body "Corpus refreshed to bundle \`${BUNDLE_VER}\`.
 
-          Run \`ingester validate-round-trip out/current\` to verify consumer compatibility before updating the terms-analysis consumer.
+          Run \`ingester validate-round-trip out/current\` from an environment with terms-analysis installed to verify consumer compatibility (it exits 4 if the consumer is not importable) before updating the terms-analysis consumer.
 
           Triggered by: ${EVENT_NAME} (run \`${RUN_ID}\`)" \
               --label "$ISSUE_LABEL"
           else
-            echo "Corpus refresh issue already open; skipping duplicate."
+            # Do not drop the news: name the new bundle on the open issue so the record step
+            # below can advance without the change going unannounced (terms-analysis#90).
+            open_issue=$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq '.[0].number')
+            gh issue comment "$open_issue" \
+              --body "A newer corpus bundle was published: \`${BUNDLE_VER}\` (run \`${RUN_ID}\`, triggered by ${EVENT_NAME})."
           fi
+
+      # Runs only after the alert step succeeded, so a failed alert is retried next run.
+      - name: Record announced bundle
+        if: steps.detect_change.outputs.changed == 'true'
+        run: |
+          source .venv/bin/activate
+          python scripts/detect_bundle_change.py record --bundle-link out/current
 
       - name: Upload health report
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1

@@ -4,11 +4,18 @@ on:
     - cron: '0 3 * * *'   # 3 AM UTC daily
   workflow_dispatch:
 
+# Explicit pipefail: GitHub's default `bash -e` lets `cmd | tail` hide cmd's failure (terms-analysis#90).
+defaults:
+  run:
+    shell: bash -eo pipefail {0}
+
 jobs:
   health:
     runs-on: [self-hosted, legal-corpus-ingester]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          persist-credentials: false  # no step needs git credentials; keep the token out of .git/config
 
       - name: Set up Python
         run: python3 --version
@@ -19,15 +26,29 @@ jobs:
           source .venv/bin/activate
           pip install -e '.[dev]' 2>&1 | tail -5
 
+      # Checkpoints are read from outside the checkout: checkout's `git clean -ffdx` wipes the
+      # gitignored state/ first, so reading ./state always saw every source as never-run.
+      # Refresh must write its checkpoints to this same directory once it is wired (terms-analysis#90).
       - name: Run ingester status
         run: |
           source .venv/bin/activate
-          ingester status || true
+          # Exits 0 on a healthy system (incl. 'No runs recorded'); no masking (terms-analysis#90).
+          ingester status --state-dir "${XDG_STATE_HOME:-$HOME/.local/state}/legal-corpus-ingester/state"
 
       - name: Run health check
         run: |
           source .venv/bin/activate
-          python scripts/health_check.py || { rc=$?; [ $rc -le 1 ] || exit $rc; }
+          rc=0
+          python scripts/health_check.py \
+            --state-dir "${XDG_STATE_HOME:-$HOME/.local/state}/legal-corpus-ingester/state" || rc=$?
+          # Only exit 3 (cli.EXIT_NOT_WIRED: refresh is not wired, so no source can have run) is the
+          # known, expected state; it shows as a warning. Every other non-zero code fails the run:
+          # 1 = stale source (or never-run once refresh is wired), 2 = config dir missing, or a crash.
+          case "$rc" in
+            0) ;;
+            3) echo "::warning title=Refresh not wired::health_check exited 3: no source has run because refresh is not wired yet. See the health report." ;;
+            *) exit "$rc" ;;
+          esac
 
       - name: Upload health report
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
