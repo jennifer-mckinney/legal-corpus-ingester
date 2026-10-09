@@ -43,7 +43,7 @@ jobs:
             --state-dir "${XDG_STATE_HOME:-$HOME/.local/state}/legal-corpus-ingester/state" || rc=$?
           # Only exit 3 (cli.EXIT_NOT_WIRED: refresh is not wired, so no source can have run) is the
           # known, expected state; it shows as a warning. Every other non-zero code fails the run:
-          # 1 = stale source (or never-run once refresh is wired), 2 = config dir missing, or a crash.
+          # 1 = stale source (or never-run once refresh is wired), 2 = config problem, or a crash.
           case "$rc" in
             0) ;;
             3) echo "::warning title=Refresh not wired::health_check exited 3: no source has run because refresh is not wired yet. See the health report." ;;

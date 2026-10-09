@@ -6,17 +6,186 @@ EXPIRED / EXPIRING_SOON / OK, prints a markdown summary table, and exits
 non-zero if any approval has expired.
 
 Exit 0: all approvals are current (no expired entries).
-Exit 1: one or more approvals are EXPIRED.
+Exit 1: one or more approvals are EXPIRED or invalid.
+Exit 2: config problem, never "nothing to do": the approvals dir or the
+        --sources-dir is missing or unreadable, a *.yaml entry is not a
+        regular file, or there are zero approval files (terms-analysis#173).
+        Messages go to stderr.
 """
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
+import unicodedata
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
 import yaml
+
+# Config problem: distinct from 1 (expired/invalid approval) so the cause is visible.
+EXIT_CONFIG: int = 2
+
+
+# ---------------------------------------------------------------------------
+# Directory listing and log-path rendering (terms-analysis#173).
+# This block is byte-identical in health_check.py and check_approvals.py so each
+# scheduled job runs standalone as `python scripts/<name>.py`. A test in
+# tests/unit/test_health_check_empty.py compares the two copies byte for byte, up to
+# the end marker below. It also holds the one load-failure and empty-dir wording.
+# What counts as a config file: a regular *.yaml file (symlinks to files followed,
+# hidden names included, as the source registry's glob("*.yaml") does). Untrusted
+# text (file names, YAML values, checkpoint fields) reaches a terminal, CI log or
+# report only through display_path, and a markdown table cell only through
+# table_cell (DEV-FUNDAMENTALS F2, F8).
+# ---------------------------------------------------------------------------
+
+YAML_SUFFIX: str = ".yaml"
+
+# Long enough to identify any real path; short enough that a hostile name cannot flood a log.
+_MAX_DISPLAY_CHARS: int = 200
+
+# Control, format (bidi overrides, zero-width), line/paragraph separators, surrogates
+# (undecodable bytes), private-use and unassigned code points are never printed raw.
+_ESCAPED_CATEGORIES: frozenset[str] = frozenset({"Cc", "Cf", "Zl", "Zp", "Cs", "Co", "Cn"})
+
+
+class YamlDirError(Exception):
+    """The directory cannot be used: missing, not a directory, unreadable, or empty."""
+
+
+@dataclass(frozen=True)
+class YamlDirListing:
+    """Result of :func:`scan_yaml_dir`."""
+
+    files: list[Path]
+    """Regular ``*.yaml`` files, sorted by name."""
+
+    non_files: list[Path]
+    """``*.yaml`` entries that are not regular files (directories, broken symlinks)."""
+
+
+def display_path(path: Path | str) -> str:
+    """Render untrusted text for a terminal or log (DEV-FUNDAMENTALS F2, F8).
+
+    Every character in an escaped category becomes a visible fixed-width escape
+    (``\\xNN``, ``\\uNNNN``, or ``\\UNNNNNNNN`` above U+FFFF) and a literal
+    backslash becomes ``\\\\``, so each escape reads one way only. The result is
+    one line with no terminal control, no bidi reordering and nothing that fails
+    to encode. Output is capped, cut only between whole escapes.
+    """
+    out: list[str] = []
+    used = 0
+    for ch in str(path):
+        code = ord(ch)
+        if ch == "\\":
+            token = "\\\\"
+        elif unicodedata.category(ch) not in _ESCAPED_CATEGORIES:
+            token = ch
+        elif code <= 0xFF:
+            token = f"\\x{code:02x}"
+        elif code <= 0xFFFF:
+            token = f"\\u{code:04x}"
+        else:
+            token = f"\\U{code:08x}"
+        # Cut only between whole escapes, so the output never ends inside a partial one.
+        if used + len(token) > _MAX_DISPLAY_CHARS:
+            return "".join(out) + "...(truncated)"
+        out.append(token)
+        used += len(token)
+    return "".join(out)
+
+
+def table_cell(value: object) -> str:
+    """Render untrusted text as one markdown table cell (DEV-FUNDAMENTALS F2).
+
+    display_path makes it one escaped line; ``|`` then becomes ``\\|`` so the
+    value cannot add or close a cell.
+    """
+    return display_path(str(value)).replace("|", "\\|")
+
+
+def scan_yaml_dir(directory: Path, label: str) -> YamlDirListing:
+    """List the ``*.yaml`` entries of ``directory``, failing closed.
+
+    Args:
+        directory: The directory to list (symlinks to directories are followed).
+        label:     How error messages name the directory, e.g. ``"config dir"``.
+
+    Raises:
+        YamlDirError: ``directory`` is missing, is not a directory, or cannot be
+            read. ``Path.glob`` returns nothing for an unreadable directory, which
+            would look exactly like an empty one, so ``os.scandir`` is used instead.
+    """
+    shown = display_path(directory)
+    if not directory.exists():
+        raise YamlDirError(f"{label} {shown} does not exist.")
+    if not directory.is_dir():
+        raise YamlDirError(f"{label} {shown} is not a directory.")
+    try:
+        with os.scandir(directory) as entries:
+            matched = sorted(
+                (entry for entry in entries if entry.name.endswith(YAML_SUFFIX)),
+                key=lambda entry: entry.name,
+            )
+    except OSError as exc:
+        # strerror only: the exception's str() repeats the raw path (F8).
+        reason = exc.strerror or type(exc).__name__
+        raise YamlDirError(f"cannot read {label} {shown}: {reason}.") from exc
+
+    files: list[Path] = []
+    non_files: list[Path] = []
+    for entry in matched:
+        try:
+            is_file = entry.is_file()  # follows symlinks; a broken link is not a file
+        except OSError:
+            is_file = False
+        (files if is_file else non_files).append(directory / entry.name)
+    return YamlDirListing(files=files, non_files=non_files)
+
+
+class _NoAliasLoader(yaml.SafeLoader):
+    """SafeLoader that refuses every YAML alias, so merge-key bombs fail at load.
+
+    Config and approval files never need anchors or ``<<`` merges. A ComposerError
+    carries a mark, so ``_load_failure`` reports "not valid YAML (line N)" (F8).
+    """
+
+    def compose_node(self, parent, index):  # type: ignore[no-untyped-def]
+        if self.check_event(yaml.events.AliasEvent):
+            event = self.peek_event()
+            raise yaml.composer.ComposerError(
+                None, None, "YAML aliases are not allowed", event.start_mark
+            )
+        return super().compose_node(parent, index)
+
+
+def _load_yaml(text: str) -> object:
+    """Parse YAML text with aliases refused (the one load path for both scripts)."""
+    return yaml.load(text, Loader=_NoAliasLoader)
+
+
+def _load_failure(exc: Exception) -> str:
+    """Describe why a YAML file could not be loaded, without its bytes or path (F8).
+
+    A YAML error gives the line number only, since the parser's message quotes the
+    file. Any other error (OSError, UnicodeDecodeError, RecursionError on deep
+    nesting) gives its strerror or type, since str(exc) can repeat the path.
+    """
+    if isinstance(exc, yaml.YAMLError):
+        mark = getattr(exc, "problem_mark", None)
+        return f"not valid YAML (line {mark.line + 1})" if mark is not None else "not valid YAML"
+    return f"cannot read: {getattr(exc, 'strerror', None) or type(exc).__name__}"
+
+
+def _empty_dir_problem(directory: Path, label: str) -> str:
+    """The one wording for a usable directory that holds no ``*.yaml`` files (#173)."""
+    return f"no *.yaml files in {label} {display_path(directory)}."
+
+
+# End of the byte-identical block (terms-analysis#173).
 
 
 # ---------------------------------------------------------------------------
@@ -54,21 +223,28 @@ def check_approvals_dir(
     Returns:
         A tuple of (rows, any_expired) where rows is a list of dicts with keys
         source_id, status, expiry, days_remaining; and any_expired is True if at
-        least one approval is EXPIRED.
+        least one approval is EXPIRED or invalid. Row values are raw; render them
+        only through _render_table.
+
+    Raises:
+        YamlDirError: approvals_dir is missing, not a directory, unreadable, or
+            holds no approval files. Nothing to check is never "all OK" (#173).
     """
     rows: list[dict[str, str | int]] = []
     any_expired = False
 
-    yaml_files = sorted(approvals_dir.glob("*.yaml"))
+    yaml_files = scan_yaml_dir(approvals_dir, "approvals dir").files
+    if not yaml_files:
+        raise YamlDirError(_empty_dir_problem(approvals_dir, "approvals dir"))
     for yaml_path in yaml_files:
         try:
-            data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-        except Exception as exc:  # noqa: BLE001 — surface parse errors as rows
+            data = _load_yaml(yaml_path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001 — any read or parse failure is an ERROR row
             rows.append(
                 {
                     "source_id": yaml_path.stem,
                     "status": "ERROR",
-                    "expiry": str(exc),
+                    "expiry": _load_failure(exc),
                     "days_remaining": "-",
                 }
             )
@@ -87,8 +263,36 @@ def check_approvals_dir(
             any_expired = True
             continue
 
-        source_id = str(data.get("source_id", yaml_path.stem))
+        # Type checks come before any str() or f-string: a YAML alias graph is cheap to
+        # load but expands in full when rendered, before any display cap (security r2 F3).
+        raw_source_id = data.get("source_id", yaml_path.stem)
+        if not isinstance(raw_source_id, str):
+            # Never shown: the row is named by the file stem. An explicit null counts too.
+            rows.append(
+                {
+                    "source_id": yaml_path.stem,
+                    "status": "ERROR",
+                    "expiry": "source_id is not a string",
+                    "days_remaining": "-",
+                }
+            )
+            any_expired = True
+            continue
+        source_id = raw_source_id
         raw_expiry = data.get("expiry")
+
+        # date covers an unquoted YAML date; an int, float or bool must never parse as one.
+        if raw_expiry is not None and not isinstance(raw_expiry, (str, date)):
+            rows.append(
+                {
+                    "source_id": source_id,
+                    "status": "ERROR",
+                    "expiry": "invalid date: not a date or string",
+                    "days_remaining": "-",
+                }
+            )
+            any_expired = True
+            continue
 
         if not raw_expiry:
             rows.append(
@@ -109,7 +313,7 @@ def check_approvals_dir(
                 {
                     "source_id": source_id,
                     "status": "ERROR",
-                    "expiry": f"invalid date: {raw_expiry!r}",
+                    "expiry": f"invalid date: {raw_expiry}",
                     "days_remaining": "-",
                 }
             )
@@ -117,7 +321,19 @@ def check_approvals_dir(
             continue
 
         # HR9: signed_artifact_sha256 must be present, non-empty, and valid hex format.
-        sha256 = str(data.get("signed_artifact_sha256", "")).strip()
+        raw_sha256 = data.get("signed_artifact_sha256", "")
+        if not isinstance(raw_sha256, str):
+            rows.append(
+                {
+                    "source_id": source_id,
+                    "status": "ERROR",
+                    "expiry": f"sha256-invalid-format (expiry={expiry_date})",
+                    "days_remaining": "-",
+                }
+            )
+            any_expired = True
+            continue
+        sha256 = raw_sha256.strip()
         if not sha256:
             rows.append(
                 {
@@ -161,13 +377,51 @@ def check_approvals_dir(
     return rows, any_expired
 
 
+def _scan(directory: Path, label: str, problems: list[str]) -> list[Path] | None:
+    """Return the regular *.yaml files in ``directory``, appending any problem found.
+
+    Returns None when the directory itself cannot be listed.
+    """
+    try:
+        listing = scan_yaml_dir(directory, label)
+    except YamlDirError as exc:
+        problems.append(str(exc))
+        return None
+    shown_dir = display_path(directory)
+    problems.extend(
+        f"{display_path(p.name)} in {label} {shown_dir} is not a regular file."
+        for p in listing.non_files
+    )
+    return listing.files
+
+
+def _config_problems(sources_dir: Path, approvals_dir: Path) -> list[str]:
+    """Return every reason the job cannot do its check; empty means usable.
+
+    Zero approvals is always a problem (terms-analysis#173): with source configs
+    present the gated sources are unverified, and with none the scheduled job
+    has nothing to verify, which looks exactly like a job that is not wired up.
+    """
+    problems: list[str] = []
+    sources = _scan(sources_dir, "sources dir", problems)
+    approvals = _scan(approvals_dir, "approvals dir", problems)
+    if approvals is not None and not approvals:
+        problems.append(_empty_dir_problem(approvals_dir, "approvals dir"))
+        if sources:
+            # Its own line, so the empty-dir line keeps the one shared wording.
+            problems.append(
+                f"{len(sources)} source config(s) in {display_path(sources_dir)} are unverified."
+            )
+    return problems
+
+
 # ---------------------------------------------------------------------------
 # Formatting
 # ---------------------------------------------------------------------------
 
 
 def _render_table(rows: list[dict[str, str | int]]) -> str:
-    """Render rows as a markdown table string."""
+    """Render rows as a markdown table string; every cell goes through table_cell (F2)."""
     header = (
         "| source_id | status | expiry | days_remaining (EXPIRED=days past) |\n"
         "|-----------|--------|--------|------------------------------------|\n"
@@ -175,10 +429,10 @@ def _render_table(rows: list[dict[str, str | int]]) -> str:
     lines: list[str] = []
     for row in rows:
         lines.append(
-            f"| {row['source_id']} "
-            f"| {row['status']} "
-            f"| {row['expiry']} "
-            f"| {row['days_remaining']} |"
+            f"| {table_cell(row['source_id'])} "
+            f"| {table_cell(row['status'])} "
+            f"| {table_cell(row['expiry'])} "
+            f"| {table_cell(row['days_remaining'])} |"
         )
     return header + "\n".join(lines) + "\n"
 
@@ -199,6 +453,11 @@ def main(argv: list[str] | None = None) -> int:
         help="Directory containing APPROVAL.yaml files (default: config/approvals)",
     )
     parser.add_argument(
+        "--sources-dir",
+        default="config/sources",
+        help="Directory containing per-source YAML configs (default: config/sources)",
+    )
+    parser.add_argument(
         "--warn-days",
         type=int,
         default=60,
@@ -211,20 +470,24 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--warn-days must be a non-negative integer")
 
     approvals_dir = Path(args.approvals_dir)
+    sources_dir = Path(args.sources_dir)
     warn_days: int = args.warn_days
     today = date.today()
 
-    # No directory or no files -- treat as no approvals to check.
-    if not approvals_dir.is_dir():
-        print("No approvals to check.")
-        return 0
+    # Nothing to check is a config error, not success: the daily job must go red
+    # instead of passing silently (terms-analysis#173).
+    problems = _config_problems(sources_dir, approvals_dir)
+    if problems:
+        for problem in problems:
+            print(f"Error: {problem}", file=sys.stderr)
+        return EXIT_CONFIG
 
-    yaml_files = list(approvals_dir.glob("*.yaml"))
-    if not yaml_files:
-        print("No approvals to check.")
-        return 0
-
-    rows, any_expired = check_approvals_dir(approvals_dir, today, warn_days)
+    try:
+        rows, any_expired = check_approvals_dir(approvals_dir, today, warn_days)
+    except YamlDirError as exc:
+        # The dir changed after the check above: still a config error, never success.
+        print(f"Error: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
 
     print(_render_table(rows))
 

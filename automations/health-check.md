@@ -56,7 +56,7 @@ decided:
 |------|---------|-----------------|
 | 0 | Every source is fresh | green |
 | 1 | A source is stale, or never-run while refresh is wired | red |
-| 2 | `config/sources/` is missing (broken checkout) | red |
+| 2 | Config problem: `config/sources/` missing, unreadable or holding zero source configs, a non-file `*.yaml` entry, or an empty / non-mapping source YAML | red |
 | 3 (`EXIT_NOT_WIRED`) | The only problem is never-run sources and `cli.REFRESH_WIRED` is False | green with a "Refresh not wired" warning annotation |
 
 Exit 3 is the known unwired state: `ingester refresh` does not run the pipeline
@@ -74,7 +74,9 @@ python scripts/health_check.py --stale-days 14
 ## Failure mode
 
 If `health_check.py` exits 1 (stale source, or never-run once refresh is wired),
-2 (`config/sources/` missing, i.e. a broken checkout) or any other code except 3,
+2 (config problem: `config/sources/` missing, unreadable or holding zero source
+configs, a `*.yaml` entry that is not a regular file, or a source YAML that is
+empty or not a mapping; terms-analysis#90, #173) or any other code except 3,
 the `Run health check` step is marked failed. None of these is masked
 (terms-analysis#90). The artifact upload still runs because it has
 `if: always()`. No issue is auto-opened - this is a monitoring report, not an

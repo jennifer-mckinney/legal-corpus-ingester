@@ -27,7 +27,7 @@ dev = [
 ]
 
 [project.scripts]
-ingester = "legal_corpus_ingester.cli:app"
+ingester = "legal_corpus_ingester.cli:main"
 
 [build-system]
 requires = ["setuptools>=68"]

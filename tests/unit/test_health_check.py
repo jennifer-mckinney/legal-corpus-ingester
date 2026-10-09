@@ -18,6 +18,7 @@ import health_check  # noqa: E402
 from health_check import (  # noqa: E402
     EXIT_CONFIG_MISSING,
     EXIT_SOURCE_PROBLEM,
+    YamlDirError,
     _status_label,
     build_report,
     health_verdict,
@@ -42,19 +43,26 @@ class TestStatusLabel:
 
 
 class TestBuildReport:
-    def test_no_sources(self, tmp_path):
+    @pytest.mark.parametrize("make_dir", [True, False], ids=["empty-dir", "missing-dir"])
+    def test_no_sources_is_not_success(self, tmp_path, make_dir):
+        # Zero sources, or no dir at all, must never be a clean report (terms-analysis#173, grumpy 4).
         config_dir = tmp_path / "config"
-        config_dir.mkdir()
-        report, verdict = build_report(
-            config_dir=config_dir,
-            state_dir=tmp_path / "state",
-            out_dir=tmp_path / "out",
-            stale_days=8,
-            today="2026-07-04",
-            refresh_wired=True,
-        )
-        assert "No sources" in report
-        assert verdict == 0
+        if make_dir:
+            config_dir.mkdir()
+        # Grumpy r2-1: one contract only. build_report raises; it never returns a report.
+        with pytest.raises(YamlDirError) as raised:
+            build_report(
+                config_dir=config_dir,
+                state_dir=tmp_path / "state",
+                out_dir=tmp_path / "out",
+                stale_days=8,
+                today="2026-07-04",
+                refresh_wired=True,
+            )
+        if make_dir:
+            assert str(raised.value) == health_check._empty_dir_problem(config_dir, "config dir")
+        else:
+            assert "does not exist" in str(raised.value)
 
     def test_all_fresh(self, tmp_path):
         config_dir = tmp_path / "config"
