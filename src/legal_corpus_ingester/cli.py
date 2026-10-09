@@ -381,8 +381,15 @@ def validate_round_trip(
     # 5. Attempt terms-analysis consumer round-trip. A missing consumer is NOT a pass by
     # default: it exits EXIT_CONSUMER_SKIPPED unless --allow-missing-consumer (terms-analysis#90).
     consumer_checked = False
+    consumer_module = "backend.app.services.legal_kb"
+    # The consumer is absent only when a package on its own dotted path is missing
+    # ("backend", "backend.app", ...). Any other missing module (a dependency of an
+    # installed consumer, or an unnamed one) is a broken consumer: an error, never a
+    # skip, so --allow-missing-consumer cannot turn it into a VALID verdict.
+    parts = consumer_module.split(".")
+    consumer_packages = {".".join(parts[: i + 1]) for i in range(len(parts))}
     try:
-        legal_kb_mod = importlib.import_module("backend.app.services.legal_kb")
+        legal_kb_mod = importlib.import_module(consumer_module)
         kb_cls = getattr(legal_kb_mod, "LegalKnowledgeBase")
         kb = kb_cls()
         kb.load_from_bundle(bundle_dir)
@@ -392,9 +399,14 @@ def validate_round_trip(
             raise typer.Exit(code=1)
         typer.echo(f"terms-analysis round-trip: OK ({len(result)} chunks returned)")
         consumer_checked = True
-    except ModuleNotFoundError:
-        # ModuleNotFoundError (not ImportError) so module-level errors in a partially-installed
-        # terms-analysis raise through to the broad except below instead of being silenced.
+    except typer.Exit:
+        raise
+    except Exception as exc:
+        # Only a ModuleNotFoundError naming the consumer's own path means "not installed";
+        # ImportError, module-level errors and missing dependencies are consumer errors.
+        if not (isinstance(exc, ModuleNotFoundError) and exc.name in consumer_packages):
+            typer.echo(f"X-Corpus-Mismatch: terms-analysis error: {exc}")
+            raise typer.Exit(code=1)
         if not allow_missing_consumer:
             typer.echo(
                 "Error: terms-analysis not installed; consumer round-trip NOT checked."
@@ -404,11 +416,6 @@ def validate_round_trip(
             )
             raise typer.Exit(code=EXIT_CONSUMER_SKIPPED)
         typer.echo("terms-analysis not installed; skipping consumer round-trip check.")
-    except typer.Exit:
-        raise
-    except Exception as exc:
-        typer.echo(f"X-Corpus-Mismatch: terms-analysis error: {exc}")
-        raise typer.Exit(code=1)
 
     # 6. Pass; the label says whether the consumer check actually ran
     verdict = "VALID" if consumer_checked else "VALID (consumer check skipped)"
