@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Enforce ruff + license-hashes audit + mypy + pytest unit checks before every local commit lands. It is a fast local gate that catches lint, license drift, typing, and unit-test regressions before they leave the workstation. It complements the pre-push gate rather than replacing it.
+Enforce ruff + license-hashes audit + mypy + pytest unit checks before every local commit lands. It is a fast local gate that catches lint, license drift, typing, and unit-test regressions before they leave the workstation. It is the only local git hook: it guards lint, license-hash drift, typing and unit tests, while the P9 review runs as CI jobs on each PR.
 
 ## Trigger
 

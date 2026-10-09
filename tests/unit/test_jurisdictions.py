@@ -25,7 +25,6 @@ def in_ci(value: str | None) -> bool:
     return (value or "").strip().lower() in {"1", "true"}
 
 
-
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -42,6 +41,7 @@ def in_ci(value: str | None) -> bool:
 )
 def test_in_ci_parses_only_real_ci_markers(value: str | None, expected: bool) -> None:
     assert in_ci(value) is expected
+
 
 def _sync_module() -> ModuleType:
     """The sync script as a module, so its paths are read, not restated."""

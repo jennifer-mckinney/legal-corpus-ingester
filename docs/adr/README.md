@@ -20,5 +20,6 @@ Each ADR follows the format: `NNN-<slug>.md`
 | ADR-012 | Weekly drift canary workflow | Accepted |
 | ADR-013 | pdfminer.six + trafilatura extraction | Accepted |
 | ADR-014 | Approval YAML gate for license changes | Accepted |
+| ADR-015 | Dependency rules C3/C7 cover the product, not CI review tooling | Accepted |
 
 To propose a change to any accepted ADR: open a PR with a new ADR file that supersedes the prior one, update the table above, and update the relevant constraint in `PRINCIPLES.md`.

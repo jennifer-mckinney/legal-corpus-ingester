@@ -30,6 +30,7 @@ import subprocess
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -257,7 +258,7 @@ def _brief_severity_tags(brief: Path) -> list[str]:
     return re.findall(r"`([A-Z]+)`", rules[0])
 
 
-def _gate_module() -> Any:
+def _gate_module() -> ModuleType:
     spec = importlib.util.spec_from_file_location("p9_check_verdict", GATE)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
