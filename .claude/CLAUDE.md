@@ -94,8 +94,10 @@ tracks: SHA256 of `.claude/CLAUDE.md`, `.claude/library/LIB-PRINCIPLES.md`, `$HO
 verify: `scripts/governance/verify-hashes.sh`
 regen: `scripts/governance/regen-manifest.sh --yes`
 
-### G2: pre-push-independent-review
-rule: LIB-PRINCIPLES P9 — grumpy-developer + security-engineer dispatched before every push; zero-tolerance security gate; zero-tolerance grumpy (2026-07-04 directive)
+### G2: pr-independent-review
+rule: LIB-PRINCIPLES P9 — every PR to `main` runs the CI jobs `security-review` + `grumpy-review` (`.github/workflows/p9-review.yml`, ubuntu-latest); CRITICAL/HIGH/MEDIUM findings block (`BLOCKING_SEVERITIES` in `.github/p9/check_verdict.py`); LOW/NIT are posted and carded (owner, 2026-10-09, narrowing the 2026-07-04 zero-tolerance directive)
+retired: local `.githooks/pre-push` signoff gate, its `.sha256` pin, `.git/reviews/` signoffs and `scripts/ci/p9-sibling-parity.sh` (2026-10-09, terms-analysis#191)
+owner_steps: add the `ANTHROPIC_API_KEY` repo secret; after the first green run, require both jobs in branch protection on `main`
 
 ## automations
 
@@ -103,7 +105,7 @@ rule: LIB-PRINCIPLES P9 — grumpy-developer + security-engineer dispatched befo
 |-----------|---------|------|
 | pre-commit hook | `git commit` | `automations/pre-commit.md` |
 | CI on PR | GitHub PR | `automations/ci-pr.md` |
-| P9 pre-push gate | `git push` | `automations/p9-pre-push.md` |
+| P9 review CI jobs | GitHub PR to `main` | `automations/p9-pre-push.md` |
 | Structured logging contract | all modules | `automations/logging.md` |
 | Docker skeleton | `docker compose up` | `automations/docker.md` |
 | Secrets management | `.env` loading | `automations/secrets.md` |
