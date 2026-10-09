@@ -31,6 +31,17 @@ No `pyproject.toml` yet — lands at Phase 0.1 Task 2. Grades are provisional un
 Note: All deps verified via `.claude/skills/dependency-audit` before merge. IRP grades are provisional
 until pyproject.toml lands at Phase 0.1 Task 2.
 
+## ci-dev-tooling
+
+GitHub Actions used only by CI workflows. These are not package dependencies, never run on the
+product data path, and never ship in the published bundle or installed package. Every `uses:` is
+pinned to a full 40-character commit SHA; the workflow file holds the pin of record.
+
+| Action | Version | Used in | Product dependency rules (C3/C7) |
+|--------|---------|---------|----------------------------------|
+| `anthropics/claude-code-action` | v1, SHA-pinned | `.github/workflows/p9-review.yml` (P9 security + grumpy review jobs) | Exempt under ADR-015 (`docs/adr/015-dependency-rules-scope-ci-review-tooling.md`) while its four conditions hold: SHA pin, read-only tool allowlist, GitHub-hosted runners with no product data beyond the PR diff, not in the artifact |
+| `actions/checkout` | v4.2.2 / v6, SHA-pinned | `.github/workflows/ci.yml`, `.github/workflows/p9-review.yml` | Outside the product data path that ADR-015 scopes C3/C7 to; checks out the repository only |
+
 ## excluded-packages
 
 | Package | Reason |
