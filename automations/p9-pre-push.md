@@ -7,6 +7,9 @@ that review runs as two standard GitHub Actions jobs on the pull request. The ea
 pre-push signoff hook is retired. The file keeps its old name so existing
 links still resolve.
 
+Companion change: this pairs with jennifer-mckinney/terms-analysis#214; the PRs merge
+back-to-back, #214 first, then this one.
+
 ## How it runs
 
 Workflow: `.github/workflows/p9-review.yml`.

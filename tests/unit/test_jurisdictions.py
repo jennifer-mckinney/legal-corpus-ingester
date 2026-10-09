@@ -18,11 +18,30 @@ SYNC_SCRIPT = REPO_ROOT / "scripts" / "sync_jurisdictions.py"
 def in_ci(value: str | None) -> bool:
     """True only for the CI markers runners actually set ("true", "1").
 
-    `bool(os.environ.get("CI"))` also skipped on CI=false or CI=0, which
-    silently disabled this guard on developer machines that export them.
+    `bool(os.environ.get("CI"))` would also be true for CI=false or CI=0,
+    so a developer machine that exports either, without the terms-analysis
+    checkout, would fail the sync test instead of skipping it.
     """
     return (value or "").strip().lower() in {"1", "true"}
 
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("true", True),
+        ("TRUE", True),
+        ("1", True),
+        (" true ", True),
+        ("false", False),
+        ("0", False),
+        ("", False),
+        (None, False),
+        ("yes", False),
+    ],
+)
+def test_in_ci_parses_only_real_ci_markers(value: str | None, expected: bool) -> None:
+    assert in_ci(value) is expected
 
 def _sync_module() -> ModuleType:
     """The sync script as a module, so its paths are read, not restated."""
