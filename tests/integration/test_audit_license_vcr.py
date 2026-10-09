@@ -2,7 +2,8 @@
 
 This test exercises the full audit_license() code path without a live network call,
 using the same response shape that the EUR-Lex legal notice page returns.
-The cassette file (eurlex_legal_notice.yaml) is the authoritative source for the
+The static fixture (tests/fixtures/static/eurlex_legal_notice.yaml, deliberately
+outside the cassette tree so the VCR drift canary never counts it as re-recorded) is the authoritative source for the
 response body — both tests and the cassette stay in sync automatically.
 
 httpx.Response requires an attached httpx.Request before raise_for_status() can be
@@ -26,8 +27,7 @@ runner = CliRunner()
 _EURLEX_LEGAL_NOTICE_YAML = (
     Path(__file__).parent.parent
     / "fixtures"
-    / "cassettes"
-    / "eurlex"
+    / "static"
     / "eurlex_legal_notice.yaml"
 )
 
