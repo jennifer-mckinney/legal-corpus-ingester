@@ -2,19 +2,28 @@
 """P9 review gate (terms-analysis#191).
 
 Run as the last step of each job in .github/workflows/p9-review.yml, after
-the reviewer has written p9-verdict.json. The job passes only when the file
-is exactly the verdict contract with verdict PASS and an empty findings list.
+the reviewer has written p9-verdict.json. The file must be exactly the
+verdict contract. The job then fails on any finding whose severity is in
+BLOCKING_SEVERITIES (CRITICAL, HIGH, MEDIUM; owner decision 2026-10-09) and
+passes when every finding is LOW or NIT. Non-blocking findings are still
+printed, marked "non-blocking", so they can be filed as cards.
 
 Contract (written by the reviewer, see .github/p9/*.md):
     {"verdict": "PASS" | "FAIL",
      "findings": [{"severity": ..., "title": ..., "file": ..., "line": ...}]}
 Key sets are exact. severity is one of SEVERITIES (exact spelling), title and
 file are non-blank strings, line is a non-negative int (bool is refused).
+The verdict must agree with the findings: "FAIL" if and only if at least one
+finding is in BLOCKING_SEVERITIES, otherwise "PASS" (LOW and NIT findings are
+listed under PASS). A contradictory verdict is off the contract.
 
 Exit codes:
-    0  PASS with zero findings (prints "P9 verdict: PASS, 0 findings")
-    1  the reviewer reported FAIL, or listed findings
-    2  the file is missing, unreadable, not JSON, or off the contract
+    0  PASS with zero findings (prints "P9 verdict: PASS, 0 findings"), or
+       PASS with only non-blocking findings (prints "P9 verdict: PASS, <n>
+       finding(s), 0 blocking" and one line per finding, to stdout)
+    1  FAIL with at least one blocking finding (to stderr)
+    2  the file is missing, unreadable, not JSON, or off the contract,
+       including a verdict that contradicts its findings
 
 Standard library only, so the step needs nothing installed.
 """
@@ -36,6 +45,10 @@ FINDING_FIELDS = ("severity", "title", "file", "line")
 # security brief stops at LOW. The test suite reads the briefs and checks
 # every tag listed there is accepted here.
 SEVERITIES = frozenset({"CRITICAL", "HIGH", "MEDIUM", "LOW", "NIT"})
+# The only severities that fail the job (owner decision 2026-10-09: block on
+# what matters for correctness, security or acceptance). Every other tag in
+# SEVERITIES passes and is printed as non-blocking.
+BLOCKING_SEVERITIES = frozenset({"CRITICAL", "HIGH", "MEDIUM"})
 # Finding text comes from a model that read untrusted PR content; it is shown
 # in the Actions log one finding per line, so each field is cut to this size.
 MAX_FIELD_CHARS = 200
@@ -107,7 +120,23 @@ def load(path: Path) -> dict[str, object]:
             f"{path.name} does not match the verdict contract "
             '{"verdict": "PASS"|"FAIL", "findings": [{...}]}'
         )
+    # The verdict is consistent with the findings, or the file is off the
+    # contract: FAIL if and only if a blocking finding is listed. This refuses
+    # a FAIL with only LOW/NIT findings, a FAIL with none, and a PASS that
+    # lists a blocking finding (PR #218 review thread).
+    blocking = _count_blocking(findings)
+    if (verdict == "FAIL") != (blocking > 0):
+        raise InvalidVerdict(
+            f"{path.name} does not match the verdict contract: verdict {verdict} "
+            f"with {blocking} blocking finding(s); the verdict is FAIL if and only "
+            f"if a finding is {'/'.join(sorted(BLOCKING_SEVERITIES))}"
+        )
     return doc
+
+
+def _count_blocking(findings: list[dict[str, object]]) -> int:
+    """How many findings carry a severity in BLOCKING_SEVERITIES."""
+    return sum(item["severity"] in BLOCKING_SEVERITIES for item in findings)
 
 
 def main(argv: list[str]) -> int:
@@ -124,11 +153,18 @@ def main(argv: list[str]) -> int:
     if verdict == "PASS" and not findings:
         print("P9 verdict: PASS, 0 findings")
         return EXIT_PASS
-    print(f"P9 verdict: {verdict}, {len(findings)} finding(s)", file=sys.stderr)
+    blocking = _count_blocking(findings)
+    header = f"P9 verdict: {verdict}, {len(findings)} finding(s), {blocking} blocking"
+    # load() has already proved verdict and findings agree, so a FAIL here
+    # always carries at least one blocking finding.
+    rejected = blocking > 0
+    stream = sys.stderr if rejected else sys.stdout
+    print(header, file=stream)
     for item in findings:
         severity, title, file, line = (_clean(item[key]) for key in FINDING_FIELDS)
-        print(f"  - [{severity}] {title} ({file}:{line})", file=sys.stderr)
-    return EXIT_REJECTED
+        mark = "blocking" if item["severity"] in BLOCKING_SEVERITIES else "non-blocking"
+        print(f"  - [{severity}] {title} ({file}:{line}) {mark}", file=stream)
+    return EXIT_REJECTED if rejected else EXIT_PASS
 
 
 if __name__ == "__main__":
