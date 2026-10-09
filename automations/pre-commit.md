@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Enforce ruff + license-hashes audit + mypy + pytest unit checks before every local commit lands. It is a fast local gate that catches lint, license drift, typing, and unit-test regressions before they leave the workstation. It complements the pre-push gate rather than replacing it.
+Enforce ruff + license-hashes audit + mypy + pytest unit checks before every local commit lands. It is a fast local gate that catches lint, license drift, typing, and unit-test regressions before they leave the workstation. It is the only local git hook: it guards lint, license-hash drift, typing and unit tests, while the P9 review runs as CI jobs on each PR.
 
 ## Trigger
 
@@ -43,7 +43,7 @@ Run once per clone:
 bash scripts/install-hooks.sh
 ```
 
-The installer is idempotent. It sets `core.hooksPath=.githooks`, chmods every file under `.githooks/` (so both pre-commit and pre-push get the executable bit), and ensures `.git/reviews/` exists for the pre-push signoff artifacts.
+The installer is idempotent. It sets `core.hooksPath=.githooks` and chmods every file under `.githooks/`. It no longer creates `.git/reviews/`: the P9 review runs in CI (`automations/p9-pre-push.md`).
 
 Re-run `install-hooks.sh` after adding any new hook file to `.githooks/`. The chmod loop only runs at install time, so a freshly-cloned repo will not have the bit set on a hook that was added after the last install.
 
@@ -51,11 +51,11 @@ Re-run `install-hooks.sh` after adding any new hook file to `.githooks/`. The ch
 
 `git commit --no-verify` disables the hook for a single commit. This is a P7 violation if used to bypass fixes. It is only defensible in a pre-approved emergency situation - for example, a merge conflict resolution where the working tree is temporarily inconsistent and the fix lands in a follow-up commit reviewed by the user.
 
-The pre-push hook still runs even if pre-commit was bypassed, so `--no-verify` on commit does not let unreviewed code reach `origin`.
+Bypassing pre-commit does not bypass P9: every PR to `main` still runs the `security-review` and `grumpy-review` CI jobs.
 
-## Relationship to pre-push
+## Relationship to P9 review
 
-The pre-commit hook gates local commits with fast checks (lint, license audit, types, unit tests). The pre-push hook gates remote pushes with the P9 independent-review workflow (security-engineer + grumpy-developer signoff). They are independent - passing pre-commit does not satisfy pre-push, and bypassing pre-commit does not disable pre-push.
+The pre-commit hook gates local commits with fast checks (lint, license audit, types, unit tests). The P9 independent review (security-engineer + grumpy-developer) runs as CI jobs on every PR to `main` (`.github/workflows/p9-review.yml`). They are independent - passing pre-commit does not satisfy P9, and bypassing pre-commit does not disable it. There is no local pre-push hook.
 
 ## Failure mode
 
@@ -72,7 +72,7 @@ The hook also refuses to source `.venv/bin/activate` if the file is a symlink or
 
 ## Auditability
 
-`--no-verify` skips the hook entirely, and the pre-push hook cannot tell whether pre-commit ran. To make bypasses observable, the hook appends a timestamp to `.git/pre-commit.log` at every successful completion (SecF7). The log lives inside `.git/`, so it is untracked and per-clone.
+`--no-verify` skips the hook entirely, and nothing downstream can tell whether pre-commit ran. To make bypasses observable, the hook appends a timestamp to `.git/pre-commit.log` at every successful completion (SecF7). The log lives inside `.git/`, so it is untracked and per-clone.
 
 To verify pre-commit ran for a given commit, check `.git/pre-commit.log`. The last timestamp should be within seconds of the commit's authored time. A gap indicates a `--no-verify` bypass.
 

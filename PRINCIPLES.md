@@ -16,11 +16,11 @@ The ingester is a local-data-only, open-source-only pipeline. Constraints are fi
 |---|-----------|---------|
 | C1 | Fetch runtime permission manifests from external URLs | HR4 — all data stays local; external fetches would leak corpus topology |
 | C2 | Use CC-BY-NC or commercially-restricted dependencies | HR1 — open source only (Apache 2.0 / MIT / BSD / MPL 2.0 / public domain preferred) |
-| C3 | Use packages from companies facing investor lawsuits | HR2 — no Meta-origin (FAISS, etc.), no VC-funded LLM houses |
+| C3 | Use packages from companies facing investor lawsuits | HR2 — no Meta-origin (FAISS, etc.), no VC-funded LLM houses. Scope: product runtime and data path only; CI review tooling is exempt per [ADR-015](docs/adr/015-dependency-rules-scope-ci-review-tooling.md) |
 | C4 | Dispatch fetch or embed workloads to remote (GitHub-hosted) runners | HR4 — self-hosted runner only; corpus artifacts must never leave the local machine |
 | C5 | Call OpenAI or any cloud embedding API | HR6 — local-only LLM inference via LocalAI + Apertus-8B |
 | C6 | Silently publish a shorter corpus on source drift or 404 | HR5 — fail-loud on drift; emit ALERTS.md; halt the affected source |
-| C7 | Accept a dependency with IRP Grade below A | HR3 — every dependency audited via `.claude/skills/dependency-audit` before merge |
+| C7 | Accept a dependency with IRP Grade below A | HR3 — every dependency audited via `.claude/skills/dependency-audit` before merge. Scope: product runtime and data path only; CI review tooling is exempt per [ADR-015](docs/adr/015-dependency-rules-scope-ci-review-tooling.md) |
 | C8 | Publish a bundle without MANIFEST.yaml containing embedder_model + embedder_revision | HR7 — consumer (terms-analysis) verifies these fields on startup; missing = HTTP 503 |
 | C9 | Proceed past SPDX license change without human review | HR8 — license drift zero tolerance; blocked until APPROVAL.yaml is updated |
 | C10 | Ingest a license-risk source without a signed APPROVAL.yaml | HR9 — legal-review gate required |
