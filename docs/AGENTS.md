@@ -9,8 +9,8 @@ Per `.claude/library/LIB-PRINCIPLES.md` P8 (agent separation of duties), every i
 | `general-purpose` | **Coder** — implements per task spec + writes own unit tests | One task at a time | None |
 | `general-purpose` (isolated) | **Test Helper** — writes spec-conformance tests from spec ONLY; no visibility into Coder's diff | Once per stage complete | None |
 | `general-purpose` (isolated) | **Critic** — runs Coder unit tests + Test Helper spec tests; reports pass/fail | After Coder + Test Helper return | None |
-| `grumpy-developer` | **Grumpy Reviewer** — adversarial code-quality review | Every PR to `main` (CI job `grumpy-review`) | Merge gate: ANY finding fails the job (zero-tolerance per P9) |
-| `security-engineer` | **Security Reviewer** — STRIDE review, zero-tolerance gate | Every PR to `main` (CI job `security-review`) | Merge gate: ANY finding fails the job |
+| `grumpy-developer` | **Grumpy Reviewer** — adversarial code-quality review | Every PR to `main` (CI job `grumpy-review`) | Merge gate: a CRITICAL, HIGH or MEDIUM finding fails the job; LOW and NIT are non-blocking (P9, owner decision 2026-10-09) |
+| `security-engineer` | **Security Reviewer** — STRIDE review, merge gate | Every PR to `main` (CI job `security-review`) | Merge gate: a CRITICAL, HIGH or MEDIUM finding fails the job; LOW is non-blocking |
 | `researcher` | **Researcher** — upstream source verification, license research | When adding a new source | None |
 | `Explore` (read-only) | **Explorer** — codebase exploration when scope is uncertain | Ad hoc | None |
 | `code-simplifier` | **Simplifier** — end-of-phase cleanup pass | Optional at phase boundary | None |
@@ -35,7 +35,7 @@ Per `.claude/library/LIB-PRINCIPLES.md` P8 (agent separation of duties), every i
 5. (Optional) Dispatch Test Helper + Critic if stage boundary
 6. Push the feature branch and open a PR to main
 7. CI runs security-review + grumpy-review on the PR
-8. Any finding → fix-Coder dispatch → push → CI re-runs (repeat until both PASS)
+8. Any blocking finding (CRITICAL, HIGH, MEDIUM) → fix-Coder dispatch → push → CI re-runs (repeat until both jobs pass); non-blocking LOW/NIT findings become cards
 9. Owner merges once both jobs pass on the PR head
 ```
 
@@ -61,8 +61,8 @@ Every dispatch prompt must name:
 
 Reference: `~/.claude/library/PEAS.md`
 
-## P9 zero-tolerance gate
+## P9 review gate
 
-Every PR to `main` runs two CI jobs, `security-review` and `grumpy-review` (`.github/workflows/p9-review.yml`). Each fails unless its reviewer writes `p9-verdict.json` with verdict `PASS` and an empty `findings` list. The local pre-push signoff hook and `.git/reviews/` signoffs are retired (terms-analysis#191). Only the owner can waive a finding, at merge time.
+Every PR to `main` runs two CI jobs, `security-review` and `grumpy-review` (`.github/workflows/p9-review.yml`). Each fails when its reviewer reports a `CRITICAL`, `HIGH` or `MEDIUM` finding, or writes no valid `p9-verdict.json` (owner decision 2026-10-09). `LOW` and `NIT` findings do not fail the job; they are posted inline and printed by the gate as non-blocking so they can be filed as cards. The local pre-push signoff hook and `.git/reviews/` signoffs are retired (terms-analysis#191). Only the owner can waive a finding, at merge time.
 
 See `automations/p9-pre-push.md` for the workflow, the verdict contract and the owner setup steps.

@@ -105,9 +105,15 @@ When the review is complete, do exactly these two things.
    - `severity` is one of `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`.
    - `file` is repo-relative; `line` is an integer (use `0` when no line applies).
    - `PASS` means zero findings. Any finding means `FAIL`.
+   - Blocking severities: `CRITICAL`, `HIGH`, `MEDIUM`.
 
-The job fails unless the file exists, parses, and says `PASS` with an empty
-`findings` list. A missing file fails the job.
+The job fails when the file is missing, does not parse or is off the
+contract, when a `FAIL` lists no findings, or when any finding has a
+blocking severity (owner decision 2026-10-09). A `FAIL` whose findings are
+all `LOW` passes the job; the gate prints those findings as non-blocking so
+they can be filed as cards. Report every finding anyway, inline and in the
+verdict, at its true severity; never change a severity to change the job
+result.
 
 ## Before you say PASS
 

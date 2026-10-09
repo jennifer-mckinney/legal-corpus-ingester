@@ -2,8 +2,11 @@
 """P9 review gate (terms-analysis#191).
 
 Run as the last step of each job in .github/workflows/p9-review.yml, after
-the reviewer has written p9-verdict.json. The job passes only when the file
-is exactly the verdict contract with verdict PASS and an empty findings list.
+the reviewer has written p9-verdict.json. The file must be exactly the
+verdict contract. The job then fails on any finding whose severity is in
+BLOCKING_SEVERITIES (CRITICAL, HIGH, MEDIUM; owner decision 2026-10-09) and
+passes when every finding is LOW or NIT. Non-blocking findings are still
+printed, marked "non-blocking", so they can be filed as cards.
 
 Contract (written by the reviewer, see .github/p9/*.md):
     {"verdict": "PASS" | "FAIL",
@@ -12,8 +15,10 @@ Key sets are exact. severity is one of SEVERITIES (exact spelling), title and
 file are non-blank strings, line is a non-negative int (bool is refused).
 
 Exit codes:
-    0  PASS with zero findings (prints "P9 verdict: PASS, 0 findings")
-    1  the reviewer reported FAIL, or listed findings
+    0  PASS with zero findings (prints "P9 verdict: PASS, 0 findings"), or
+       only non-blocking findings (prints "P9 verdict: <verdict>, <n>
+       finding(s), 0 blocking" and one line per finding, to stdout)
+    1  any blocking finding, or FAIL with no findings listed (to stderr)
     2  the file is missing, unreadable, not JSON, or off the contract
 
 Standard library only, so the step needs nothing installed.
@@ -36,6 +41,10 @@ FINDING_FIELDS = ("severity", "title", "file", "line")
 # security brief stops at LOW. The test suite reads the briefs and checks
 # every tag listed there is accepted here.
 SEVERITIES = frozenset({"CRITICAL", "HIGH", "MEDIUM", "LOW", "NIT"})
+# The only severities that fail the job (owner decision 2026-10-09: block on
+# what matters for correctness, security or acceptance). Every other tag in
+# SEVERITIES passes and is printed as non-blocking.
+BLOCKING_SEVERITIES = frozenset({"CRITICAL", "HIGH", "MEDIUM"})
 # Finding text comes from a model that read untrusted PR content; it is shown
 # in the Actions log one finding per line, so each field is cut to this size.
 MAX_FIELD_CHARS = 200
@@ -124,11 +133,19 @@ def main(argv: list[str]) -> int:
     if verdict == "PASS" and not findings:
         print("P9 verdict: PASS, 0 findings")
         return EXIT_PASS
-    print(f"P9 verdict: {verdict}, {len(findings)} finding(s)", file=sys.stderr)
+    blocking = sum(item["severity"] in BLOCKING_SEVERITIES for item in findings)
+    header = f"P9 verdict: {verdict}, {len(findings)} finding(s), {blocking} blocking"
+    # A FAIL that names nothing gives no reason to pass: fail closed.
+    rejected = blocking > 0 or not findings
+    if not findings:
+        header += "; a FAIL verdict must list its findings"
+    stream = sys.stderr if rejected else sys.stdout
+    print(header, file=stream)
     for item in findings:
         severity, title, file, line = (_clean(item[key]) for key in FINDING_FIELDS)
-        print(f"  - [{severity}] {title} ({file}:{line})", file=sys.stderr)
-    return EXIT_REJECTED
+        mark = "blocking" if item["severity"] in BLOCKING_SEVERITIES else "non-blocking"
+        print(f"  - [{severity}] {title} ({file}:{line}) {mark}", file=stream)
+    return EXIT_REJECTED if rejected else EXIT_PASS
 
 
 if __name__ == "__main__":
