@@ -155,8 +155,16 @@ def test_actionlint_off_ci_skips_and_under_ci_fails_without_the_binary(
         _actionlint()
     for value in ("true", "1"):
         monkeypatch.setenv("CI", value)
-        with pytest.raises(pytest.fail.Exception, match="not on PATH under CI"):
+        # Catch the skip outcome too: inside pytest.raises an escaping skip
+        # would mark this test skipped instead of failing it.
+        try:
             _actionlint()
+        except pytest.fail.Exception as exc:
+            assert "not on PATH under CI" in str(exc)
+        except pytest.skip.Exception:
+            pytest.fail(f"CI={value}: a missing actionlint skipped instead of failing")
+        else:
+            pytest.fail(f"CI={value}: a missing actionlint was not reported")
 
 
 # Helpers: run one workflow step's shell with fakes --------------------------
