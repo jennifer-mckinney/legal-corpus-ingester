@@ -40,7 +40,8 @@ pinned to a full 40-character commit SHA; the workflow file holds the pin of rec
 | Action | Version | Used in | Product dependency rules (C3/C7) |
 |--------|---------|---------|----------------------------------|
 | `anthropics/claude-code-action` | v1, SHA-pinned | `.github/workflows/p9-review.yml` (P9 security + grumpy review jobs) | Exempt under ADR-015 (`docs/adr/015-dependency-rules-scope-ci-review-tooling.md`) while its four conditions hold: SHA pin, read-only tool allowlist, GitHub-hosted runners with no product data beyond the PR diff, not in the artifact |
-| `actions/checkout` | v4.2.2 / v6, SHA-pinned | `.github/workflows/ci.yml`, `.github/workflows/p9-review.yml` | Outside the product data path that ADR-015 scopes C3/C7 to; checks out the repository only |
+| `actions/checkout` | v4.2.2 / v6, SHA-pinned | `.github/workflows/approval-expiry.yml`, `.github/workflows/ci.yml`, `.github/workflows/health.yml`, `.github/workflows/p9-review.yml`, `.github/workflows/refresh.yml`, `.github/workflows/vcr-drift.yml` | Outside the product data path that ADR-015 scopes C3/C7 to; checks out the repository only |
+| `actions/upload-artifact` | v4.6.1, SHA-pinned | `.github/workflows/ci.yml`, `.github/workflows/health.yml`, `.github/workflows/refresh.yml`, `.github/workflows/vcr-drift.yml` | Outside the product data path that ADR-015 scopes C3/C7 to; uploads CI logs and reports as workflow artifacts only |
 
 ## excluded-packages
 
