@@ -151,8 +151,15 @@ class TestValidateRoundTripConsumer:
         assert "terms-analysis error" in result.output
 
     @staticmethod
-    def _make_consumer_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-        """Make the terms-analysis consumer import raise ModuleNotFoundError."""
+    def _make_consumer_missing(
+        monkeypatch: pytest.MonkeyPatch,
+        missing: str | None = "backend.app.services.legal_kb",
+    ) -> None:
+        """Make the terms-analysis consumer import raise ModuleNotFoundError.
+
+        ``missing`` is the exception's ``name``, as Python sets it: the module
+        that could not be found, which may be a dependency of the consumer.
+        """
         # Remove any stubs that may have been installed in prior tests
         for key in (
             "backend",
@@ -169,7 +176,7 @@ class TestValidateRoundTripConsumer:
 
         def _raise_for_legal_kb(name: str, *args: object, **kwargs: object) -> object:
             if name == "backend.app.services.legal_kb":
-                raise ModuleNotFoundError(f"No module named {name!r}")
+                raise ModuleNotFoundError(f"No module named {missing!r}", name=missing)
             return original_import_module(name, *args, **kwargs)  # type: ignore[arg-type]
 
         monkeypatch.setattr(importlib, "import_module", _raise_for_legal_kb)
@@ -200,3 +207,54 @@ class TestValidateRoundTripConsumer:
         assert result.exit_code == 0, result.output
         assert "not installed" in result.output
         assert "VALID (consumer check skipped)" in result.output
+
+    @pytest.mark.parametrize(
+        "missing", ["backend", "backend.app", "backend.app.services"]
+    )
+    def test_missing_consumer_package_prefix_is_an_absent_consumer(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str
+    ) -> None:
+        """Any missing package on the consumer's own path means it is not installed."""
+        bundle = _make_bundle(tmp_path)
+        self._make_consumer_missing(monkeypatch, missing)
+
+        result = runner.invoke(app, ["validate-round-trip", str(bundle)])
+        assert result.exit_code == cli.EXIT_CONSUMER_SKIPPED, result.output
+
+        result = runner.invoke(
+            app, ["validate-round-trip", str(bundle), "--allow-missing-consumer"]
+        )
+        assert result.exit_code == 0, result.output
+        assert "VALID (consumer check skipped)" in result.output
+
+    # Copilot PR #27: a dependency missing INSIDE an installed consumer is a broken
+    # consumer, not an absent one; the opt-out must not turn it into a VALID verdict.
+    @pytest.mark.parametrize(
+        "missing",
+        [
+            "numpy",
+            "backend.app.services.legal_kb.store",
+            "backend.app.services.legal_kb_extra",
+            "backendx",
+            None,
+        ],
+    )
+    @pytest.mark.parametrize("opt_out", [False, True])
+    def test_missing_dependency_inside_consumer_is_an_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        missing: str | None,
+        opt_out: bool,
+    ) -> None:
+        bundle = _make_bundle(tmp_path)
+        self._make_consumer_missing(monkeypatch, missing)
+
+        args = ["validate-round-trip", str(bundle)]
+        if opt_out:
+            args.append("--allow-missing-consumer")
+        result = runner.invoke(app, args)
+        assert result.exit_code == 1, result.output
+        assert "X-Corpus-Mismatch: terms-analysis error" in result.output
+        assert "VALID" not in result.output
+        assert "not installed" not in result.output
