@@ -93,6 +93,61 @@ def test_interactions_error_messages() -> None:
     assert "no interactions" in str(vdr._interactions_error({"interactions": []}))
 
 
+# Copilot PR #25: a non-empty interactions list whose entries, request,
+# response or status are not mappings made diff_cassette raise AttributeError,
+# which crashed the whole report instead of listing a parse error.
+_NESTED_SHAPES: dict[str, Any] = {
+    "null-interaction": {"interactions": [None]},
+    "str-interaction": {"interactions": ["bad"]},
+    "str-request": {"interactions": [{"request": "bad", "response": _ix()["response"]}]},
+    "list-request": {"interactions": [{"request": ["x"], "response": _ix()["response"]}]},
+    "str-response": {"interactions": [{"request": _ix()["request"], "response": "bad"}]},
+    "str-status": {
+        "interactions": [{"request": _ix()["request"], "response": {"status": "bad"}}]
+    },
+    "null-status": {
+        "interactions": [{"request": _ix()["request"], "response": {"status": None}}]
+    },
+    "second-entry-bad": {"interactions": [_ix(), None]},
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_NESTED_SHAPES))
+@pytest.mark.parametrize("side", ["baseline", "current"])
+def test_malformed_nested_interaction_is_parse_error(
+    tmp_path: Path, shape: str, side: str
+) -> None:
+    good = {"interactions": [_ix(), _ix()]}
+    bad = _NESTED_SHAPES[shape]
+    b, c = (bad, good) if side == "baseline" else (good, bad)
+    bdir, cdir = _pair(tmp_path, b, c)
+    report, any_drift, compared = vdr.generate_report_with_count(bdir, cdir)
+    assert (any_drift, compared) == (True, 0)
+    assert "Parse errors" in report
+    assert f"{side}/x.yaml" in report
+    assert "interaction " in str(vdr._interactions_error(bad))
+
+
+def test_malformed_cassette_does_not_hide_drift_in_other_pairs(tmp_path: Path) -> None:
+    """One bad cassette is a parse error; the other pairs are still diffed."""
+    bdir, cdir = _pair(tmp_path, _NESTED_SHAPES["null-interaction"], {"interactions": [_ix()]})
+    _write(bdir / "ok.yaml", {"interactions": [_ix(body="old")]})
+    _write(cdir / "ok.yaml", {"interactions": [_ix(body="new")]})
+    out = tmp_path / "r.md"
+    code = vdr.main(["--baseline", str(bdir), "--current", str(cdir), "--output", str(out)])
+    assert code == 1
+    text = out.read_text()
+    assert "baseline/x.yaml" in text
+    assert "interaction 0: body changed" in text
+
+
+def test_absent_or_null_request_response_still_compares() -> None:
+    """Absent/null request or response keep the existing tolerant comparison."""
+    assert vdr._interactions_error({"interactions": [{}]}) is None
+    assert vdr._interactions_error({"interactions": [{"request": None, "response": None}]}) is None
+    assert vdr._interactions_error({"interactions": [{"response": {"body": "x"}}]}) is None
+
+
 # ---------------------------------------------------------------------------
 # grumpy #6: status drift is its own class
 # ---------------------------------------------------------------------------
