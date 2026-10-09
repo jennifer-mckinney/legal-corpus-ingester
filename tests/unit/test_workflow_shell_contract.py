@@ -104,6 +104,34 @@ def broad_token_scopes(doc: dict[str, Any]) -> list[str]:
     return found
 
 
+# `gh` in command position (bare or by path), not part of a longer word or variable name.
+_GH_CALL = re.compile(r"(?<![\w.$-])gh(?=[ \t;|&)]|$)", re.MULTILINE)
+
+
+def _invokes_gh(run: str) -> bool:
+    """True if a `run:` script calls `gh`; whole-line shell comments are ignored."""
+    code = "\n".join(line for line in run.splitlines() if not line.lstrip().startswith("#"))
+    return bool(_GH_CALL.search(code))
+
+
+def gh_steps_without_token(doc: dict[str, Any]) -> list[str]:
+    """`run:` steps that call `gh` with no non-empty GH_TOKEN in step, job or workflow env.
+
+    Job- and workflow-level tokens count as available here; whether a workflow may put
+    the token there is broad_token_scopes' contract, checked separately.
+    """
+    wf_env = doc.get("env") or {}
+    missing = []
+    for job_name, job, step in _steps(doc):
+        if not _invokes_gh(str(step.get("run") or "")):
+            continue
+        # Step env overrides job env, which overrides workflow env.
+        env = {**wf_env, **(job.get("env") or {}), **(step.get("env") or {})}
+        if not str(env.get("GH_TOKEN") or "").strip():
+            missing.append(_step_label(job_name, step))
+    return missing
+
+
 def checkouts_persisting_credentials(doc: dict[str, Any]) -> list[str]:
     """`actions/checkout` steps that do not set `persist-credentials: false`."""
     bad = []
@@ -222,6 +250,43 @@ def test_token_scope_checkers_catch_mutations() -> None:
     assert broad_token_scopes(doc) == ["workflow env: GITHUB_TOKEN", "job j env: GH_TOKEN"]
     # The quoted string "false" is not the YAML boolean and is flagged.
     assert len(checkouts_persisting_credentials(doc)) == 2
+
+
+@pytest.mark.parametrize("path", _params(xfail_vcr=False))
+def test_every_gh_step_has_gh_token(path: Path) -> None:
+    # Moving the token from job to step level must not strand a `gh` step without it:
+    # gh then fails auth and the alert never fires (PR #26/#27 review).
+    missing = gh_steps_without_token(_load(path))
+    assert not missing, f"{path.name}: steps call `gh` without GH_TOKEN: {missing}"
+
+
+def test_gh_token_checker_catches_mutations() -> None:
+    tok = {"GH_TOKEN": "${{ github.token }}"}
+    doc = {
+        "jobs": {
+            "j": {
+                "env": {"ISSUE_LABEL": "x"},
+                "steps": [
+                    {"name": "bare", "run": "gh issue list"},
+                    {"name": "subshell", "run": 'n=$(gh issue list --json number)'},
+                    {"name": "after-if", "run": "if ! gh api x; then exit 1; fi"},
+                    {"name": "path", "run": "/usr/bin/gh api x"},
+                    {"name": "line-end", "run": "command -v gh"},
+                    {"name": "empty", "env": {"GH_TOKEN": ""}, "run": "gh api x"},
+                    {"name": "other-var", "env": {"GITHUB_TOKEN": "t"}, "run": "gh api x"},
+                    {"name": "scoped", "env": tok, "run": "gh issue create"},
+                    {"name": "comment", "run": "# gh issue create runs later\necho hi"},
+                    {"name": "words", "run": "echo ghost sigh gh_x gh-y $gh x.gh"},
+                    {"uses": "actions/checkout@abc"},
+                ],
+            },
+            "k": {"env": tok, "steps": [{"name": "job-env", "run": "gh api x"}]},
+        },
+    }
+    assert gh_steps_without_token(doc) == [
+        "j: bare", "j: subshell", "j: after-if", "j: path", "j: line-end", "j: empty", "j: other-var",
+    ]
+    assert gh_steps_without_token({"env": tok, **doc}) == ["j: empty"]
 
 
 # ---------------------------------------------------------------------------
