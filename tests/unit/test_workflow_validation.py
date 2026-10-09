@@ -458,3 +458,30 @@ def test_issue_workflow_files_issues_under_the_label_preflight_checked(name: str
     text = (WORKFLOWS_DIR / name).read_text()
     assert f'"{label}"' not in text, "label restated as a literal; use $ISSUE_LABEL"
     assert '--label "$ISSUE_LABEL"' in text
+
+
+# 5. The expiry issue is filed only for a real expiry ------------------------
+
+APPROVAL_WORKFLOW = WORKFLOWS_DIR / "approval-expiry.yml"
+APPROVAL_JOB = ISSUE_WORKFLOWS["approval-expiry.yml"][0]
+APPROVAL_CHECK_STEP = "Run approval check"
+EXPIRY_ISSUE_STEP = "Open issue on expiry"
+
+
+def test_expiry_issue_step_runs_only_when_the_approval_check_failed() -> None:
+    """A Preflight (or install) failure must fail the job without filing an
+    expiry issue, so the issue step keys on the check step's own outcome."""
+    check_id = _step(APPROVAL_WORKFLOW, APPROVAL_JOB, APPROVAL_CHECK_STEP).get("id")
+    assert check_id, f"{APPROVAL_CHECK_STEP!r} has no id to key the issue step on"
+    cond = str(_step(APPROVAL_WORKFLOW, APPROVAL_JOB, EXPIRY_ISSUE_STEP).get("if", ""))
+    assert cond == f"failure() && steps.{check_id}.outcome == 'failure'", cond
+
+
+@pytest.mark.parametrize("name", sorted(ISSUE_WORKFLOWS))
+def test_issue_workflow_steps_do_not_restate_job_env(name: str) -> None:
+    """A step-level copy of a job env key has no effect and drifts (one source)."""
+    job, _ = ISSUE_WORKFLOWS[name]
+    job_env = set(_job(WORKFLOWS_DIR / name, job).get("env", {}))
+    for step in _job(WORKFLOWS_DIR / name, job)["steps"]:
+        dup = job_env & set(step.get("env", {}))
+        assert not dup, f"{name}: step {step.get('name')!r} restates job env {sorted(dup)}"
