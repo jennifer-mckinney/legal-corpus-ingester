@@ -207,6 +207,26 @@ def _interactions_error(data: Any) -> str | None:
         return f"'interactions' is not a list (got {type(interactions).__name__})"
     if not interactions:
         return "no interactions in cassette"
+    # diff_cassette() calls .get() on each interaction, its request/response
+    # and the response status, so any of those that is present but not a
+    # mapping is a parse error here, never an AttributeError that crashes the
+    # whole report (Copilot PR #25). Absent or null request/response keep the
+    # existing tolerant comparison; a present status must be a mapping.
+    for idx, ix in enumerate(interactions):
+        if not isinstance(ix, dict):
+            return f"interaction {idx} is not a mapping (got {type(ix).__name__})"
+        for part in ("request", "response"):
+            value = ix.get(part)
+            if value is not None and not isinstance(value, dict):
+                return f"interaction {idx} {part} is not a mapping (got {type(value).__name__})"
+        response = ix.get("response")
+        if isinstance(response, dict) and "status" in response:
+            status = response["status"]
+            if not isinstance(status, dict):
+                return (
+                    f"interaction {idx} response status is not a mapping"
+                    f" (got {type(status).__name__})"
+                )
     return None
 
 
