@@ -1,0 +1,25 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.14.3, pytest-9.1.1, pluggy-1.6.0
+rootdir: <path>
+configfile: pyproject.toml
+plugins: recording-0.13.4, cov-7.1.0, anyio-4.14.1, syrupy-5.4.0
+collected 23 items
+
+tests/unit/test_vcr_canary_contract.py .......FFFFFFFFF..FFFFF           [100%]
+
+=========================== short test summary info ============================
+FAILED tests/unit/test_vcr_canary_contract.py::test_e1_rerecord_step_uses_rewrite_mode
+FAILED tests/unit/test_vcr_canary_contract.py::test_e2_rerecord_replaces_cassette_with_exactly_one_new_interaction
+FAILED tests/unit/test_vcr_canary_contract.py::test_f1_zero_interaction_cassette_pair_exits_nonzero[non-dict]
+FAILED tests/unit/test_vcr_canary_contract.py::test_f1_zero_interaction_cassette_pair_exits_nonzero[empty-list]
+FAILED tests/unit/test_vcr_canary_contract.py::test_f1_zero_interaction_cassette_pair_exits_nonzero[null]
+FAILED tests/unit/test_vcr_canary_contract.py::test_f1_zero_interaction_cassette_pair_exits_nonzero[missing-key]
+FAILED tests/unit/test_vcr_canary_contract.py::test_f2_report_is_bounded_and_marked_truncated
+FAILED tests/unit/test_vcr_canary_contract.py::test_f3_upstream_text_is_contained_in_a_long_enough_fence
+FAILED tests/unit/test_vcr_canary_contract.py::test_f4_status_code_drift_is_reported_distinctly
+FAILED tests/unit/test_vcr_canary_contract.py::test_g2_vcr_config_scrubs_set_cookie_from_recorded_responses
+FAILED tests/unit/test_vcr_canary_contract.py::test_h1_checkout_does_not_persist_credentials
+FAILED tests/unit/test_vcr_canary_contract.py::test_h2_issue_step_checks_for_existing_open_issue_first
+FAILED tests/unit/test_vcr_canary_contract.py::test_h3_no_or_true_in_any_run_step
+FAILED tests/unit/test_vcr_canary_contract.py::test_h4_exit_2_is_not_titled_drift_detected
+========================= 14 failed, 9 passed in 2.21s =========================

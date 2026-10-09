@@ -32,7 +32,7 @@ parse → chunk → embed → serialize → deserialize → terms-analysis retri
 - Location: `tests/fixtures/cassettes/<source_id>/` (e.g., `cassettes/eurlex/`, `cassettes/lii/`)
 - Recorded once in development with `record_mode='new_episodes'`
 - CI uses `record_mode='none'` — hard failure if cassette missing
-- Weekly drift canary re-records with `--vcr-record=all` against live upstream (see ADR-013)
+- Weekly drift canary re-records with `--record-mode=rewrite` against live upstream (see ADR-013)
 
 ### Sample corpus
 - Location: `tests/fixtures/corpus/`
@@ -94,7 +94,7 @@ ADR-013.
 cron: "0 4 * * 0"   # Sunday 4am
 ```
 
-Run: `pytest tests/integration/ --vcr-record=all`
+Run: `pytest tests/integration/ --record-mode=rewrite`
 
 Behavior:
 - Re-records all VCR cassettes against live upstream sources

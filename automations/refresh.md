@@ -21,16 +21,21 @@ invalid bundle.
 ## What it does
 
 The `refresh` job runs these steps in order. Checkout uses
-`persist-credentials: false` and no job-level token is set; only the issue step gets
-`GH_TOKEN` (terms-analysis#90).
+`persist-credentials: false` and no job-level token is set; only the Preflight and
+issue steps get `GH_TOKEN` (terms-analysis#90).
 
-1. **Run refresh.** Calls `ingester refresh --all` inside the virtualenv, under the
+1. **Preflight.** Fails the run with an `::error::` annotation when the runner has
+   no `gh` CLI or the `corpus-refresh` issue label cannot be read, and names the
+   fix (`gh label create corpus-refresh`). The label is set once, as the job's
+   `ISSUE_LABEL`, and step 4 files under it.
+
+2. **Run refresh.** Calls `ingester refresh --all` inside the virtualenv, under the
    workflow-level `bash -eo pipefail` shell. Any non-zero exit fails the job, including
    2 (`EXIT_NO_SOURCES`: `config/sources/` is tracked, so an empty registry means a
    broken checkout) and 3 (`EXIT_NOT_WIRED`: intentionally red until G2 wires the
    orchestrator; terms-analysis#90).
 
-2. **Detect bundle change.** Runs `scripts/detect_bundle_change.py detect`. It reads
+3. **Detect bundle change.** Runs `scripts/detect_bundle_change.py detect`. It reads
    the bundle `out/current` points at and fingerprints it (SHA256 of its
    `checksums.txt` lines, leaving out run-metadata `MANIFEST.yaml`). It compares the
    version and fingerprint with the record of the last announced bundle, kept in
@@ -42,7 +47,7 @@ The `refresh` job runs these steps in order. Checkout uses
    run as a change. If refresh succeeded but `out/current` is missing, or the version
    or `checksums.txt` is invalid, the step exits 1. It does not report "no change".
 
-3. **Open issue on corpus change.** Runs only when `changed=true`. Creates the
+4. **Open issue on corpus change.** Runs only when `changed=true`. Creates the
    `corpus-refresh` label first (`gh label create --force`, idempotent; a real error
    fails the step). Then creates a GitHub issue titled
    `Weekly corpus refresh -- YYYY-MM-DD` with the bundle version and run ID in the
@@ -51,10 +56,10 @@ The `refresh` job runs these steps in order. Checkout uses
    updating the terms-analysis consumer. If a `corpus-refresh` issue is already open, no
    duplicate is created; the step comments on it naming the new bundle version instead.
 
-4. **Record announced bundle.** Runs `scripts/detect_bundle_change.py record` only
+5. **Record announced bundle.** Runs `scripts/detect_bundle_change.py record` only
    after the issue step succeeded. A failed alert is therefore retried on the next run.
 
-5. **Upload health report.** Uploads `out/health/` as a GitHub Actions artifact named
+6. **Upload health report.** Uploads `out/health/` as a GitHub Actions artifact named
    `health-report-<run_id>`. This step runs with `if: always()` so the artifact is
    preserved even when earlier steps fail.
 

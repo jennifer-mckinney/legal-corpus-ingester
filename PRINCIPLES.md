@@ -46,7 +46,7 @@ ADR markdown files land in `docs/adr/` during Phase 0.1.
 | ADR-010 | Grace-period tripwire = **pure function + YAML index** | `resolve_status(chunk, today)` pure; `state/tripwires.yaml` for observability only, never authoritative |
 | ADR-011 | Retention policy = **4 weekly + 12 monthly + quarterly forever** | `--dry-run` gate; refuse to prune `out/current` symlink target |
 | ADR-012 | Runtime handoff = **atomic symlink flip + SIGHUP** | `POST /reload` as fallback under uvicorn `--workers` > 1 |
-| ADR-013 | External-source testing = **VCR.py cassettes** | `record_mode='none'` in CI; weekly `--vcr-record=all` schema-drift canary |
+| ADR-013 | External-source testing = **VCR.py cassettes** | `record_mode='none'` in CI; weekly `--record-mode=rewrite` schema-drift canary |
 | ADR-014 | Consumer verification = **MANIFEST field assertions** | `LegalKnowledgeBase.load_from_bundle()` asserts chunker_version / embedder_model / embedder_revision; mismatch → HTTP 503 + `X-Corpus-Mismatch` header |
 
 ---

@@ -46,7 +46,10 @@ _WORKFLOW_FILES = sorted(_WORKFLOWS_DIR.glob("*.yml")) + sorted(_WORKFLOWS_DIR.g
 # vcr-drift.yml is owned by feat/g0-3-vcr-canary (terms-analysis#92), which adds the
 # pipefail default, in-step label creation and persist-credentials: false. strict=True
 # turns each xfail into a failure once that branch merges, so whichever branch merges
-# second must drop the markers in the merge commit.
+# second must drop the markers in the merge commit. Dropped for pipefail and
+# persist-credentials when G0-3 merged; the label check stays xfail because
+# vcr-drift.yml creates its labels in a loop over `$name`, which labels_not_created
+# cannot trace.
 _VCR_DRIFT_XFAIL = pytest.mark.xfail(strict=True, reason="fixed on feat/g0-3-vcr-canary, terms-analysis#92")
 
 
@@ -154,14 +157,14 @@ def test_workflow_is_valid_yaml(path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("path", _params(xfail_vcr=True))
+@pytest.mark.parametrize("path", _params(xfail_vcr=False))
 def test_workflow_default_shell_is_pipefail(path: Path) -> None:
     assert _default_shell(_load(path)) == _REQUIRED_SHELL, (
         f"{path.name} lacks workflow-level `defaults.run.shell: {_REQUIRED_SHELL}`"
     )
 
 
-@pytest.mark.parametrize("path", _params(xfail_vcr=True))
+@pytest.mark.parametrize("path", _params(xfail_vcr=False))
 def test_every_piped_step_runs_with_pipefail(path: Path) -> None:
     unguarded = unguarded_piped_steps(_load(path))
     assert not unguarded, f"{path.name}: piped steps whose effective shell lacks pipefail: {unguarded}"
@@ -203,7 +206,7 @@ def test_github_token_is_only_step_scoped(path: Path) -> None:
     assert not broad, f"{path.name}: token exposed beyond the step that needs it: {broad}"
 
 
-@pytest.mark.parametrize("path", _params(xfail_vcr=True))
+@pytest.mark.parametrize("path", _params(xfail_vcr=False))
 def test_checkout_does_not_persist_credentials(path: Path) -> None:
     bad = checkouts_persisting_credentials(_load(path))
     assert not bad, f"{path.name}: checkout without `persist-credentials: false`: {bad}"
