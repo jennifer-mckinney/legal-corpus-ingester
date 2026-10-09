@@ -20,32 +20,37 @@ invalid bundle.
 
 ## What it does
 
-The `refresh` job runs five steps in order:
+The `refresh` job runs six steps in order:
 
-1. **Record pre-refresh bundle target.** Reads `readlink out/current` before the
+1. **Preflight.** Fails the run with an `::error::` annotation when the runner has
+   no `gh` CLI or the `corpus-refresh` issue label cannot be read, and names the
+   fix (`gh label create corpus-refresh`). The label is set once, as the job's
+   `ISSUE_LABEL`, and step 5 files under it.
+
+2. **Record pre-refresh bundle target.** Reads `readlink out/current` before the
    refresh starts and saves the result to `GITHUB_OUTPUT` as `target`. If
    `out/current` does not yet exist (fresh install), `target` is set to the empty
    string.
 
-2. **Run refresh.** Calls `ingester refresh --all` inside the virtualenv. If the
+3. **Run refresh.** Calls `ingester refresh --all` inside the virtualenv. If the
    command exits non-zero because no sources are configured or because of a transient
    error that `ingester` already handled, the step swallows the failure and exits 0
    to keep the workflow green. Hard failures (Python exceptions, missing config) are
    still surfaced through the step's stderr output.
 
-3. **Detect bundle change.** Reads `readlink out/current` again and compares it to
+4. **Detect bundle change.** Reads `readlink out/current` again and compares it to
    the pre-refresh value. Also runs `git status --porcelain out/ state/` to catch
    any uncommitted changes (new checkpoint files, updated manifest) that indicate
    ingest activity even when the symlink did not move. Sets `changed=true` if either
    check sees a difference.
 
-4. **Open issue on corpus change.** Runs only when `changed=true`. Creates a GitHub
+5. **Open issue on corpus change.** Runs only when `changed=true`. Creates a GitHub
    issue titled `Weekly corpus refresh -- YYYY-MM-DD` with the bundle version and run
    ID in the body. The issue instructs the operator to run
    `ingester validate-round-trip out/current` before updating the terms-analysis
    consumer.
 
-5. **Upload health report.** Uploads `out/health/` as a GitHub Actions artifact named
+6. **Upload health report.** Uploads `out/health/` as a GitHub Actions artifact named
    `health-report-<run_id>`. This step runs with `if: always()` so the artifact is
    preserved even when earlier steps fail.
 

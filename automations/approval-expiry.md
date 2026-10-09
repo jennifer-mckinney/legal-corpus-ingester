@@ -56,6 +56,11 @@ during normal operation.
 
 ## Failure mode
 
+Before any check runs, a `Preflight` step fails the run with an `::error::`
+annotation when the runner has no `gh` CLI or the `approval-expiry` issue label
+cannot be read, and names the fix (`gh label create approval-expiry`). The label
+is set once, as the job's `ISSUE_LABEL`, and the issue step files under it.
+
 If `check_approvals.py` exits 1 (expired approval detected), the `Run approval
 check` step is marked failed and the `Open issue on expiry` step fires. The workflow
 job itself ends in failure, making the problem visible in the Actions summary without
