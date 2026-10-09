@@ -27,7 +27,7 @@ pip install -e '.[dev]'      # pyproject.toml lands at Phase 0.1 Task 2
 ## Post-install verification
 
 ```bash
-bash scripts/install-hooks.sh          # pre-commit + pre-push hooks
+bash scripts/install-hooks.sh          # pre-commit hook (P9 review runs in CI)
 bash scripts/governance/verify-hashes.sh  # governance manifest intact
 docker build -t legal-corpus-ingester:dev .  # Docker baseline
 ```

@@ -12,7 +12,7 @@ Each file documents: trigger, artifact produced, failure mode, and escalation pa
 | `docker.md` | Build | Docker build automation |
 | `self-hosted-runner.md` | Setup | GitHub Actions self-hosted runner |
 | `secrets.md` | Configuration | Secrets management |
-| `p9-pre-push.md` | `git push` | P9 security + grumpy pre-push gate |
+| `p9-pre-push.md` | GitHub PR to `main` | P9 security + grumpy review CI jobs (`p9-review.yml`) |
 | `health-check.md` | Cron 3 AM UTC daily | Nightly corpus health check |
 | `refresh.md` | Cron Sun 3 AM UTC | Weekly corpus refresh |
 | `vcr-drift.md` | Cron Sun 4 AM UTC | Weekly VCR cassette drift canary |
