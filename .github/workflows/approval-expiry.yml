@@ -53,8 +53,10 @@ jobs:
           fi
           python scripts/check_approvals.py --approvals-dir config/approvals
 
+      # Only a failed approval check means an expiry. A Preflight or install
+      # failure still fails the job, but files no false expiry alert.
       - name: Open issue on expiry
-        if: failure()
+        if: failure() && steps.approval_check.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

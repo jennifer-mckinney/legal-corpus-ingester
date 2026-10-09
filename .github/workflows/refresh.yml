@@ -24,8 +24,6 @@ jobs:
       # Fail loudly up front when the runner lacks gh or the issue label is
       # missing, instead of failing only when an issue must be filed (#21).
       - name: Preflight
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           if ! command -v gh >/dev/null 2>&1; then
             echo "::error::gh CLI not found on the runner; install it and restart the runner service" >&2
@@ -101,7 +99,6 @@ jobs:
           BUNDLE_VER: ${{ steps.detect_change.outputs.new_target }}
           RUN_ID: ${{ github.run_id }}
           EVENT_NAME: ${{ github.event_name }}
-          GH_TOKEN: ${{ github.token }}
         run: |
           open_count=$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq 'length') || {
             echo "Warning: gh issue list failed; creating issue unconditionally." >&2
