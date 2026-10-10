@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Give the ingester a reproducible container image and a compose file that stands up LocalAI as a sibling service. The image is the deployable unit for CI, self-hosted runners, and any future container platform. Compose is the local convenience wrapper that removes the "where is LocalAI running" question during development.
+Give the ingester a reproducible container image and a compose file that stands up LocalAI as a sibling service. The image is the deployable unit for CI on GitHub-hosted runners (ADR-016) and any future container platform. Compose is the local convenience wrapper that removes the "where is LocalAI running" question during development.
 
 ## Image layout
 

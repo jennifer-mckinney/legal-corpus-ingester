@@ -53,9 +53,15 @@ def _run_step(workspace: Path, tmp_path: Path) -> subprocess.CompletedProcess[st
     script_path = tmp_path / "step.sh"
     script_path.write_text(script)
     # `python` on PATH resolves to the interpreter running the suite, as the venv does on the runner.
+    # A wrapper that execs sys.executable by its own path, not a symlink to it: Python locates
+    # pyvenv.cfg next to the path it was invoked as, so a symlink from elsewhere silently drops
+    # the venv and runs the base interpreter (no pyyaml on a GitHub-hosted runner; the laptop's
+    # Homebrew python masked this, #19).
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    (bindir / "python").symlink_to(sys.executable)
+    wrapper = bindir / "python"
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
     env = dict(os.environ)
     env["PATH"] = str(bindir) + os.pathsep + env.get("PATH", "")
     argv = [part.replace("{0}", str(script_path)) for part in shlex.split(shell)]

@@ -340,6 +340,8 @@ def test_refresh_detects_change_from_durable_record_not_pre_checkout_symlink() -
     assert "pre_refresh" not in text
     _, detect = _step_by_name(doc, "Detect bundle change")
     assert "scripts/detect_bundle_change.py detect" in detect["run"]
+    # ADR-016/#71: on a hosted runner a missing record must be a red run, never an announce.
+    assert "--require-state" in detect["run"]
     issue_idx, _ = _step_by_name(doc, "Open issue on corpus change")
     record_idx, record = _step_by_name(doc, "Record announced bundle")
     # The record is written only after the alert step, and only when it ran.

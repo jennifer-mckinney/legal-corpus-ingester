@@ -29,7 +29,7 @@ rule: no tools/services from companies facing investor lawsuits; no Meta-origin 
 rule: every dependency added passes .claude/skills/dependency-audit before merge
 
 ### HR4: local-only-data
-rule: all corpus data stays local; self-hosted GitHub Actions runner (never GitHub-hosted)
+rule: all corpus data stays local to the pipeline's configured output; CI runs on GitHub-hosted ubuntu-latest runners (ADR-016)
 
 ### HR5: fail-loud-on-source-drift
 rule: 404 / schema change / license SPDX drift halts the affected source and emits ALERTS.md; never silent shorter corpus
@@ -109,7 +109,6 @@ owner_steps: add the `ANTHROPIC_API_KEY` repo secret; after the first green run,
 | Structured logging contract | all modules | `automations/logging.md` |
 | Docker skeleton | `docker compose up` | `automations/docker.md` |
 | Secrets management | `.env` loading | `automations/secrets.md` |
-| Self-hosted runner | launchd service | `automations/self-hosted-runner.md` |
 | Weekly VCR drift canary | Cron Sun 4 AM UTC | `automations/vcr-drift.md` |
 | Nightly health check | Cron 3 AM UTC daily | `automations/health-check.md` |
 

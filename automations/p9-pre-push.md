@@ -15,7 +15,7 @@ Workflow: `.github/workflows/p9-review.yml`.
   ready_for_review). Not `pull_request_target`, so the PR's code never runs
   with the base repository's secrets.
 - **Jobs:** `security-review` and `grumpy-review`, on GitHub-hosted
-  `ubuntu-latest` (not this repo's self-hosted runner). Each job:
+  `ubuntu-latest` (as is every workflow in this repo since ADR-016). Each job:
   1. checks out the PR with full history (`actions/checkout`, pinned by
      commit SHA, `fetch-depth: 0`);
   2. deletes any `p9-verdict.json` committed in the PR and copies

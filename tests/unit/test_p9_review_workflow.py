@@ -57,7 +57,9 @@ EXIT_INVALID = 2  # missing, unreadable, malformed or off-contract file,
 # independent literal, not read from the gate, so drift either way turns red.
 EXPECTED_BLOCKING = frozenset({"CRITICAL", "HIGH", "MEDIUM"})
 
-ACTION_REPOS = {"actions/checkout", "anthropics/claude-code-action"}
+# Every job uses each of these exactly once: checkout, setup-python (reads
+# .python-version for the verdict gate, terms-analysis#215) and the review action.
+ACTION_REPOS = {"actions/checkout", "actions/setup-python", "anthropics/claude-code-action"}
 # Exact allowlist: file reads, writes to the verdict file only (an Edit rule
 # scopes the Write tool), and the one inline PR-comment MCP tool. No Bash: it
 # could read /proc/*/environ and post the key.
@@ -233,7 +235,7 @@ def test_gate_fails_closed_on_unparseable_file(tmp_path: Path, content: str | by
     assert "is not valid JSON" in proc.stderr
 
 
-# The ingester's CI runs on the self-hosted runner's python3, which may be 3.14
+# The ingester's CI runs the pinned python (.python-version), 3.14 today
 # (terms-analysis#215). Before 3.14 this input raises RecursionError ("is not
 # valid JSON"); 3.14 parses it into a nested list ("does not match the verdict
 # contract"). Either way the gate must fail closed with EXIT_INVALID.
@@ -564,7 +566,7 @@ def test_every_action_is_pinned_to_a_full_sha_with_its_tag() -> None:
         for line in WORKFLOW.read_text(encoding="utf-8").splitlines()
         if re.match(r"\s*(-\s+)?uses:", line)
     ]
-    assert len(uses_lines) == 2 * len(BRIEFS), uses_lines  # checkout + action per job
+    assert len(uses_lines) == len(ACTION_REPOS) * len(BRIEFS), uses_lines  # each action once per job
     seen = set()
     for line in uses_lines:
         match = re.fullmatch(r"(?:-\s+)?uses:\s+([\w.-]+/[\w.-]+)@([0-9a-f]{40})\s+#\s+v\d+(\.\d+)*", line)

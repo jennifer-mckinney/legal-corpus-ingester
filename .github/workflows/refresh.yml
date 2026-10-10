@@ -19,7 +19,7 @@ defaults:
 
 jobs:
   refresh:
-    runs-on: [self-hosted, legal-corpus-ingester]
+    runs-on: ubuntu-latest
     # No job-level GH_TOKEN: only Preflight and the issue step get the token, so
     # Install (third-party build hooks) and Run refresh cannot read it (terms-analysis#90).
     env:
@@ -36,7 +36,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if ! command -v gh >/dev/null 2>&1; then
-            echo "::error::gh CLI not found on the runner; install it and restart the runner service" >&2
+            echo "::error::gh CLI not found on the runner; gh ships on the ubuntu-latest image, so the runner image has changed" >&2
             exit 1
           fi
           if ! gh api "repos/${GITHUB_REPOSITORY}/labels/${ISSUE_LABEL}" --silent; then
@@ -45,7 +45,9 @@ jobs:
           fi
 
       - name: Set up Python
-        run: python3 --version
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version-file: .python-version
 
       - name: Install
         run: |
@@ -66,9 +68,15 @@ jobs:
           # Compares the bundle just published against the record of the last announced
           # one, kept under $XDG_STATE_HOME (else ~/.local/state; outside the checkout, which checkout's clean wipes).
           # Exits 1 if refresh succeeded but published no valid bundle (terms-analysis#90).
+          # The hosted runner's filesystem is discarded after every job (ADR-016), so that
+          # record is absent until state persistence is decided and wired (#71).
+          # --require-state turns a missing record into exit 2 (a red run, no announce)
+          # instead of "changed=true" every week; a wired refresh must never announce and
+          # then forget. Remove the flag only when #71 restores the record before this step.
           python scripts/detect_bundle_change.py detect \
             --bundle-link out/current \
-            --github-output "$GITHUB_OUTPUT"
+            --github-output "$GITHUB_OUTPUT" \
+            --require-state
 
       - name: Open issue on corpus change
         if: steps.detect_change.outputs.changed == 'true'

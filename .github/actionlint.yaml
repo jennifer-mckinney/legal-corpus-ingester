@@ -1,6 +1,6 @@
 # actionlint configuration (legal-corpus-ingester#21).
-# Custom labels of the project's self-hosted runner; actionlint rejects any
-# runs-on label it does not know.
+# Every workflow runs on GitHub-hosted ubuntu-latest (#19), so no custom
+# runner labels are declared. actionlint rejects any runs-on label it does
+# not know, so a self-hosted label added to a workflow fails the lint.
 self-hosted-runner:
-  labels:
-    - legal-corpus-ingester
+  labels: []

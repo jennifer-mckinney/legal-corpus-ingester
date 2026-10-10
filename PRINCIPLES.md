@@ -17,7 +17,7 @@ The ingester is a local-data-only, open-source-only pipeline. Constraints are fi
 | C1 | Fetch runtime permission manifests from external URLs | HR4 — all data stays local; external fetches would leak corpus topology |
 | C2 | Use CC-BY-NC or commercially-restricted dependencies | HR1 — open source only (Apache 2.0 / MIT / BSD / MPL 2.0 / public domain preferred) |
 | C3 | Use packages from companies facing investor lawsuits | HR2 — no Meta-origin (FAISS, etc.), no VC-funded LLM houses. Scope: product runtime and data path only; CI review tooling is exempt per [ADR-015](docs/adr/015-dependency-rules-scope-ci-review-tooling.md) |
-| C4 | Dispatch fetch or embed workloads to remote (GitHub-hosted) runners | HR4 — self-hosted runner only; corpus artifacts must never leave the local machine |
+| C4 | Depend on a self-hosted runner, or on state left on a runner between jobs | HR4 — CI runs on GitHub-hosted `ubuntu-latest` runners per [ADR-016](docs/adr/016-github-hosted-runners.md); corpus data stays local to the pipeline's configured output; runner filesystems are discarded after each job, so refresh/health state needs explicit persistence before refresh is wired |
 | C5 | Call OpenAI or any cloud embedding API | HR6 — local-only LLM inference via LocalAI + Apertus-8B |
 | C6 | Silently publish a shorter corpus on source drift or 404 | HR5 — fail-loud on drift; emit ALERTS.md; halt the affected source |
 | C7 | Accept a dependency with IRP Grade below A | HR3 — every dependency audited via `.claude/skills/dependency-audit` before merge. Scope: product runtime and data path only; CI review tooling is exempt per [ADR-015](docs/adr/015-dependency-rules-scope-ci-review-tooling.md) |

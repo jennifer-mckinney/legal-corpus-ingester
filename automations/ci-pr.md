@@ -11,11 +11,9 @@ The workflow (`.github/workflows/ci.yml`) fires on:
 
 ## Where it runs
 
-Jobs execute on the project's self-hosted runner, matched by label set
-`[self-hosted, legal-corpus-ingester]`. That runner is provisioned per Task P2
-and lives outside the repo. If the labels drift or the runner is offline, jobs
-stay in the `queued` state rather than failing loudly; see the failure-mode
-note below.
+Jobs run on GitHub-hosted `ubuntu-latest` runners (ADR-016). There is no
+runner to provision. If GitHub's hosted capacity is unavailable, jobs stay in
+the `queued` state rather than failing loudly; see the failure-mode note below.
 
 ## Steps
 
@@ -23,7 +21,7 @@ The single `test` job runs these steps sequentially. Every step runs under the w
 command piped into `tail` still fails the step (terms-analysis#90).
 
 1. `actions/checkout@v4` - pulls the ref under test.
-2. `Set up Python` - runs `python3 --version` to confirm the runner's Python is reachable.
+2. `Set up Python` - `actions/setup-python` installs the interpreter named in `.python-version` (the single Python pin) from the hosted runner's tool cache.
 3. `Install` - creates `.venv` and runs `pip install -e '.[dev]'`. Output is tail-truncated to 5 lines.
 4. `Lint` - runs `ruff check .` against the full codebase. Failures block the job.
 5. `Type check` - runs `mypy src/`. Failures block the job.
@@ -57,15 +55,9 @@ For a live tail while a run is in progress, add `--watch` to `gh run view`.
 
 ## Failure modes
 
-- **Job stays `queued`**: usually a `runs-on` label mismatch or an offline
-  runner. Check runner registration and status with:
-
-  ```bash
-  gh api /repos/jennifer-mckinney/legal-corpus-ingester/actions/runners
-  ```
-
-  Look for the runner in the response and confirm its `status` is `online`
-  and its `labels` include both `self-hosted` and `legal-corpus-ingester`.
+- **Job stays `queued`**: GitHub-hosted capacity is unavailable, or `runs-on`
+  names a label GitHub does not host. Check https://www.githubstatus.com/ and
+  confirm the job's `runs-on` is `ubuntu-latest`.
 
 - **Job fails on lint or type check**: ruff or mypy found a violation. Read the
   step log for the exact file and line number, fix locally, and push again.

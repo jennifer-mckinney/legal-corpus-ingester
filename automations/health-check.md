@@ -25,10 +25,12 @@ The `health` job runs two checks in order:
    stage, and writes a markdown table to `out/health/YYYY-MM-DD.md`.
 
 Both steps pass `--state-dir "${XDG_STATE_HOME:-$HOME/.local/state}/legal-corpus-ingester/state"`,
-outside the checkout. `actions/checkout` cleans ignored files on the self-hosted
-runner, which wipes the gitignored `state/`, so reading `./state` would always
-report every source as never-run. When refresh is wired it must write its
-checkpoints to this same directory.
+outside the checkout. `actions/checkout` cleans ignored files, which wipes the
+gitignored `state/`, so reading `./state` would always report every source as
+never-run. On a GitHub-hosted runner the whole filesystem is new each run, so
+this directory is empty too until state persistence is designed (ADR-016). When
+refresh is wired it must write its checkpoints to this same directory and
+persist them across runs.
 
 ## What it produces
 
@@ -85,9 +87,8 @@ pipeline failures, which are separate workflows.
 
 ## Where it runs
 
-The `health` job runs on the project's self-hosted runner, matched by label
-`[self-hosted, legal-corpus-ingester]`. This satisfies HR4 (local-only data).
-No corpus data leaves the runner.
+The `health` job runs on GitHub-hosted `ubuntu-latest` (ADR-016). It reads
+tracked source configs and run checkpoints, not corpus data.
 
 ## How to run manually
 
