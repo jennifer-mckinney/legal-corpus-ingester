@@ -130,15 +130,12 @@ the failed run. The cassettes in the working tree are then in an undefined state
 Open the run log to tell "upstream is down" (fetch failure) from "a test was
 skipped" (the guard names each skipped test on stderr).
 
-## Why self-hosted runner
+## Where it runs
 
-Hard requirement HR4 mandates that all corpus fetches remain local. A
-GitHub-hosted runner executes on Azure infrastructure, which means the HTTP
-requests to EUR-Lex, Congress.gov, or other sources would originate from
-and transit through Azure. The cassette re-record makes live HTTP calls to
-each source. Running on the self-hosted `legal-corpus-ingester` runner
-keeps those fetches on-machine, consistent with every other ingest
-workflow in this repo.
+The job runs on GitHub-hosted `ubuntu-latest` (ADR-016). The re-record step
+makes live HTTP calls to each source (EUR-Lex, Congress.gov and the others),
+so those requests originate from GitHub's infrastructure. The re-recorded
+cassettes leave the runner only as the run artifact.
 
 ## Relationship to ALERTS.md
 

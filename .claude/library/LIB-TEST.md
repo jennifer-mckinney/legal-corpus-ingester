@@ -12,7 +12,7 @@ xref: [[LIB-STACK]] [[LIB-ARCH]] [[.claude/rules/testing.md]] [[.claude/CLAUDE.m
 | Contract (round-trip with terms-analysis) | pytest + dynamic import | `tests/e2e/` | Per phase complete |
 | Snapshot (chunker parity) | syrupy | `tests/snapshot/` | On chunker change |
 | CLI smoke | Typer `CliRunner` | `tests/cli/` | Per phase complete |
-| Weekly drift canary | pytest + VCR record=all | CI schedule | Weekly on self-hosted runner |
+| Weekly drift canary | pytest + VCR record=all | CI schedule | Weekly on ubuntu-latest |
 
 ## coverage-gates
 

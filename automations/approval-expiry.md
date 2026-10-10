@@ -101,9 +101,9 @@ When an issue fires:
 
 ## Where it runs
 
-The `approval-expiry` job runs on the project's self-hosted runner, matched by label
-`[self-hosted, legal-corpus-ingester]`. This satisfies HR4 (local-only data). The
-approval files and any associated artifact hashes remain on-machine.
+The `approval-expiry` job runs on GitHub-hosted `ubuntu-latest` (ADR-016). It
+reads only the tracked `config/approvals/*.yaml` files in the checkout, which
+hold expiry dates and artifact hashes, not the signed artifacts.
 
 ## How to run manually
 

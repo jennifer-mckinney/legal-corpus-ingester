@@ -117,9 +117,11 @@ all weekly runs.
 
 ## Where it runs
 
-The `refresh` job runs on the project's self-hosted runner, matched by label
-`[self-hosted, legal-corpus-ingester]`. This satisfies HR4 (local-only data). No
-corpus data leaves the runner.
+The `refresh` job runs on GitHub-hosted `ubuntu-latest` (ADR-016). The runner
+filesystem is discarded after each run, so `out/` and the
+`last-published-bundle.json` record in step 3 do not survive between runs.
+Persistence must be designed before refresh is wired; it is tracked as a
+decision card under ADR-016.
 
 ## How to run manually
 
