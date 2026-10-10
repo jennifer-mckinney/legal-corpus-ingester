@@ -1,0 +1,5 @@
+# Worktree roots checked by scripts/governance/check-no-stale-worktrees.sh
+# (terms-analysis#123). One repo-relative root per line; "#" lines and
+# empty lines are ignored; an optional trailing "/" is allowed. Each root
+# must be ignored by a tracked .gitignore and must contain nothing tracked.
+.claude/worktrees/

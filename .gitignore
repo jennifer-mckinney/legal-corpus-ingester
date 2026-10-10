@@ -29,3 +29,6 @@ state/*.json
 
 # VCR cassette PII scrub logs
 tests/fixtures/cassettes/*/pii-scrub.log
+
+# Agent worktrees (terms-analysis#123; roots: .claude/governance/worktree-roots.txt)
+/.claude/worktrees/
