@@ -54,7 +54,7 @@ For every file in the diff:
 1. **Identify the trust boundary** the change crosses (upstream legal
    sources fetched over HTTP, the parsers and cleaners that read them, the
    local embedder, state and bundles on disk, the published corpus that
-   terms-analysis consumes, the CLI, CI and the self-hosted runner).
+   terms-analysis consumes, the CLI and the GitHub-hosted CI runners).
 2. **Walk the data flow** end to end. What can an attacker control? What
    validates it? What is the side effect?
 3. **Try to break it.** Construct a concrete attack input. If you cannot,

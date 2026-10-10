@@ -10,7 +10,6 @@ Each file documents: trigger, artifact produced, failure mode, and escalation pa
 | `ci-pr.md` | GitHub PR | CI on pull request |
 | `logging.md` | Runtime | Structured logging setup |
 | `docker.md` | Build | Docker build automation |
-| `self-hosted-runner.md` | Setup | GitHub Actions self-hosted runner |
 | `secrets.md` | Configuration | Secrets management |
 | `p9-pre-push.md` | GitHub PR to `main` | P9 security + grumpy review CI jobs (`p9-review.yml`) |
 | `health-check.md` | Cron 3 AM UTC daily | Nightly corpus health check |

@@ -26,23 +26,19 @@ needs revocation):
   than commenting it out, so future audits do not misread intent.
 
 There is no shared secret store to update because `.env` values stay on
-the developer or runner host by design (see next section).
+the developer host by design (see next section).
 
 ## How CI reads env vars
 
-CI runs on a self-hosted runner via
-`runs-on: [self-hosted, legal-corpus-ingester]` (see
-`automations/self-hosted-runner.md`). The runner reads environment
-variables from the host process environment.
+CI runs on GitHub-hosted `ubuntu-latest` runners (ADR-016). Each workflow
+sets the environment it needs in the workflow file; no job reads a host
+environment, and no job needs a secret beyond its own `github.token`. The
+one repository secret, `ANTHROPIC_API_KEY`, belongs to the P9 review jobs
+(see `automations/p9-pre-push.md`).
 
-CI does not use GitHub-hosted secrets. Storing values in GitHub secrets
-would move data to Azure/Microsoft infrastructure, which appears to
-conflict with HR4 (all data stays local, no external API calls). Values
-needed at CI time should be set on the runner host, for example in the
-runner service unit or the shell profile the runner uses.
-
-See `automations/self-hosted-runner.md` for the host-side management
-steps.
+No `.env` value is placed in GitHub secrets or variables. Values that
+configure the local pipeline (the LocalAI URL, the served model name,
+override flags) belong in the local `.env` only.
 
 ## Legal-review overrides
 
@@ -68,7 +64,7 @@ unavailable). When the env-var override is used:
 - No auth tokens for external services. HR4 excludes external services
   from the data path. If a future feature appears to need an external
   credential, it needs to be re-evaluated against HR2 (no
-  investor-lawsuit vendors) and HR4 (local-only data) before any token
+  investor-lawsuit vendors) and HR4 (corpus data stays local) before any token
   is added here.
 - No third-party API keys. Same reasoning as above.
 
