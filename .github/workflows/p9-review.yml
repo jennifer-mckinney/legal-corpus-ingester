@@ -1,7 +1,7 @@
 name: P9 Review
 
 # P9 independent review as standard CI jobs (terms-analysis#191), ported to
-# legal-corpus-ingester. It runs on ubuntu-latest, not the self-hosted runner.
+# legal-corpus-ingester. Like every workflow here, it runs on GitHub-hosted ubuntu-latest.
 # Two Claude reviewers run on every pull request to main. Each one comments
 # inline on its findings and writes p9-verdict.json; a separate gate step,
 # run from a copy in RUNNER_TEMP, fails the job on any CRITICAL, HIGH or

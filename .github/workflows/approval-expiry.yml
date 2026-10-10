@@ -15,7 +15,7 @@ defaults:
 
 jobs:
   approval-expiry:
-    runs-on: [self-hosted, legal-corpus-ingester]
+    runs-on: ubuntu-latest
     env:
       ISSUE_LABEL: approval-expiry
     steps:
@@ -30,7 +30,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if ! command -v gh >/dev/null 2>&1; then
-            echo "::error::gh CLI not found on the runner; install it and restart the runner service" >&2
+            echo "::error::gh CLI not found on the runner; gh ships on the ubuntu-latest image, so the runner image has changed" >&2
             exit 1
           fi
           if ! gh api "repos/${GITHUB_REPOSITORY}/labels/${ISSUE_LABEL}" --silent; then

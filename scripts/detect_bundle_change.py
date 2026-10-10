@@ -7,8 +7,9 @@ the gitignored ``out/`` first, so the "before" value was always empty and every
 successful refresh counted as a change. This script compares the bundle that
 the refresh just published against a record of the last bundle that was
 announced. That record lives in a state file outside the checkout (by default
-``$XDG_STATE_HOME`` or ``~/.local/state`` on the self-hosted runner), so it
-survives the clean.
+``$XDG_STATE_HOME`` or ``~/.local/state`` on the runner), so it survives the
+clean. The record persists only as long as the runner's home directory does;
+a fresh runner starts with no record.
 
 Change is decided by content, not by name. The fingerprint is the SHA256 of the
 bundle's ``checksums.txt`` lines, leaving out ``MANIFEST.yaml`` because that
