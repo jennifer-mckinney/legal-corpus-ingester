@@ -19,7 +19,7 @@ defaults:
 
 jobs:
   refresh:
-    runs-on: [self-hosted, legal-corpus-ingester]
+    runs-on: ubuntu-latest
     # No job-level GH_TOKEN: only Preflight and the issue step get the token, so
     # Install (third-party build hooks) and Run refresh cannot read it (terms-analysis#90).
     env:
@@ -36,7 +36,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           if ! command -v gh >/dev/null 2>&1; then
-            echo "::error::gh CLI not found on the runner; install it and restart the runner service" >&2
+            echo "::error::gh CLI not found on the runner; gh ships on the ubuntu-latest image, so the runner image has changed" >&2
             exit 1
           fi
           if ! gh api "repos/${GITHUB_REPOSITORY}/labels/${ISSUE_LABEL}" --silent; then

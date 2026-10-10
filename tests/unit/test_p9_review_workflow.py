@@ -235,7 +235,7 @@ def test_gate_fails_closed_on_unparseable_file(tmp_path: Path, content: str | by
     assert "is not valid JSON" in proc.stderr
 
 
-# The ingester's CI runs on the self-hosted runner's python3, which may be 3.14
+# The ingester's CI runs the pinned python (.python-version), 3.14 today
 # (terms-analysis#215). Before 3.14 this input raises RecursionError ("is not
 # valid JSON"); 3.14 parses it into a nested list ("does not match the verdict
 # contract"). Either way the gate must fail closed with EXIT_INVALID.

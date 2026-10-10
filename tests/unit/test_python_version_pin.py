@@ -36,10 +36,10 @@ WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
 VERSION_FILE_NAME = ".python-version"
 VERSION_FILE = REPO_ROOT / VERSION_FILE_NAME
 
-# Acceptance value: the interpreter CI and local dev share. The self-hosted
-# runner's python3 is 3.14 today. This is the expectation the pin is checked
-# against, deliberately not read back from the pin itself (a test that reads
-# its answer from the file under test cannot fail).
+# Acceptance value: the interpreter CI and local dev share; setup-python
+# installs it on ubuntu-latest from the pin. This is the expectation the pin
+# is checked against, deliberately not read back from the pin itself (a test
+# that reads its answer from the file under test cannot fail).
 TARGET_VERSION = (3, 14)
 
 SETUP_PYTHON = "actions/setup-python"
@@ -595,9 +595,8 @@ def test_every_python_running_job_installs_python_from_the_pin() -> None:
 
 @pytest.mark.parametrize("path", _workflow_files(), ids=lambda p: p.name)
 def test_every_python_run_follows_a_pinned_setup_python(path: Path) -> None:
-    # Red today on every workflow: the self-hosted jobs (ci, health, refresh,
-    # vcr-drift, approval-expiry) run the runner's python3 and the p9-review
-    # jobs run ubuntu-latest's python3, all with no setup-python step.
+    # Every Python run must follow a setup-python step that reads the pin;
+    # without one a job would run whatever python3 the ubuntu-latest image ships.
     assert _unpinned_python_runs(path.name, _load(path)) == []
 
 

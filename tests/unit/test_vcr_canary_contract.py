@@ -192,7 +192,11 @@ def test_c2_no_step_uses_pytest_vcr_flag() -> None:
 
 
 def _stash_created_dir(stash_script: str) -> str:
-    """Model what the stash step creates, with BSD cp semantics (macOS runner).
+    """Model what the stash step creates, with BSD cp semantics.
+
+    CI runs GNU cp on ubuntu-latest. The two differ only for ``cp -r SRC/ DST``
+    with DST an existing dir (GNU creates ``DST/basename(SRC)``); the stash step
+    copies into an absent DST, where both agree.
 
     - ``cp -r SRC/ DST`` (trailing slash or ``SRC/.``) copies SRC's contents into DST.
     - ``cp -r SRC DST`` with DST an existing dir creates ``DST/basename(SRC)``.

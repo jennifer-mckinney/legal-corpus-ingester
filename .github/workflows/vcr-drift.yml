@@ -18,7 +18,7 @@ defaults:
 
 jobs:
   drift:
-    runs-on: [self-hosted, legal-corpus-ingester]
+    runs-on: ubuntu-latest
     steps:
       # persist-credentials: false keeps the issues:write token out of
       # .git/config while pip install and live network tests run (security F4).
@@ -38,9 +38,9 @@ jobs:
           source .venv/bin/activate
           pip install -e '.[dev]' 2>&1 | tail -5
 
-      # Fresh per-run baseline under RUNNER_TEMP (not shared /tmp on the
-      # self-hosted runner). Destination does not exist before the copy, so
-      # `cp -R src dst` creates dst as a copy of src on both BSD and GNU cp:
+      # Fresh per-run baseline under RUNNER_TEMP. The destination does not
+      # exist before the copy, so `cp -R src dst` (GNU cp on ubuntu-latest)
+      # creates dst as a copy of src:
       # the cassette tree (eurlex/...) sits directly under $RUNNER_TEMP/vcr-baseline.
       - name: Stash committed cassettes
         run: |
