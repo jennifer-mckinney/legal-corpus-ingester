@@ -23,7 +23,7 @@ The single `test` job runs these steps sequentially. Every step runs under the w
 command piped into `tail` still fails the step (terms-analysis#90).
 
 1. `actions/checkout@v4` - pulls the ref under test.
-2. `Set up Python` - runs `python3 --version` to confirm the runner's Python is reachable.
+2. `Set up Python` - `actions/setup-python` installs the interpreter named in `.python-version` (the single Python pin) from the runner tool cache. On this self-hosted macOS runner the cache must be seeded first; see `docs/runbooks/self-hosted-runner-python.md`.
 3. `Install` - creates `.venv` and runs `pip install -e '.[dev]'`. Output is tail-truncated to 5 lines.
 4. `Lint` - runs `ruff check .` against the full codebase. Failures block the job.
 5. `Type check` - runs `mypy src/`. Failures block the job.

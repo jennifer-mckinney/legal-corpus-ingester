@@ -21,7 +21,9 @@ jobs:
           persist-credentials: false  # no step needs git credentials; keep the token out of .git/config
 
       - name: Set up Python
-        run: python3 --version
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
+        with:
+          python-version-file: .python-version
 
       - name: Install
         run: |
