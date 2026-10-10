@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import re
@@ -27,12 +28,14 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
 import yaml
 
 from legal_corpus_ingester import cli
+from legal_corpus_ingester.pipeline.state import CheckpointState, CheckpointStore
 
 _WORKFLOWS_DIR = Path(__file__).resolve().parents[2] / ".github" / "workflows"
 _REQUIRED_SHELL = "bash -eo pipefail {0}"
@@ -382,19 +385,60 @@ def test_refresh_dedupe_branch_comments_instead_of_silently_skipping() -> None:
 # "checkout" directory.
 
 _REPO_ROOT = _WORKFLOWS_DIR.parents[1]
-_HEALTH_STEPS = ("Run ingester status", "Run health check")
+_HEALTH_YML = _WORKFLOWS_DIR / "health.yml"
+# The health.yml steps that read checkpoints, found by the command each one runs and never
+# by step name, so renaming a step cannot slip it past these tests (#17 r1). Shell comments
+# are stripped first, so a step that only MENTIONS the other command is not taken for it.
+_HEALTH_STEPS: dict[str, re.Pattern[str]] = {
+    "health-check": re.compile(r"(?<![\w.-])scripts/health_check\.py\b"),
+    "status": re.compile(r"(?<![\w.-])ingester\s+status\b"),
+}
+_SHELL_COMMENT = re.compile(r"(?m)(?:^|\s)#.*$")
+
+
+def _load_health_check() -> ModuleType:
+    """scripts/health_check.py as a module, for its documented exit codes (F10: never restated)."""
+    spec = importlib.util.spec_from_file_location(
+        "_health_check_for_workflow_contract", _REPO_ROOT / "scripts" / "health_check.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    # @dataclass resolves the module through sys.modules while the script executes.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_HC = _load_health_check()
+
+
+def _health_step(doc: dict[str, Any], key: str) -> tuple[str, int, dict[str, Any]]:
+    """(job name, index in that job, step) of the ONE step that runs _HEALTH_STEPS[key]."""
+    pattern = _HEALTH_STEPS[key]
+    hits = [
+        (job_name, i, step)
+        for job_name, job in (doc.get("jobs") or {}).items()
+        for i, step in enumerate(job.get("steps") or [])
+        if pattern.search(_SHELL_COMMENT.sub("", str(step.get("run") or "")))
+    ]
+    assert len(hits) == 1, (
+        f"health.yml: expected exactly one step running {pattern.pattern!r}, "
+        f"found {[(job, step.get('name')) for job, _, step in hits]}"
+    )
+    return hits[0]
 
 
 def _run_health_step(
-    tmp_path: Path, step_name: str, *, python_rc: int | None = None, xdg: Path | None = None
+    tmp_path: Path, key: str, *, python_rc: int | None = None, xdg: Path | None = None
 ) -> tuple[subprocess.CompletedProcess[str], Path, list[str]]:
     """Run a health.yml step; return (result, checkout dir, argv the fake command got).
 
-    python_rc None runs the real scripts/health_check.py and CLI; an int makes a fake
-    `python`/`ingester` that records its argv and exits with that code.
+    key names the step by the command it runs (a _HEALTH_STEPS key). python_rc None runs
+    the real scripts/health_check.py and CLI; an int makes a fake `python`/`ingester`
+    that records its argv and exits with that code.
     """
-    doc = _load(_WORKFLOWS_DIR / "health.yml")
-    _, step = _step_by_name(doc, step_name)
+    doc = _load(_HEALTH_YML)
+    _, _, step = _health_step(doc, key)
     checkout = tmp_path / "checkout"
     (checkout / ".venv" / "bin").mkdir(parents=True)
     (checkout / ".venv" / "bin" / "activate").write_text("")
@@ -436,11 +480,11 @@ def _run_health_step(
     return result, checkout, argv
 
 
-@pytest.mark.parametrize("step_name", _HEALTH_STEPS)
+@pytest.mark.parametrize("key", sorted(_HEALTH_STEPS))
 @pytest.mark.parametrize("use_xdg", [True, False], ids=["xdg", "home-fallback"])
-def test_health_steps_read_state_outside_the_checkout(tmp_path: Path, step_name: str, use_xdg: bool) -> None:
+def test_health_steps_read_state_outside_the_checkout(tmp_path: Path, key: str, use_xdg: bool) -> None:
     xdg = tmp_path / "xdg" if use_xdg else None
-    result, checkout, argv = _run_health_step(tmp_path, step_name, python_rc=0, xdg=xdg)
+    result, checkout, argv = _run_health_step(tmp_path, key, python_rc=0, xdg=xdg)
     assert result.returncode == 0, result.stderr
     state_dir = Path(argv[argv.index("--state-dir") + 1])
     base = xdg if xdg is not None else tmp_path / "home" / ".local" / "state"
@@ -448,31 +492,141 @@ def test_health_steps_read_state_outside_the_checkout(tmp_path: Path, step_name:
     assert not state_dir.resolve().is_relative_to(checkout.resolve())
 
 
+# Every exit code health_check.py documents, read from the script (F10). Each one except
+# EXIT_NOT_WIRED must fail the step with that same code; only EXIT_NOT_WIRED is a warning.
+_HC_EXIT_CODES = {name: value for name, value in vars(_HC).items() if name.startswith("EXIT_")}
+# Pass-through codes: every documented one, the neighbours of the warning code, and
+# shell-level codes (126 not executable, 127 not found, 143 SIGTERM, 255 maximum).
+_PASS_THROUGH_CODES = sorted(
+    {code for code in _HC_EXIT_CODES.values() if code not in (0, cli.EXIT_NOT_WIRED)}
+    | {cli.EXIT_NOT_WIRED - 1, cli.EXIT_NOT_WIRED + 1, cli.EXIT_CONSUMER_SKIPPED, 126, 127, 143, 255}
+)
+
+
+def test_health_check_exit_table_covers_every_documented_code() -> None:
+    # #17 added EXIT_CHECKPOINT_INVALID; a reorder must not lose its pass-through row.
+    assert "EXIT_CHECKPOINT_INVALID" in _HC_EXIT_CODES
+    assert _HC_EXIT_CODES["EXIT_CHECKPOINT_INVALID"] in _PASS_THROUGH_CODES
+    # health_check re-exports EXIT_NOT_WIRED; it has the one warning row, never a pass-through row.
+    assert _HC_EXIT_CODES.get("EXIT_NOT_WIRED") == cli.EXIT_NOT_WIRED
+    assert cli.EXIT_NOT_WIRED not in _PASS_THROUGH_CODES
+    for name, code in _HC_EXIT_CODES.items():
+        assert code in (*_PASS_THROUGH_CODES, 0, cli.EXIT_NOT_WIRED), f"{name}={code} has no row in the step exit table"
+
+
 @pytest.mark.parametrize(
     ("rc", "step_rc", "warns"),
-    [
-        (0, 0, False),
-        (cli.EXIT_NOT_WIRED, 0, True),
-        (1, 1, False),
-        (2, 2, False),
-        (cli.EXIT_CONSUMER_SKIPPED, cli.EXIT_CONSUMER_SKIPPED, False),
-        (127, 127, False),
-    ],
+    [(0, 0, False), (cli.EXIT_NOT_WIRED, 0, True)] + [(code, code, False) for code in _PASS_THROUGH_CODES],
 )
 def test_health_check_step_excuses_only_the_not_wired_code(
     tmp_path: Path, rc: int, step_rc: int, warns: bool
 ) -> None:
-    result, _, argv = _run_health_step(tmp_path, "Run health check", python_rc=rc, xdg=tmp_path / "xdg")
+    result, _, argv = _run_health_step(tmp_path, "health-check", python_rc=rc, xdg=tmp_path / "xdg")
     assert argv[0] == "scripts/health_check.py"
     assert result.returncode == step_rc, (result.stdout, result.stderr)
     assert ("::warning title=Refresh not wired::" in result.stdout) is warns
+
+
+# #17 r1: health_check.py is the guard and `ingester status` is diagnostics. Status crashes
+# on a malformed checkpoint (CheckpointStore.load; its own card), so if status runs first
+# the job dies with a traceback and EXIT_CHECKPOINT_INVALID can never surface.
+
+
+def test_health_check_step_runs_before_ingester_status() -> None:
+    doc = _load(_HEALTH_YML)
+    hc_job, hc_idx, hc_step = _health_step(doc, "health-check")
+    st_job, st_idx, _ = _health_step(doc, "status")
+    assert hc_job == st_job, f"health check ({hc_job}) and status ({st_job}) must be steps of one job"
+    assert hc_idx < st_idx, (
+        f"health.yml: the health_check.py step (#{hc_idx}) must run before `ingester status` "
+        f"(#{st_idx}), or a malformed checkpoint crashes status first and exit "
+        f"{_HC.EXIT_CHECKPOINT_INVALID} never surfaces"
+    )
+    # The guard must not be made conditional or non-fatal while it is being moved.
+    assert "if" not in hc_step
+    assert "continue-on-error" not in hc_step
+
+
+def _run_health_job(tmp_path: Path, xdg: Path) -> tuple[int, str | None, list[str], str]:
+    """Run health.yml's checkpoint-reading steps for real, in workflow order, as the runner does.
+
+    Returns (job exit code, key of the step that failed the job or None, keys run, output).
+    A failing step ends the job unless it sets `continue-on-error: true`. Step `if:`
+    expressions are not modelled, so one fails the test instead of being guessed at.
+    """
+    doc = _load(_HEALTH_YML)
+    located = sorted((_health_step(doc, key), key) for key in _HEALTH_STEPS)
+    assert len({job for (job, _, _), _ in located}) == 1, "health.yml: checkpoint steps split across jobs"
+    ran: list[str] = []
+    output = ""
+    for (_, _, step), key in located:
+        assert "if" not in step, f"health.yml {key} step has an `if:` this test does not model"
+        continue_on_error = step.get("continue-on-error", False)
+        assert isinstance(continue_on_error, bool), f"health.yml {key}: unmodelled continue-on-error"
+        result, _, _ = _run_health_step(tmp_path / key, key, xdg=xdg)
+        ran.append(key)
+        output += result.stdout + result.stderr
+        if result.returncode != 0 and not continue_on_error:
+            return result.returncode, key, ran, output
+    return 0, None, ran, output
+
+
+def _first_source() -> str:
+    """A source the real config defines, so health_check.py treats its checkpoint as known."""
+    configs = sorted((_REPO_ROOT / "config" / "sources").glob("*.yaml"))
+    assert configs, "config/sources holds no source configs"
+    return configs[0].stem
+
+
+_JOB_CANARY = "CANARY-17-JOB"
+# Malformed checkpoints of each kind: the card's list, other non-objects, unparseable
+# JSON, and hostile text (ANSI clear-screen, bidi override) inside a list.
+_MALFORMED_CHECKPOINTS = {
+    "empty-list": b"[]",
+    "string": b'"done"',
+    "null": b"null",
+    "unparseable": b"{",
+    "hostile-list": json.dumps([f"{_JOB_CANARY}\x1b[2J‮"]).encode(),
+}
+
+
+@pytest.mark.parametrize("raw", list(_MALFORMED_CHECKPOINTS.values()), ids=list(_MALFORMED_CHECKPOINTS))
+def test_health_job_surfaces_invalid_checkpoint_exit_code(tmp_path: Path, raw: bytes) -> None:
+    xdg = tmp_path / "xdg"
+    state = xdg / "legal-corpus-ingester" / "state"
+    state.mkdir(parents=True)
+    checkpoint = state / f"{_first_source()}.checkpoint.json"
+    checkpoint.write_bytes(raw)
+    job_rc, failed, ran, output = _run_health_job(tmp_path, xdg)
+    assert (job_rc, failed) == (_HC.EXIT_CHECKPOINT_INVALID, "health-check"), (ran, output[-2000:])
+    # Honest, safe output: the guard names the bad file; no traceback, no raw hostile bytes.
+    assert checkpoint.name in output
+    assert "Traceback" not in output
+    for forbidden in (_JOB_CANARY, "\x1b", "‮"):
+        assert forbidden not in output
+
+
+@pytest.mark.parametrize("seed", ["empty-state", "valid-checkpoint"])
+def test_health_job_positive_control_runs_both_steps_and_passes(tmp_path: Path, seed: str) -> None:
+    # Green today and must stay green: a legitimate state runs BOTH steps and the job
+    # passes, with the not-wired warning (no source but the seeded one has run).
+    xdg = tmp_path / "xdg"
+    state = xdg / "legal-corpus-ingester" / "state"
+    state.mkdir(parents=True)
+    if seed == "valid-checkpoint":
+        CheckpointStore(state).save(CheckpointState(source_name=_first_source(), stage="done", corpus_version="v1"))
+    assert not cli.REFRESH_WIRED
+    job_rc, failed, ran, output = _run_health_job(tmp_path, xdg)
+    assert (job_rc, failed) == (0, None), output[-2000:]
+    assert sorted(ran) == sorted(_HEALTH_STEPS)
+    assert "::warning title=Refresh not wired::" in output
 
 
 def test_health_check_step_end_to_end_unwired_is_warning_and_ignores_checkout_state(tmp_path: Path) -> None:
     # A fresh checkpoint inside the checkout must not be read: the real runner wipes it.
     (tmp_path / "checkout" / "state").mkdir(parents=True)
     (tmp_path / "checkout" / "state" / "eurlex_gdpr.checkpoint.json").write_text('{"stage": "done"}')
-    result, _, _ = _run_health_step(tmp_path, "Run health check", xdg=tmp_path / "xdg")
+    result, _, _ = _run_health_step(tmp_path, "health-check", xdg=tmp_path / "xdg")
     assert not cli.REFRESH_WIRED
     assert result.returncode == 0, (result.stdout, result.stderr)
     assert "::warning title=Refresh not wired::" in result.stdout
@@ -487,7 +641,7 @@ def test_health_check_step_end_to_end_stale_source_fails(tmp_path: Path) -> None
     cp.write_text(json.dumps({"stage": "done"}))
     old = time.time() - 30 * 86400
     os.utime(cp, (old, old))
-    result, _, _ = _run_health_step(tmp_path, "Run health check", xdg=tmp_path / "xdg")
+    result, _, _ = _run_health_step(tmp_path, "health-check", xdg=tmp_path / "xdg")
     assert result.returncode == 1, (result.stdout, result.stderr)
     assert "| eurlex_gdpr |" in result.stdout
     assert "| stale |" in result.stdout
