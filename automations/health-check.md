@@ -60,12 +60,22 @@ decided:
 | 1 | A source is stale, or never-run while refresh is wired | red |
 | 2 | Config problem: `config/sources/` missing, unreadable or holding zero source configs, a non-file `*.yaml` entry, or an empty / non-mapping source YAML | red |
 | 3 (`EXIT_NOT_WIRED`) | The only problem is never-run sources and `cli.REFRESH_WIRED` is False | green with a "Refresh not wired" warning annotation |
+| 4 (`EXIT_CHECKPOINT_INVALID`) | A checkpoint file exists but is not a valid `CheckpointState` for its source (see below). Outranks 1 and 3 (stale or never-run sources do not mask it), wired or not | red |
 
 Exit 3 is the known unwired state: `ingester refresh` does not run the pipeline
 yet, so no checkpoint can exist. The step turns exactly that code into a warning
 and fails on every other non-zero code, including a crash. A stale checkpoint is
 never excused. The PR that wires refresh flips `REFRESH_WIRED` to True (a unit
 test fails until it does), after which never-run exits 1.
+
+A checkpoint is valid only when it is a regular file (a symlink to one is
+followed) holding strict UTF-8 JSON: an object in which every
+`CheckpointState` field (`pipeline/state.py`) that is present is a string,
+`stage` is present and, if `source_name` is present, it names its own
+source. Anything else at the checkpoint path, including a directory, a FIFO
+or a dangling symlink, is invalid: the source's row shows `checkpoint-invalid`, the report names the file
+and the reason without echoing its contents, and the script exits 4 (#17). A
+path with nothing at it is still never-run.
 
 The threshold is configurable:
 
@@ -78,7 +88,8 @@ python scripts/health_check.py --stale-days 14
 If `health_check.py` exits 1 (stale source, or never-run once refresh is wired),
 2 (config problem: `config/sources/` missing, unreadable or holding zero source
 configs, a `*.yaml` entry that is not a regular file, or a source YAML that is
-empty or not a mapping; terms-analysis#90, #173) or any other code except 3,
+empty or not a mapping; terms-analysis#90, #173), 4 (an invalid checkpoint;
+#17) or any other code except 3,
 the `Run health check` step is marked failed. None of these is masked
 (terms-analysis#90). The artifact upload still runs because it has
 `if: always()`. No issue is auto-opened - this is a monitoring report, not an
