@@ -71,7 +71,10 @@ unchanged: moving CI does not move inference.
   `$XDG_STATE_HOME/legal-corpus-ingester` (default `~/.local/state`), which was chosen because
   the self-hosted runner's home directory persisted between runs. On a hosted runner it is empty
   on every run. A persistence design (Actions cache, artifact, or a state branch) is required
-  before refresh is wired; it is tracked as its own decision card and is not decided here.
+  before refresh is wired; it is tracked as decision card #71 and is not decided here. Until
+  #71 lands, `refresh.yml` runs the detect step with `--require-state`, so a missing record is
+  a red run (exit 2) rather than an announcement every week; a wired refresh cannot announce
+  and then forget.
 - ADR-015 condition 3 ("the jobs run on GitHub-hosted runners, never the self-hosted corpus
   runner") is still satisfied; there is no longer a corpus runner to move them to.
 - `.claude/CLAUDE.md` HR4 changes, so `.claude/_governance-manifest.json` is regenerated in the

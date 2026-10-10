@@ -140,6 +140,59 @@ class TestLoudFailures:
         assert not state.exists()
 
 
+class TestRequireState:
+    """On a GitHub-hosted runner the state directory is empty on every job (ADR-016, #71).
+
+    ``--require-state`` must turn "no record" into a distinct loud failure that writes
+    nothing to GITHUB_OUTPUT, so the announce step cannot fire every run.
+    """
+
+    def _detect_required(self, link: Path, state: Path, gh_out: Path) -> int:
+        return dbc.main([
+            "detect", "--bundle-link", str(link), "--state-file", str(state),
+            "--github-output", str(gh_out), "--require-state",
+        ])
+
+    def test_missing_record_is_a_loud_failure_not_a_change(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        link = _bundle(tmp_path / "out", "2026.10.0")
+        gh_out = tmp_path / "gh_output"
+        assert self._detect_required(link, tmp_path / "state.json", gh_out) == dbc.EXIT_NO_STATE
+        captured = capsys.readouterr()
+        assert "no record of the last announced bundle" in captured.err
+        assert "#71" in captured.err
+        assert "changed=" not in captured.out
+        assert not gh_out.exists()
+
+    def test_exit_code_is_distinct_from_bad_bundle(self) -> None:
+        # 1 means "bad bundle or corrupt record"; a missing record must not be confused with it.
+        assert dbc.EXIT_NO_STATE not in (0, 1)
+
+    def test_present_record_still_decides_normally(self, tmp_path: Path) -> None:
+        state = tmp_path / "state.json"
+        link = _bundle(tmp_path / "out", "2026.10.0")
+        assert _record(link, state) == 0
+        gh_out = tmp_path / "gh_output"
+        assert self._detect_required(link, state, gh_out) == 0
+        assert _outputs(gh_out) == {"changed": "false", "new_target": "2026.10.0"}
+        gh_out2 = tmp_path / "gh_output2"
+        assert self._detect_required(_bundle(tmp_path / "out", "2026.10.1"), state, gh_out2) == 0
+        assert _outputs(gh_out2) == {"changed": "true", "new_target": "2026.10.1"}
+
+    def test_corrupt_record_is_still_exit_1_under_require_state(self, tmp_path: Path) -> None:
+        state = tmp_path / "state.json"
+        state.write_text("not json", encoding="utf-8")
+        link = _bundle(tmp_path / "out", "2026.10.0")
+        assert self._detect_required(link, state, tmp_path / "gh_output") == 1
+
+    def test_without_the_flag_first_publish_is_still_a_change(self, tmp_path: Path) -> None:
+        # Pins the default so the flag is an explicit opt-in, not a silent behaviour change.
+        gh_out = tmp_path / "gh_output"
+        assert _detect(_bundle(tmp_path / "out", "2026.10.0"), tmp_path / "state.json", gh_out) == 0
+        assert _outputs(gh_out)["changed"] == "true"
+
+
 class TestStateFile:
     def test_record_writes_version_and_fingerprint(self, tmp_path: Path) -> None:
         state = tmp_path / "nested" / "state.json"

@@ -9,7 +9,11 @@ the refresh just published against a record of the last bundle that was
 announced. That record lives in a state file outside the checkout (by default
 ``$XDG_STATE_HOME`` or ``~/.local/state`` on the runner), so it survives the
 clean. The record persists only as long as the runner's home directory does;
-a fresh runner starts with no record.
+a fresh runner starts with no record. Since ADR-016 every job runs on a
+GitHub-hosted runner whose filesystem is discarded after the job, so without
+explicit persistence (decision card #71) the record is absent on every run.
+``--require-state`` makes that absence a loud failure instead of a change: a
+wired refresh must not announce (and then forget) a new bundle every week.
 
 Change is decided by content, not by name. The fingerprint is the SHA256 of the
 bundle's ``checksums.txt`` lines, leaving out ``MANIFEST.yaml`` because that
@@ -26,6 +30,8 @@ Exit 0: decision made (detect) or record written (record).
 Exit 1: refresh reported success but no valid bundle is published (missing
         ``current`` link, bad version name, missing ``checksums.txt``), or the
         state file is unreadable. These are loud failures, never "no change".
+Exit 2: ``--require-state`` was given and no record exists. Nothing is written
+        to ``--github-output``, so the announce step cannot run.
 """
 from __future__ import annotations
 
@@ -42,6 +48,9 @@ from pathlib import Path
 VERSION_RE = re.compile(r"^[0-9]{4}\.[0-9]+\.[0-9]+$")
 # Excluded from the fingerprint: it records run metadata, not corpus content.
 _FINGERPRINT_EXCLUDE = frozenset({"MANIFEST.yaml"})
+# Exit code for "no record of the last announced bundle" under --require-state.
+# Distinct from 1 (bad bundle / corrupt record) so the workflow log says which it was.
+EXIT_NO_STATE = 2
 
 
 def default_state_file() -> Path:
@@ -122,6 +131,15 @@ def main(argv: list[str] | None = None) -> int:
         help="Record of the last announced bundle (default: %(default)s)",
     )
     parser.add_argument("--github-output", type=Path, default=None)
+    parser.add_argument(
+        "--require-state",
+        action="store_true",
+        help=(
+            "Fail (exit %d) when no record exists instead of treating a missing record "
+            "as a first publish. Used on GitHub-hosted runners, where the state directory "
+            "is empty on every job until persistence is decided (#71)." % EXIT_NO_STATE
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -130,10 +148,22 @@ def main(argv: list[str] | None = None) -> int:
             write_state(args.state_file, version, fingerprint)
             print(f"recorded bundle {version} ({fingerprint[:12]})")
             return 0
-        changed = is_changed((version, fingerprint), read_state(args.state_file))
+        previous = read_state(args.state_file)
     except BundleError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
+    if previous is None and args.require_state:
+        # On a GitHub-hosted runner (ADR-016) the state directory starts empty, so a
+        # missing record cannot be told apart from a genuine first publish. Refuse to
+        # announce rather than announce every run; persistence is decision #71.
+        print(
+            f"Error: no record of the last announced bundle at {args.state_file}; "
+            "the runner filesystem is discarded after every job (ADR-016) and state "
+            "persistence is not wired yet (decision #71). Refusing to announce.",
+            file=sys.stderr,
+        )
+        return EXIT_NO_STATE
+    changed = is_changed((version, fingerprint), previous)
 
     lines = [f"changed={'true' if changed else 'false'}", f"new_target={version}"]
     for line in lines:

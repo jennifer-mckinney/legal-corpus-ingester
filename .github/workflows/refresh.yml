@@ -68,9 +68,15 @@ jobs:
           # Compares the bundle just published against the record of the last announced
           # one, kept under $XDG_STATE_HOME (else ~/.local/state; outside the checkout, which checkout's clean wipes).
           # Exits 1 if refresh succeeded but published no valid bundle (terms-analysis#90).
+          # The hosted runner's filesystem is discarded after every job (ADR-016), so that
+          # record is absent until state persistence is decided and wired (#71).
+          # --require-state turns a missing record into exit 2 (a red run, no announce)
+          # instead of "changed=true" every week; a wired refresh must never announce and
+          # then forget. Remove the flag only when #71 restores the record before this step.
           python scripts/detect_bundle_change.py detect \
             --bundle-link out/current \
-            --github-output "$GITHUB_OUTPUT"
+            --github-output "$GITHUB_OUTPUT" \
+            --require-state
 
       - name: Open issue on corpus change
         if: steps.detect_change.outputs.changed == 'true'
