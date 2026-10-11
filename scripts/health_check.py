@@ -15,13 +15,20 @@ Exit 3 (cli.EXIT_NOT_WIRED): the only problem is never-run sources while
         known unwired state: not success, and not a broken pipeline either.
         health.yml turns exactly this code into a warning; every other non-zero
         code fails the run. health_verdict() is the one place this is decided.
+Exit 4 (EXIT_CHECKPOINT_INVALID): a checkpoint file exists but cannot be trusted
+        (#17): not a regular file, not strict UTF-8 JSON, not an object, a missing
+        or non-string "stage", a wrong-typed CheckpointState field, or another
+        source's source_name. It outranks every other source problem, whether or not
+        refresh is wired, and the report names the file without echoing its bytes.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import stat
 import sys
+import typing
 import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -30,12 +37,27 @@ from pathlib import Path
 import yaml
 
 from legal_corpus_ingester.cli import EXIT_NOT_WIRED, REFRESH_WIRED
+from legal_corpus_ingester.pipeline.state import CheckpointState
 
 # A stale source, or a never-run source once refresh is wired: a real problem.
 EXIT_SOURCE_PROBLEM: int = 1
 # Config problem (missing/unreadable/empty dir, bad source YAML): distinct from 1
 # (stale sources) so the cause is visible in the exit code.
 EXIT_CONFIG_MISSING: int = 2
+# A checkpoint file that exists but is not a valid CheckpointState (#17). Not 1: an
+# uncaught traceback also exits 1, so a crash and a handled bad checkpoint stay apart.
+EXIT_CHECKPOINT_INVALID: int = 4
+
+# Status label for a source whose checkpoint cannot be trusted. Its row never claims
+# fresh, stale or never-run.
+STATUS_CHECKPOINT_INVALID: str = "checkpoint-invalid"
+
+# The checkpoint schema is the writer's dataclass (pipeline.state.CheckpointStore.save),
+# read here so field names and types are never restated (DEV-FUNDAMENTALS F3, F10).
+_CHECKPOINT_FIELD_TYPES: dict[str, type] = typing.get_type_hints(CheckpointState)
+# The one field the report reads. Older checkpoints carry only {"stage": ...}, so the
+# other fields may be absent, but never wrong-typed.
+_CHECKPOINT_REQUIRED_FIELD: str = "stage"
 
 
 # ---------------------------------------------------------------------------
@@ -250,34 +272,108 @@ def _config_problems(config_dir: Path) -> list[str]:
     return problems
 
 
-def _checkpoint_info(state_dir: Path, source: str) -> tuple[str, str, float | None]:
-    """Return (last_run_utc, stage, lag_hours) for a source checkpoint.
+class CheckpointInvalid(Exception):
+    """A checkpoint file exists but cannot be trusted (#17).
 
-    last_run_utc is an ISO-8601 string or "never".
+    The message is a fixed reason: it never carries the file's bytes or path (F2, F8).
+    """
+
+
+def _checkpoint_problem(data: object, source: str) -> str | None:
+    """Return why parsed checkpoint JSON is not a CheckpointState for ``source``, or None.
+
+    Allowlist (F1): a JSON object in which every CheckpointState field present has
+    its declared type, that carries the required field, and whose source_name (when
+    present) is this source's own (F7). Field names in messages come from the
+    dataclass, never from the file.
+    """
+    if not isinstance(data, dict):
+        return "not a JSON object"
+    for name, expected in _CHECKPOINT_FIELD_TYPES.items():
+        if name in data and not isinstance(data[name], expected):
+            return f'field "{name}" is not of type {expected.__name__}'
+    if _CHECKPOINT_REQUIRED_FIELD not in data:
+        return f'field "{_CHECKPOINT_REQUIRED_FIELD}" is missing'
+    if "source_name" in data and data["source_name"] != source:
+        return "source_name names a different source"
+    return None
+
+
+def _read_checkpoint(checkpoint: Path, source: str) -> tuple[float, str]:
+    """Return (mtime, stage) of an existing checkpoint, failing closed (#17).
+
+    The file type is checked before the file is opened, so a FIFO or device never
+    blocks the job (F6). The open is non-blocking and the opened object is checked
+    again with fstat, so a file swapped in after the first check is caught too, and
+    the mtime comes from the object actually read (F7). Symlinks to a regular file
+    are followed, as the config listing does.
+
+    Raises:
+        CheckpointInvalid: not a regular file, unreadable, not strict UTF-8 JSON, or
+            not a valid CheckpointState for ``source``.
+    """
+    try:
+        before = os.stat(checkpoint)
+    except OSError as exc:
+        # A dangling symlink lands here (lexists saw the link): strerror only (F8).
+        raise CheckpointInvalid(f"cannot read: {exc.strerror or type(exc).__name__}") from exc
+    if not stat.S_ISREG(before.st_mode):
+        raise CheckpointInvalid("is not a regular file")
+
+    try:
+        fd = os.open(checkpoint, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+        with os.fdopen(fd, "rb") as handle:
+            opened = os.fstat(handle.fileno())
+            if not stat.S_ISREG(opened.st_mode):
+                raise CheckpointInvalid("is not a regular file")
+            raw = handle.read()
+    except OSError as exc:
+        # strerror only: the exception's str() repeats the raw path (F8).
+        raise CheckpointInvalid(f"cannot read: {exc.strerror or type(exc).__name__}") from exc
+
+    try:
+        text = raw.decode("utf-8")  # strict: invalid bytes and encoded surrogates fail
+    except UnicodeDecodeError as exc:
+        raise CheckpointInvalid("is not valid UTF-8") from exc
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        # Line number only: the decoder's own message never quotes the document.
+        raise CheckpointInvalid(f"is not valid JSON (line {exc.lineno})") from exc
+    except RecursionError as exc:
+        raise CheckpointInvalid("is not valid JSON (nested too deeply)") from exc
+
+    problem = _checkpoint_problem(data, source)
+    if problem is not None:
+        raise CheckpointInvalid(problem)
+    return opened.st_mtime, data[_CHECKPOINT_REQUIRED_FIELD]
+
+
+def _checkpoint_info(
+    state_dir: Path, source: str
+) -> tuple[str, str, float | None, str | None]:
+    """Return (last_run_utc, stage, lag_hours, problem) for a source checkpoint.
+
+    last_run_utc is an ISO-8601 string, "never" (no checkpoint) or "-" (invalid).
     stage is the last recorded stage string or "-".
-    lag_hours is None if the checkpoint does not exist.
+    lag_hours is None if the checkpoint does not exist or is invalid.
+    problem is None for a missing or valid checkpoint, else one line naming the file
+    (escaped, F2) and the reason it is invalid, never its bytes (F8).
+    Only a path with nothing at it is "never run": lexists, so a dangling symlink is
+    an invalid checkpoint, not a missing one (#17).
     """
     checkpoint = state_dir / f"{source}.checkpoint.json"
-    if not checkpoint.exists():
-        return "never", "-", None
+    if not os.path.lexists(checkpoint):
+        return "never", "-", None, None
 
     try:
-        mtime = os.path.getmtime(checkpoint)
-    except OSError:
-        return "never", "-", None
+        mtime, stage = _read_checkpoint(checkpoint, source)
+    except CheckpointInvalid as exc:
+        return "-", "-", None, f"Checkpoint {display_path(checkpoint.name)} cannot be used: {exc}."
     last_run_dt = datetime.fromtimestamp(mtime, tz=UTC)
     last_run_utc = last_run_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    stage = "-"
-    try:
-        data = json.loads(checkpoint.read_text())
-        stage = str(data.get("stage", "-"))
-    except (json.JSONDecodeError, OSError):
-        pass
-
-    now = _utc_now()
-    lag_hours = (now - last_run_dt).total_seconds() / 3600.0
-    return last_run_utc, stage, lag_hours
+    lag_hours = (_utc_now() - last_run_dt).total_seconds() / 3600.0
+    return last_run_utc, stage, lag_hours, None
 
 
 def _latest_bundle(out_dir: Path) -> str | None:
@@ -316,11 +412,15 @@ def health_verdict(statuses: list[str], refresh_wired: bool) -> int:
 
     Fails closed: any status other than "fresh" is a problem, unless every
     problem is "never-run" and refresh is not wired, which is the known
-    unwired state (EXIT_NOT_WIRED). Stale always fails.
+    unwired state (EXIT_NOT_WIRED). Stale always fails. An invalid checkpoint
+    (EXIT_CHECKPOINT_INVALID) outranks every other problem.
     """
     problems = {s for s in statuses if s != "fresh"}
     if not problems:
         return 0
+    # An untrusted checkpoint outranks everything: no other status may mask it (#17).
+    if STATUS_CHECKPOINT_INVALID in problems:
+        return EXIT_CHECKPOINT_INVALID
     if problems == {"never-run"} and not refresh_wired:
         return EXIT_NOT_WIRED
     return EXIT_SOURCE_PROBLEM
@@ -348,10 +448,15 @@ def build_report(
 
     rows: list[str] = []
     statuses: list[str] = []
+    invalid_notes: list[str] = []
 
     for source in sources:
-        last_run, stage, lag_hours = _checkpoint_info(state_dir, source)
-        status = _status_label(lag_hours, stale_days)
+        last_run, stage, lag_hours, problem = _checkpoint_info(state_dir, source)
+        if problem is None:
+            status = _status_label(lag_hours, stale_days)
+        else:
+            status = STATUS_CHECKPOINT_INVALID
+            invalid_notes.append(problem)
         lag_str = _lag_display(lag_hours)
         statuses.append(status)
 
@@ -366,6 +471,12 @@ def build_report(
     )
 
     verdict = health_verdict(statuses, refresh_wired)
+    if invalid_notes:
+        # Say which file failed and why, without its bytes (F8), in the report itself.
+        table += (
+            "\n" + "\n".join(invalid_notes)
+            + f"\nExit {EXIT_CHECKPOINT_INVALID}: fix or remove each checkpoint above.\n"
+        )
     if verdict == EXIT_NOT_WIRED:
         # Say why the run is not red, in the report itself, so never-run is not read as fine.
         table += (
