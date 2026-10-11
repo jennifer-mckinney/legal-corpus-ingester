@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import os
 import subprocess
@@ -13,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from legal_corpus_ingester import cli
+from legal_corpus_ingester.pipeline import state as checkpoint_module
 from legal_corpus_ingester.pipeline.state import CheckpointState, CheckpointStore
 
 # scripts/ is not a package; inject it into the path.
@@ -76,7 +78,8 @@ class TestBuildReport:
         state_dir.mkdir()
         # Write a checkpoint so the source is "fresh" (recent mtime)
         cp = state_dir / "eurlex.checkpoint.json"
-        cp.write_text(json.dumps({"stage": "publish"}))
+        cp.write_text(json.dumps(dataclasses.asdict(
+            CheckpointState(source_name="eurlex", stage="publish", corpus_version="v1"))))
         # Patch _checkpoint_info to control lag — instead use real file with recent mtime
         report, verdict = build_report(
             config_dir=config_dir,
@@ -156,7 +159,8 @@ class TestMainExitCodes:
         state_dir = tmp_path / "state"
         state_dir.mkdir()
         cp = state_dir / "eurlex.checkpoint.json"
-        cp.write_text(json.dumps({"stage": "done"}))
+        cp.write_text(json.dumps(dataclasses.asdict(
+            CheckpointState(source_name="eurlex", stage="done", corpus_version="v1"))))
         old = time.time() - 9 * 86400
         os.utime(cp, (old, old))
         rc = main(["--config-dir", str(config_dir), "--state-dir", str(state_dir),
@@ -204,9 +208,10 @@ class TestHealthVerdict:
 # The writer is pipeline.state.CheckpointStore.save; the schema is CheckpointState. The
 # field names and types below are read from that dataclass, never restated (F10, F13).
 # Contract pinned here:
-#   * a checkpoint file that exists but is not a JSON object holding a str "stage", whose
-#     every other CheckpointState field present has its declared type, and whose
-#     source_name (if present) names the file's own source, is INVALID;
+#   * a checkpoint file that exists is VALID only if CheckpointStore.load (what
+#     `ingester status` calls) can build a CheckpointState from it: a JSON object with
+#     every field CheckpointState(**data) requires, no key it does not accept, each
+#     field of its declared type, and source_name naming the file's own source (#17 r2);
 #   * an invalid checkpoint exits health_check.EXIT_CHECKPOINT_INVALID, whatever
 #     REFRESH_WIRED says and whatever the other sources look like: never 0, never
 #     EXIT_NOT_WIRED (health.yml's warning-only code), never a traceback;
@@ -231,9 +236,13 @@ _CHILD_TIMEOUT_S = 30.0
 
 _CP_FIELDS = dataclasses.fields(CheckpointState)
 _CP_TYPES = typing.get_type_hints(CheckpointState)
-# health_check reads "stage"; it is the one field a checkpoint must carry. The other
-# fields may be absent (existing fixtures write {"stage": ...} only) but never wrong-typed.
-_REQUIRED_FIELD = "stage"
+# The report's Stage column reads this field.
+_STAGE_FIELD = "stage"
+# What CheckpointState(**data), and so CheckpointStore.load, requires and accepts, read from
+# the constructor's signature: independent of any list health_check or state.py keeps (#17 r2).
+_CTOR_PARAMS = inspect.signature(CheckpointState).parameters
+_CTOR_REQUIRED = frozenset(n for n, p in _CTOR_PARAMS.items() if p.default is inspect.Parameter.empty)
+_CTOR_ACCEPTED = frozenset(_CTOR_PARAMS)
 # One JSON value of every type that is not str, plus hostile text hidden inside containers.
 _WRONG_TYPED_VALUES: dict[str, object] = {
     "null": None,
@@ -266,11 +275,20 @@ def _field_vectors() -> list[tuple[str, dict[str, object], bool]]:
     vectors: list[tuple[str, dict[str, object], bool]] = [("full", _valid_checkpoint(), True)]
     for field in _CP_FIELDS:
         absent = {k: v for k, v in _valid_checkpoint().items() if k != field.name}
-        vectors.append((f"{field.name}-absent", absent, field.name != _REQUIRED_FIELD))
+        vectors.append((f"{field.name}-absent", absent, field.name not in _CTOR_REQUIRED))
         for label, value in _WRONG_TYPED_VALUES.items():
             vectors.append((f"{field.name}-{label}", {**_valid_checkpoint(), field.name: value}, False))
     # F7: the checkpoint must be this source's own, not another source's file copied in.
     vectors.append(("source_name-foreign", {**_valid_checkpoint(), "source_name": "cfpb"}, False))
+    # #17 r2: keys CheckpointState(**data) does not accept crash `ingester status` with the
+    # key in the traceback, so they are invalid here too, hostile or NaN-valued ones included.
+    vectors.append(("unknown-key", {**_valid_checkpoint(), "extra": 1}, False))
+    vectors.append(("unknown-key-hostile", {**_valid_checkpoint(), _HOSTILE_TEXT: "x"}, False))
+    vectors.append(("unknown-key-nan", {**_valid_checkpoint(), "extra": float("nan")}, False))
+    vectors.append(("unknown-key-empty-name", {**_valid_checkpoint(), "": "x"}, False))
+    # The legacy shape health_check used to accept; CheckpointStore.load raises TypeError on it.
+    vectors.append(("legacy-stage-only", {_STAGE_FIELD: "done"}, False))
+    vectors.append(("empty-object", {}, False))
     return vectors
 
 
@@ -468,7 +486,10 @@ class TestCheckpointShapeControls:
         rc, out, err = _run_main(tmp_path, capsys)
         assert rc == 0, (out, err)
         ((_name, _last_run, stage, _lag, status),) = _source_rows(out)
-        assert (stage, status) == (checkpoint[_REQUIRED_FIELD], "fresh")
+        assert (stage, status) == (checkpoint[_STAGE_FIELD], "fresh")
+        # Whatever the health check calls fresh, `ingester status` can load (#17 r2).
+        loaded = CheckpointStore(tmp_path / "state").load(_SOURCE)
+        assert loaded is not None and loaded.stage == checkpoint[_STAGE_FIELD]
 
     def test_missing_checkpoint_stays_never_run(self, tmp_path, capsys, refresh_wired):
         # Missing and malformed stay apart: no file is "never run", with today's codes.
@@ -484,10 +505,115 @@ class TestCheckpointShapeControls:
         # Contract: the generated table tracks CheckpointState. Every field has invalid
         # vectors and appears in a valid one; the generator only knows how to break str fields.
         names = {f.name for f in _CP_FIELDS}
-        assert _REQUIRED_FIELD in names
+        assert _STAGE_FIELD in _CTOR_REQUIRED
+        assert names == _CTOR_ACCEPTED
         assert all(_CP_TYPES[name] is str for name in names), "extend _WRONG_TYPED_VALUES for the new type"
         invalid_ids = {vid for vid, _obj, ok in _FIELD_VECTORS if not ok}
         for name in names:
             assert {f"{name}-{label}" for label in _WRONG_TYPED_VALUES} <= invalid_ids
         assert set(_valid_checkpoint()) == names
         assert _FIELD_VALID and _FIELD_INVALID
+
+
+# ---------------------------------------------------------------------------
+# #17 r2: one rule for "valid checkpoint". health.yml runs health_check.py first and then
+# `ingester status`, which reads every checkpoint through CheckpointStore.load
+# (CheckpointState(**data)). Every checkpoint that load cannot build must be reported by the
+# health check as EXIT_CHECKPOINT_INVALID, or status crashes on it with a traceback (and
+# echoes an unknown key raw). The oracle below is load itself, not a restated field list.
+# ---------------------------------------------------------------------------
+
+
+def _all_checkpoint_bodies() -> dict[str, bytes]:
+    bodies = {f"field-{vid}": json.dumps(obj).encode() for vid, obj, _ok in _FIELD_VECTORS}
+    bodies.update({f"non-object-{k}": v for k, v in _NON_OBJECT_BYTES.items()})
+    bodies.update({f"unparseable-{k}": v for k, v in _UNPARSEABLE_BYTES.items()})
+    return bodies
+
+
+_ALL_BODIES = _all_checkpoint_bodies()
+
+
+def _load_fails(state: Path) -> bool:
+    """True when CheckpointStore.load, as `ingester status` calls it, cannot build a state."""
+    try:
+        CheckpointStore(state).load(_SOURCE)
+    except Exception:  # noqa: BLE001 — any failure of the real reader is what we compare against
+        return True
+    return False
+
+
+class TestCheckpointParityWithStore:
+    """#17 r2: the health check and CheckpointStore.load share one validity rule."""
+
+    @pytest.mark.parametrize("body", list(_ALL_BODIES.values()), ids=list(_ALL_BODIES))
+    def test_every_checkpoint_the_store_cannot_load_is_invalid(self, tmp_path, capsys, refresh_wired, body):
+        _write_source_configs(tmp_path / "config")
+        state = _state_with_checkpoint(tmp_path, body)
+        load_fails = _load_fails(state)
+        rc, out, err = _run_main(tmp_path, capsys)
+        if load_fails:
+            _assert_checkpoint_invalid(rc, out, err, tmp_path)
+        else:
+            # load accepts it: the health check may be stricter (types, foreign source_name),
+            # never looser, and never crash.
+            assert "Traceback" not in err
+            assert rc in (0, _checkpoint_invalid_code()), (rc, out[-600:], err[-600:])
+
+    def test_parity_corpus_has_load_failures_of_every_kind(self, tmp_path):
+        # The oracle branch above must not go vacuous: each family that crashes status today
+        # (missing field, unknown key, legacy shape, non-object) is in the corpus.
+        failing: set[str] = set()
+        for vid, body in _ALL_BODIES.items():
+            case = tmp_path / vid.replace("/", "_")
+            case.mkdir()
+            (case / "state").mkdir()
+            (case / "state" / _CHECKPOINT_NAME).write_bytes(body)
+            if _load_fails(case / "state"):
+                failing.add(vid)
+        expected = {f"field-{name}-absent" for name in _CTOR_REQUIRED} | {
+            "field-unknown-key", "field-unknown-key-hostile", "field-legacy-stage-only",
+            "field-empty-object", "non-object-empty-list", "non-object-null",
+        }
+        assert expected <= failing, sorted(expected - failing)
+
+    def test_health_check_uses_the_store_field_list(self):
+        # One list: state.py derives it from CheckpointState, health_check imports it.
+        required = getattr(checkpoint_module, "CHECKPOINT_REQUIRED_FIELDS", None)
+        field_types = getattr(checkpoint_module, "CHECKPOINT_FIELD_TYPES", None)
+        problem = getattr(checkpoint_module, "checkpoint_problem", None)
+        assert required is not None and field_types is not None and callable(problem), (
+            "pipeline/state.py must expose CHECKPOINT_REQUIRED_FIELDS, CHECKPOINT_FIELD_TYPES "
+            "and checkpoint_problem (#17 r2)"
+        )
+        assert set(required) == _CTOR_REQUIRED
+        assert set(field_types) == _CTOR_ACCEPTED
+        assert dict(field_types) == _CP_TYPES
+        # health_check validates through the store's function, not a copy of it.
+        assert getattr(health_check, "checkpoint_problem", None) is problem
+        for stale in ("_CHECKPOINT_FIELD_TYPES", "_CHECKPOINT_REQUIRED_FIELD"):
+            assert not hasattr(health_check, stale), f"health_check still keeps its own {stale}"
+
+    @pytest.mark.parametrize(("vid", "obj", "ok"), _FIELD_VECTORS, ids=[v for v, _o, _k in _FIELD_VECTORS])
+    def test_store_rule_matches_field_vectors(self, vid, obj, ok):
+        # Truth table for the shared validator itself: None exactly for the valid vectors
+        # (source_name-foreign is a health_check-only rule, so it is valid to the store).
+        problem = getattr(checkpoint_module, "checkpoint_problem", None)
+        assert callable(problem), "pipeline/state.py exposes no checkpoint_problem (#17 r2)"
+        expected_ok = ok or vid == "source_name-foreign"
+        assert (problem(obj) is None) is expected_ok, (vid, problem(obj))
+
+    @pytest.mark.parametrize("body", list(_NON_OBJECT_BYTES.values()), ids=list(_NON_OBJECT_BYTES))
+    def test_store_rule_rejects_non_objects(self, body):
+        problem = getattr(checkpoint_module, "checkpoint_problem", None)
+        assert callable(problem), "pipeline/state.py exposes no checkpoint_problem (#17 r2)"
+        assert problem(json.loads(body)) == "not a JSON object"
+
+    def test_store_rule_messages_never_echo_the_file(self):
+        # F8: an unknown key is reported by a fixed message, never by name.
+        problem = getattr(checkpoint_module, "checkpoint_problem", None)
+        assert callable(problem), "pipeline/state.py exposes no checkpoint_problem (#17 r2)"
+        message = problem({**_valid_checkpoint(), _HOSTILE_TEXT: "x"})
+        assert message is not None
+        for raw in _RAW_FORBIDDEN:
+            assert raw not in message
