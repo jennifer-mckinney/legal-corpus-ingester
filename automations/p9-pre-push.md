@@ -52,7 +52,7 @@ Workflow: `.github/workflows/p9-review.yml`.
   home, `./path` is the working directory, and a single `/path` is relative
   to the settings file, so no rule uses a single leading slash.
   - `Read(//proc/**)` and `Read(//sys/**)`: the process
-    environment (`ANTHROPIC_API_KEY`, the job token) cannot be read back;
+    environment (`CLAUDE_CODE_OAUTH_TOKEN`, the job token) cannot be read back;
   - `Read(~/.git-credentials)`, `Read(~/.config/gh/**)` and
     `Read(~/.claude/.credentials.json)`: runner credential files;
   - `Read(/${{ runner.temp }}/_runner_file_commands/**)`: the runner's
@@ -69,8 +69,8 @@ Workflow: `.github/workflows/p9-review.yml`.
 - **Permissions:** the workflow grants nothing by default; each job gets
   `contents: read` and `pull-requests: write` (for the inline comments) and
   uses the job's own `github.token`.
-- **Secret:** `ANTHROPIC_API_KEY`, used only as the action's
-  `anthropic_api_key` input, so it is set in that step only; there is no
+- **Secret:** `CLAUDE_CODE_OAUTH_TOKEN`, used only as the action's
+  `claude_code_oauth_token` input, so it is set in that step only; there is no
   workflow- or job-level `env`. Fork PRs receive no secrets, so the review step
   fails and the job fails closed.
 
@@ -117,7 +117,9 @@ the owner can waive a finding, at merge time.
 
 ## Owner setup
 
-1. Add the `ANTHROPIC_API_KEY` repository secret.
+1. Add the `CLAUDE_CODE_OAUTH_TOKEN` repository secret: the owner's Claude
+   subscription token from `claude setup-token` (claude-code-action
+   `docs/setup.md`; owner decision 2026-10-11).
 2. After the first green run, add `security-review` and `grumpy-review` as
    required status checks on `main`.
 

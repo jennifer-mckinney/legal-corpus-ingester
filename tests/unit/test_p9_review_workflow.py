@@ -582,16 +582,19 @@ def test_permissions_are_least_privilege() -> None:
         assert job["permissions"] == JOB_PERMISSIONS, name
 
 
-def test_secret_is_referenced_only_as_the_action_api_key() -> None:
+def test_secret_is_referenced_only_as_the_action_oauth_token() -> None:
     text = WORKFLOW.read_text(encoding="utf-8")
     # No workflow- or job-level env: the key must reach only the action step.
     assert "env" not in _workflow()
     for name, job in _jobs().items():
         assert "env" not in job, name
-    assert set(re.findall(r"secrets\.[A-Za-z0-9_]+", text)) == {"secrets.ANTHROPIC_API_KEY"}
-    assert text.count("secrets.ANTHROPIC_API_KEY") == len(BRIEFS)
+    assert set(re.findall(r"secrets\.[A-Za-z0-9_]+", text)) == {"secrets.CLAUDE_CODE_OAUTH_TOKEN"}
+    assert text.count("secrets.CLAUDE_CODE_OAUTH_TOKEN") == len(BRIEFS)
     for name, job in _jobs().items():
-        assert _action_step(job)["with"]["anthropic_api_key"] == "${{ secrets.ANTHROPIC_API_KEY }}"
+        assert _action_step(job)["with"]["claude_code_oauth_token"] == "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}"
+        # Subscription auth only (owner, 2026-10-11): no API key input, so a review
+        # never draws API credit.
+        assert "anthropic_api_key" not in _action_step(job)["with"], name
         for step in job["steps"]:
             assert "secrets." not in json.dumps(step.get("env", {})), name
 

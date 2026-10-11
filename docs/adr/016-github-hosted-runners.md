@@ -43,7 +43,7 @@ Other facts bearing on the decision:
   vendor-documented patterns over custom machinery. The runner service, its launchd plist,
   `scripts/setup_runner.sh` and the tool-cache seed are custom machinery.
 - This repository and the terms-analysis consumer are both public. No job needs a secret beyond
-  the job's own `github.token`; the one repository secret (`ANTHROPIC_API_KEY`) belongs to the P9
+  the job's own `github.token`; the one repository secret (`CLAUDE_CODE_OAUTH_TOKEN`) belongs to the P9
   review jobs, which already run on `ubuntu-latest` (ADR-015).
 - The five jobs read tracked files, run tests, and in the canary's case re-record cassettes from
   public legal sources. None of them reads a published corpus bundle, an index or an embedding.
