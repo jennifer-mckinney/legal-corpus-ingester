@@ -119,7 +119,9 @@ the owner can waive a finding, at merge time.
 
 1. Add the `CLAUDE_CODE_OAUTH_TOKEN` repository secret: the owner's Claude
    subscription token from `claude setup-token` (claude-code-action
-   `docs/setup.md`; owner decision 2026-10-11).
+   `docs/setup.md`; owner decision 2026-10-11). The review jobs no longer
+   read the old `ANTHROPIC_API_KEY` secret; the owner may delete it from the
+   repo secrets once #81 has merged.
 2. After the first green run, add `security-review` and `grumpy-review` as
    required status checks on `main`.
 
