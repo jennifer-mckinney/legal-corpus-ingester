@@ -20,6 +20,13 @@ jobs:
         with:
           persist-credentials: false  # no step needs git credentials; keep the token out of .git/config
 
+      # Worktree hygiene (terms-analysis#123): agent worktree roots, listed in
+      # .claude/governance/worktree-roots.txt, must be ignored by the tracked
+      # .gitignore and must contain nothing tracked. Exit codes 0-3 are in
+      # scripts/governance/README.md; only 0 (with "CLEAN <n>") passes.
+      - name: Worktree hygiene
+        run: bash scripts/governance/check-no-stale-worktrees.sh
+
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
