@@ -14,6 +14,7 @@ run on its own with no helper module beside it.
 """
 from __future__ import annotations
 
+import dataclasses
 import errno
 import json
 import os
@@ -31,6 +32,8 @@ from types import ModuleType
 import pytest
 import yaml
 
+from legal_corpus_ingester.pipeline.state import CheckpointState
+
 # scripts/ is not a package; inject it into the path.
 _SCRIPTS = Path(__file__).parent.parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS))
@@ -42,6 +45,11 @@ from health_check import main  # noqa: E402
 
 _EXIT_CONFIG = 2
 _FIXTURE_SOURCE = Path(__file__).resolve().parents[1] / "fixtures" / "sources" / "eurlex.yaml"
+
+
+def _checkpoint(stage: str) -> dict[str, object]:
+    """A complete eurlex checkpoint as CheckpointStore.save writes it (#17 r2: stage-only is invalid)."""
+    return dataclasses.asdict(CheckpointState(source_name="eurlex", stage=stage, corpus_version="v1"))
 # A directory name that tries to forge terminal output: clear-screen escape,
 # a newline followed by a fake status line, and a bidi override.
 _HOSTILE_NAME = "hostile-cfg\x1b[2J\nFORGED: all sources fresh\u202e"
@@ -546,7 +554,7 @@ def test_hostile_checkpoint_stage_is_escaped_on_exit_zero_path(
     state = tmp_path / "state"
     state.mkdir()
     stage = "pub\x1b[2J|lished\nFORGED | x | y | z | fresh |\u2028\u202e"
-    (state / "eurlex.checkpoint.json").write_text(json.dumps({"stage": stage}))
+    (state / "eurlex.checkpoint.json").write_text(json.dumps(_checkpoint(stage)))
     rc, out, _err = _run(config_dir, tmp_path, capsys)
     assert rc == 0  # fresh source: the success path must be safe too
     (report,) = (tmp_path / "out" / "health").glob("*.md")
@@ -613,7 +621,7 @@ def test_fresh_valid_source_still_exits_zero(tmp_path: Path, capsys: pytest.Capt
     (config_dir / "eurlex.yaml").write_text(_FIXTURE_SOURCE.read_text())
     state = tmp_path / "state"
     state.mkdir()
-    (state / "eurlex.checkpoint.json").write_text(json.dumps({"stage": "published"}))
+    (state / "eurlex.checkpoint.json").write_text(json.dumps(_checkpoint("published")))
     rc, out, _err = _run(config_dir, tmp_path, capsys)
     assert rc == 0
     assert "| eurlex |" in out

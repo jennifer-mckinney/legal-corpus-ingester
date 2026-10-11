@@ -16,10 +16,11 @@ Exit 3 (cli.EXIT_NOT_WIRED): the only problem is never-run sources while
         health.yml turns exactly this code into a warning; every other non-zero
         code fails the run. health_verdict() is the one place this is decided.
 Exit 4 (EXIT_CHECKPOINT_INVALID): a checkpoint file exists but cannot be trusted
-        (#17): not a regular file, not strict UTF-8 JSON, not an object, a missing
-        or non-string "stage", a wrong-typed CheckpointState field, or another
-        source's source_name. It outranks every other source problem, whether or not
-        refresh is wired, and the report names the file without echoing its bytes.
+        (#17): not a regular file, not strict UTF-8 JSON, or not an object that
+        CheckpointStore.load accepts (a missing, unknown or wrong-typed
+        CheckpointState field), or another source's source_name. It outranks every
+        other source problem, whether or not refresh is wired, and the report names
+        the file without echoing its bytes.
 """
 from __future__ import annotations
 
@@ -28,7 +29,6 @@ import json
 import os
 import stat
 import sys
-import typing
 import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -37,7 +37,7 @@ from pathlib import Path
 import yaml
 
 from legal_corpus_ingester.cli import EXIT_NOT_WIRED, REFRESH_WIRED
-from legal_corpus_ingester.pipeline.state import CheckpointState
+from legal_corpus_ingester.pipeline.state import checkpoint_problem
 
 # A stale source, or a never-run source once refresh is wired: a real problem.
 EXIT_SOURCE_PROBLEM: int = 1
@@ -52,12 +52,10 @@ EXIT_CHECKPOINT_INVALID: int = 4
 # fresh, stale or never-run.
 STATUS_CHECKPOINT_INVALID: str = "checkpoint-invalid"
 
-# The checkpoint schema is the writer's dataclass (pipeline.state.CheckpointStore.save),
-# read here so field names and types are never restated (DEV-FUNDAMENTALS F3, F10).
-_CHECKPOINT_FIELD_TYPES: dict[str, type] = typing.get_type_hints(CheckpointState)
-# The one field the report reads. Older checkpoints carry only {"stage": ...}, so the
-# other fields may be absent, but never wrong-typed.
-_CHECKPOINT_REQUIRED_FIELD: str = "stage"
+# Checkpoint validity is pipeline.state.checkpoint_problem, the same rule set
+# CheckpointStore.load enforces, so a checkpoint this script passes never crashes
+# `ingester status` (#17 r2; DEV-FUNDAMENTALS F3, F10). The report reads one field.
+_STAGE_FIELD: str = "stage"
 
 
 # ---------------------------------------------------------------------------
@@ -282,19 +280,16 @@ class CheckpointInvalid(Exception):
 def _checkpoint_problem(data: object, source: str) -> str | None:
     """Return why parsed checkpoint JSON is not a CheckpointState for ``source``, or None.
 
-    Allowlist (F1): a JSON object in which every CheckpointState field present has
-    its declared type, that carries the required field, and whose source_name (when
-    present) is this source's own (F7). Field names in messages come from the
-    dataclass, never from the file.
+    Allowlist (F1): whatever pipeline.state.checkpoint_problem accepts (exactly the
+    CheckpointState fields, each of its declared type), whose source_name is this
+    source's own (F7). Field names in messages come from the dataclass, never from
+    the file.
     """
-    if not isinstance(data, dict):
-        return "not a JSON object"
-    for name, expected in _CHECKPOINT_FIELD_TYPES.items():
-        if name in data and not isinstance(data[name], expected):
-            return f'field "{name}" is not of type {expected.__name__}'
-    if _CHECKPOINT_REQUIRED_FIELD not in data:
-        return f'field "{_CHECKPOINT_REQUIRED_FIELD}" is missing'
-    if "source_name" in data and data["source_name"] != source:
+    problem = checkpoint_problem(data)
+    if problem is not None:
+        return problem
+    # checkpoint_problem returned None, so data is an object carrying source_name.
+    if isinstance(data, dict) and data["source_name"] != source:
         return "source_name names a different source"
     return None
 
@@ -346,7 +341,7 @@ def _read_checkpoint(checkpoint: Path, source: str) -> tuple[float, str]:
     problem = _checkpoint_problem(data, source)
     if problem is not None:
         raise CheckpointInvalid(problem)
-    return opened.st_mtime, data[_CHECKPOINT_REQUIRED_FIELD]
+    return opened.st_mtime, data[_STAGE_FIELD]
 
 
 def _checkpoint_info(

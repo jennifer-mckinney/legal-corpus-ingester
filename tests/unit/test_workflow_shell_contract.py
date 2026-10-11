@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import importlib.util
 import json
 import os
@@ -590,6 +591,24 @@ _MALFORMED_CHECKPOINTS = {
 }
 
 
+def _writer_checkpoint() -> dict[str, object]:
+    """What CheckpointStore.save writes for the first configured source."""
+    return dataclasses.asdict(CheckpointState(source_name=_first_source(), stage="done", corpus_version="v1"))
+
+
+# #17 r2: objects the health check used to pass that crash `ingester status`
+# (CheckpointState(**data) raises TypeError), one per kind. The hostile key would reach the
+# CI log raw in status's traceback.
+_MALFORMED_CHECKPOINTS.update({
+    "legacy-stage-only": json.dumps({"stage": "done"}).encode(),
+    "missing-corpus-version": json.dumps(
+        {k: v for k, v in _writer_checkpoint().items() if k != "corpus_version"}).encode(),
+    "missing-source-name": json.dumps(
+        {k: v for k, v in _writer_checkpoint().items() if k != "source_name"}).encode(),
+    "unknown-key-hostile": json.dumps({**_writer_checkpoint(), f"{_JOB_CANARY}\x1b[2J‮": "x"}).encode(),
+})
+
+
 @pytest.mark.parametrize("raw", list(_MALFORMED_CHECKPOINTS.values()), ids=list(_MALFORMED_CHECKPOINTS))
 def test_health_job_surfaces_invalid_checkpoint_exit_code(tmp_path: Path, raw: bytes) -> None:
     xdg = tmp_path / "xdg"
@@ -638,7 +657,8 @@ def test_health_check_step_end_to_end_stale_source_fails(tmp_path: Path) -> None
     state = tmp_path / "xdg" / "legal-corpus-ingester" / "state"
     state.mkdir(parents=True)
     cp = state / "eurlex_gdpr.checkpoint.json"
-    cp.write_text(json.dumps({"stage": "done"}))
+    cp.write_text(json.dumps(dataclasses.asdict(
+        CheckpointState(source_name="eurlex_gdpr", stage="done", corpus_version="v1"))))
     old = time.time() - 30 * 86400
     os.utime(cp, (old, old))
     result, _, _ = _run_health_step(tmp_path, "health-check", xdg=tmp_path / "xdg")
