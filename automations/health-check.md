@@ -69,10 +69,12 @@ never excused. The PR that wires refresh flips `REFRESH_WIRED` to True (a unit
 test fails until it does), after which never-run exits 1.
 
 A checkpoint is valid only when it is a regular file (a symlink to one is
-followed) holding strict UTF-8 JSON: an object in which every
-`CheckpointState` field (`pipeline/state.py`) that is present is a string,
-`stage` is present and, if `source_name` is present, it names its own
-source. Anything else at the checkpoint path, including a directory, a FIFO
+followed) holding strict UTF-8 JSON that `CheckpointStore.load` accepts: an
+object with exactly the `CheckpointState` fields (`pipeline/state.py`), every
+field without a default present, no unknown keys, each field a string, and
+`source_name` naming its own source. The rule is `checkpoint_problem` in
+`pipeline/state.py`, shared with the store, so a checkpoint that passes the
+health check never crashes `ingester status` (#17). Anything else at the checkpoint path, including a directory, a FIFO
 or a dangling symlink, is invalid: the source's row shows `checkpoint-invalid`, the report names the file
 and the reason without echoing its contents, and the script exits 4 (#17). A
 path with nothing at it is still never-run.

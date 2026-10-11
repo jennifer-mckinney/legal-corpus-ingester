@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+import typing
+from dataclasses import MISSING, asdict, dataclass, fields
 from pathlib import Path
 
 # Ordered pipeline stages; "fetch_failed" / "embed_failed" are error states.
@@ -14,6 +15,36 @@ class CheckpointState:
     stage: str          # one of STAGES or an error variant
     corpus_version: str
     error: str = ""
+
+
+# The checkpoint schema, derived from the dataclass so it is stated once (#17). These are
+# exactly the rules CheckpointState(**data) in CheckpointStore.load enforces at
+# construction (keys) plus the declared field types, which the dataclass does not check.
+CHECKPOINT_FIELD_TYPES: dict[str, type] = typing.get_type_hints(CheckpointState)
+CHECKPOINT_REQUIRED_FIELDS: frozenset[str] = frozenset(
+    f.name for f in fields(CheckpointState)
+    if f.default is MISSING and f.default_factory is MISSING
+)
+
+
+def checkpoint_problem(data: object) -> str | None:
+    """Return why parsed checkpoint JSON is not a loadable CheckpointState, or None.
+
+    None means CheckpointStore.load would build a CheckpointState from *data* without
+    error and every field has its declared type. Messages name fields only from the
+    dataclass, never from *data* (an unknown key is untrusted text).
+    """
+    if not isinstance(data, dict):
+        return "not a JSON object"
+    if not set(data) <= CHECKPOINT_FIELD_TYPES.keys():
+        return "has an unknown field"
+    for name, expected in CHECKPOINT_FIELD_TYPES.items():
+        if name in data and not isinstance(data[name], expected):
+            return f'field "{name}" is not of type {expected.__name__}'
+    for name in sorted(CHECKPOINT_REQUIRED_FIELDS):
+        if name not in data:
+            return f'field "{name}" is missing'
+    return None
 
 
 class CheckpointStore:
