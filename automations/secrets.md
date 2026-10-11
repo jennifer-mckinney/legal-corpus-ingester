@@ -33,7 +33,7 @@ the developer host by design (see next section).
 CI runs on GitHub-hosted `ubuntu-latest` runners (ADR-016). Each workflow
 sets the environment it needs in the workflow file; no job reads a host
 environment, and no job needs a secret beyond its own `github.token`. The
-one repository secret, `ANTHROPIC_API_KEY`, belongs to the P9 review jobs
+one repository secret, `CLAUDE_CODE_OAUTH_TOKEN`, belongs to the P9 review jobs
 (see `automations/p9-pre-push.md`).
 
 No `.env` value is placed in GitHub secrets or variables. Values that

@@ -13,15 +13,17 @@ name: P9 Review
 # tool. No Bash, so it sees the change through a diff and a changed-file list
 # prepared before it runs. Reads are fenced to the workspace and that
 # directory, and /proc, /sys and runner credential paths are denied as defence in
-# depth, so the process environment (ANTHROPIC_API_KEY, the job token) cannot
+# depth, so the process environment (CLAUDE_CODE_OAUTH_TOKEN, the job token) cannot
 # be read back. Checkout keeps no credential (persist-credentials: false), but
 # the action itself writes the job token into the origin URL in .git/config,
 # so the workspace .git directory is denied too. --setting-sources user ignores
-# any .claude/settings.json the PR adds. ANTHROPIC_API_KEY is only the action step's input, never job env.
+# any .claude/settings.json the PR adds. CLAUDE_CODE_OAUTH_TOKEN is only the action step's input, never job env.
 # Branch protection is pending: after the first green run the owner makes both
 # jobs (security-review, grumpy-review) required checks on main.
 #
-# Auth: the ANTHROPIC_API_KEY repo secret. Fork PRs receive no secrets, so the
+# Auth: the CLAUDE_CODE_OAUTH_TOKEN repo secret, the owner's Claude subscription
+# token (claude-code-action docs/setup.md; owner decision 2026-10-11), so a
+# review does not draw API credit. Fork PRs receive no secrets, so the
 # review step fails and the job fails closed.
 # Only fixed, non-user-controlled values (repo name, PR number, SHAs) reach the
 # prompt; no PR title, body or branch name is interpolated anywhere.
@@ -89,7 +91,7 @@ jobs:
       - name: Security review
         uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b # v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
           prompt: |
             REPO: ${{ github.repository }}
@@ -161,7 +163,7 @@ jobs:
       - name: Code-quality review
         uses: anthropics/claude-code-action@2dca132ff0e0c4094ce6048b422c6915a071210b # v1
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ github.token }}
           prompt: |
             REPO: ${{ github.repository }}
