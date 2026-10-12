@@ -22,7 +22,8 @@ import pytest
 from typer.testing import CliRunner
 
 from legal_corpus_ingester import cli
-from tests.cli.helpers import PUBLIC_EXIT_CODES
+from legal_corpus_ingester.sources.registry import load_all
+from tests.cli.helpers import PUBLIC_EXIT_CODES, SOURCES_DIR_COMMANDS, sources_dir_argv
 
 runner = CliRunner()
 
@@ -142,13 +143,19 @@ _SOURCES_BUILDERS: dict[str, Callable[[Path], str]] = {
     "configured": _configured,
 }
 
+def _configured_source() -> str:
+    """A source name the repo's config defines, read from the config rather than restated."""
+    return next(iter(load_all(_SOURCES_DIR)))
+
+
 _NON_USAGE_RUNS: list[tuple[str, Callable[[Path], list[str]]]] = [
+    # #108 fold-in: every --sources-dir command, not only status and refresh.
     *(
-        (f"status-{key}", lambda r, b=b: ["status", "--sources-dir", b(r), "--state-dir", str(r / "state")])
-        for key, b in _SOURCES_BUILDERS.items()
-    ),
-    *(
-        (f"refresh-{key}", lambda r, b=b: ["refresh", "--all", "--sources-dir", b(r)])
+        (
+            f"{command.replace(' ', '-')}-{key}",
+            lambda r, b=b, c=command: sources_dir_argv(c, b(r), r, _configured_source()),
+        )
+        for command in SOURCES_DIR_COMMANDS
         for key, b in _SOURCES_BUILDERS.items()
     ),
     ("fetch-unknown-source", lambda r: ["fetch", "no_such_source", "--sources-dir", str(_SOURCES_DIR)]),
@@ -233,11 +240,12 @@ def test_docs_do_not_call_a_missing_dir_a_load_error() -> None:
 # --- #108: how the sources dir is classified (mutants M3, M6, M9 from the coder's probes) -----
 
 def _commands(sources_dir: str, root: Path) -> dict[str, list[str]]:
-    """refresh and status share the sources-dir classification; both must give the same code."""
-    return {
-        "status": ["status", "--sources-dir", sources_dir, "--state-dir", str(root / "state")],
-        "refresh": ["refresh", "--all", "--sources-dir", sources_dir],
-    }
+    """Every --sources-dir command shares the sources-dir classification and gives the same code.
+
+    #108 fold-in (owner ruling 2026-10-12): fetch, sources list and audit-license joined status
+    and refresh, because the top-level help says 6 means a missing --sources-dir for the tool.
+    """
+    return {c: sources_dir_argv(c, sources_dir, root, _configured_source()) for c in SOURCES_DIR_COMMANDS}
 
 
 def _fail_for(monkeypatch: pytest.MonkeyPatch, name: str, target: str, code: int) -> None:
@@ -255,7 +263,7 @@ def _fail_for(monkeypatch: pytest.MonkeyPatch, name: str, target: str, code: int
     monkeypatch.setattr(os, name, fake)
 
 
-@pytest.mark.parametrize("command", ["status", "refresh"])
+@pytest.mark.parametrize("command", SOURCES_DIR_COMMANDS)
 @pytest.mark.parametrize("code", [errno.EACCES, errno.EPERM, errno.EIO], ids=["EACCES", "EPERM", "EIO"])
 def test_stat_error_outside_missing_allowlist_is_load_error_not_dir_missing(
     command: str, code: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -268,12 +276,16 @@ def test_stat_error_outside_missing_allowlist_is_load_error_not_dir_missing(
     _fail_for(monkeypatch, "stat", target, code)
     _fail_for(monkeypatch, "scandir", target, code)
     result = runner.invoke(cli.app, args)
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
     assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_LOAD_ERROR"], (result.exit_code, result.stderr)
     assert cli.MSG_SOURCES_DIR_MISSING not in result.stderr, result.stderr  # message honesty (F8)
+    # #108 fold-in: it is reported as a load error, by the shared stem, not as an unknown source
+    # or "directory not found" (load_all's old message, which also carried the path).
+    assert cli.MSG_LOAD_ERROR in result.stderr, result.stderr
     assert target not in result.output + result.stderr, "the path must not be echoed (F8)"
 
 
-@pytest.mark.parametrize("command", ["status", "refresh"])
+@pytest.mark.parametrize("command", SOURCES_DIR_COMMANDS)
 @pytest.mark.parametrize("code", [errno.EACCES, errno.EPERM], ids=["EACCES", "EPERM"])
 def test_existing_unreadable_sources_dir_is_load_error(
     command: str, code: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -285,8 +297,12 @@ def test_existing_unreadable_sources_dir_is_load_error(
     args = _commands(target, tmp_path)[command]
     _fail_for(monkeypatch, "scandir", target, code)
     result = runner.invoke(cli.app, args)
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
     assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_LOAD_ERROR"], (result.exit_code, result.stderr)
     assert cli.MSG_NO_SOURCES not in result.output + result.stderr, result.output
+    # #108 fold-in: `sources list` must not call it "No sources configured." and exit 0, and
+    # fetch / audit-license must not call it an unknown source: it is a load error.
+    assert cli.MSG_LOAD_ERROR in result.stderr, result.stderr
     assert target not in result.output + result.stderr, "the path must not be echoed (F8)"
 
 
@@ -313,7 +329,7 @@ _SYMLINK_LOOPS: dict[str, Callable[[Path], str]] = {
 }
 
 
-@pytest.mark.parametrize("command", ["status", "refresh"])
+@pytest.mark.parametrize("command", SOURCES_DIR_COMMANDS)
 @pytest.mark.parametrize("build", list(_SYMLINK_LOOPS.values()), ids=list(_SYMLINK_LOOPS))
 def test_symlink_loop_sources_dir_is_dir_missing(
     command: str, build: Callable[[Path], str], tmp_path: Path
@@ -325,6 +341,7 @@ def test_symlink_loop_sources_dir_is_dir_missing(
         os.stat(target)
     assert raised.value.errno == errno.ELOOP, "control: the fixture must be a real ELOOP"
     result = runner.invoke(cli.app, _commands(target, tmp_path)[command])
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
     assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_SOURCES_DIR_MISSING"], (
         result.exit_code, result.stderr,
     )

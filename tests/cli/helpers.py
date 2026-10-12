@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 # CSI escape sequences (colour/style), as emitted by Rich/typer help rendering.
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
@@ -40,3 +41,30 @@ EXIT_CODE_MEANINGS: dict[str, tuple[str, ...]] = {
     "EXIT_NO_SOURCES": ("holds no source",),
     "EXIT_SOURCES_DIR_MISSING": ("does not exist", "not a directory"),
 }
+
+# Every command that takes --sources-dir, by the name `ingester --help` shows (#108, owner ruling
+# 2026-10-12 "fold in"): the top-level help says 6 means a missing --sources-dir for the whole tool,
+# so each of these must classify the path the same way. test_cli_smoke pins this tuple to the
+# commands the app actually registers with a --sources-dir option.
+SOURCES_DIR_COMMANDS: tuple[str, ...] = ("status", "refresh", "fetch", "sources list", "audit-license")
+
+
+def sources_dir_argv(command: str, sources_dir: str, root: Path, source: str) -> list[str]:
+    """argv that runs *command* on *sources_dir*, with every other path kept under *root*.
+
+    *source* is the source name for fetch and audit-license. audit-license runs --offline with
+    its own state file, so no row can reach the network or the repo's state/.
+    """
+    argv: dict[str, list[str]] = {
+        "status": ["status", "--sources-dir", sources_dir, "--state-dir", str(root / "state")],
+        "refresh": ["refresh", "--all", "--sources-dir", sources_dir],
+        "fetch": ["fetch", source, "--sources-dir", sources_dir],
+        "sources list": ["sources", "list", "--sources-dir", sources_dir],
+        "audit-license": [
+            "audit-license", source, "--offline",
+            "--state-file", str(root / "license-hashes.json"),
+            "--sources-dir", sources_dir,
+        ],
+    }
+    assert set(argv) == set(SOURCES_DIR_COMMANDS), "argv table out of step with SOURCES_DIR_COMMANDS"
+    return argv[command]

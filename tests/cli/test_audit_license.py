@@ -7,8 +7,8 @@ from typing import Any
 
 from typer.testing import CliRunner
 
-from legal_corpus_ingester.cli import app
-from tests.cli.helpers import strip_ansi
+from legal_corpus_ingester.cli import MSG_SOURCES_DIR_MISSING, app
+from tests.cli.helpers import PUBLIC_EXIT_CODES, strip_ansi
 
 runner = CliRunner()
 
@@ -71,13 +71,15 @@ def test_audit_license_unknown_source(tmp_path: Path, monkeypatch: Any) -> None:
 
 
 def test_audit_license_no_sources_dir(tmp_path: Path) -> None:
-    """Missing sources dir exits 1."""
+    """Missing sources dir exits EXIT_SOURCES_DIR_MISSING (#108; it exited 1 before)."""
     missing = tmp_path / "nonexistent"
     result = runner.invoke(
         app,
         ["audit-license", "test-src", "--sources-dir", str(missing)],
     )
-    assert result.exit_code == 1
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_SOURCES_DIR_MISSING"], result.output
+    assert MSG_SOURCES_DIR_MISSING in result.stderr, result.stderr
+    assert str(missing) not in result.output, "the path must not be echoed (F8)"
 
 
 def test_audit_license_no_change(tmp_path: Path, monkeypatch: Any) -> None:

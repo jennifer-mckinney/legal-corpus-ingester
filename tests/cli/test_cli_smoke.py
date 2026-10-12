@@ -17,7 +17,13 @@ from legal_corpus_ingester import cli
 from legal_corpus_ingester.cli import app
 from legal_corpus_ingester.pipeline.state import STAGES, CheckpointState, CheckpointStore
 from legal_corpus_ingester.sources.registry import load_all
-from tests.cli.helpers import EXIT_CODE_MEANINGS, PUBLIC_EXIT_CODES, strip_ansi
+from tests.cli.helpers import (
+    EXIT_CODE_MEANINGS,
+    PUBLIC_EXIT_CODES,
+    SOURCES_DIR_COMMANDS,
+    sources_dir_argv,
+    strip_ansi,
+)
 
 runner = CliRunner()
 
@@ -189,6 +195,11 @@ def _missing_hostile_name(ch: str) -> Callable[[Path], tuple[str, str, list[str]
     return build
 
 
+def _empty_string_path(root: Path) -> tuple[str, str, list[str]]:
+    # Boundary: --sources-dir "" names nothing (stat("") is ENOENT); it must not fall back to the cwd.
+    return "", "state", []
+
+
 def _missing_name_too_long(root: Path) -> tuple[str, str, list[str]]:
     # ENAMETOOLONG, sized from the filesystem's own limit (no literal): still "does not exist",
     # and the huge name is never echoed back (checked in the dir_missing branch).
@@ -299,6 +310,7 @@ _STATUS_CASES: tuple[_StatusCase, ...] = (
     _StatusCase("parent-is-a-file", "dir_missing", _parent_is_a_file),
     _StatusCase("sources-path-is-a-fifo", "dir_missing", _fifo),
     _StatusCase("missing-name-too-long", "dir_missing", _missing_name_too_long),
+    _StatusCase("empty-string-path", "dir_missing", _empty_string_path),
     *(
         _StatusCase(f"missing-hostile-path-U+{ord(ch):04X}", "dir_missing", _missing_hostile_name(ch))
         for ch in _HOSTILE_PATH_CHARS
@@ -397,10 +409,8 @@ def test_status_outcome_by_configuration(
         )
         assert result.exit_code == expected, (result.exit_code, result.stderr)
         # Honest message (F8): its own stem, never another outcome's, and it names the fix.
-        missing_msg = getattr(cli, "MSG_SOURCES_DIR_MISSING", None)
-        assert isinstance(missing_msg, str) and missing_msg, "cli.MSG_SOURCES_DIR_MISSING not defined"
         for stream in (result.stderr, ref.stderr):
-            assert missing_msg in stream, stream
+            assert cli.MSG_SOURCES_DIR_MISSING in stream, stream
             assert "--sources-dir" in stream, stream
             assert _NO_SOURCES_MSG not in stream, "missing dir reported as no sources"
             assert _LOAD_ERROR_MSG not in stream, "missing dir reported as a load error"
@@ -482,6 +492,203 @@ def test_top_level_help_lists_every_exit_code() -> None:
             continue
         for phrase in EXIT_CODE_MEANINGS[by_code[int(code)]]:
             assert phrase in clause, (code, phrase, clause)
+
+
+# ---------------------------------------------------------------------------
+# #108 fold-in (owner ruling 2026-10-12): every --sources-dir command classifies the path alike
+# ---------------------------------------------------------------------------
+#
+# `ingester --help` says 6 means a missing --sources-dir for the whole tool, so fetch, sources list
+# and audit-license must exit EXIT_SOURCES_DIR_MISSING on exactly the rows status and refresh do.
+# Before the fold-in they exited 1 through load_all ("Sources directory not found: <path>"), which
+# also echoed the path. Their other outcomes stay: `sources list` on an existing empty dir prints
+# "No sources configured." and exits 0, fetch on a valid dir exits EXIT_NOT_WIRED, and an unknown
+# source is still 1.
+
+_DIR_MISSING_CASES = tuple(c for c in _STATUS_CASES if c.kind == "dir_missing")
+_NO_SOURCES_CASES = tuple(c for c in _STATUS_CASES if c.kind == "no_sources")
+
+
+def _repo_source_name() -> str:
+    return next(iter(load_all(_REPO_SOURCES)))  # from the config, not a literal
+
+
+def _registered_sources_dir_options() -> dict[str, object]:
+    """{command name as `--help` shows it: its --sources-dir parameter}, from the real app."""
+    found: dict[str, object] = {}
+
+    def walk(command: object, path: tuple[str, ...]) -> None:
+        subcommands = getattr(command, "commands", None)
+        if subcommands:
+            for name, sub in subcommands.items():
+                walk(sub, (*path, name))
+            return
+        for param in getattr(command, "params", []):
+            if "--sources-dir" in getattr(param, "opts", []):
+                found[" ".join(path)] = param
+
+    walk(typer.main.get_command(app), ())
+    return found
+
+
+def test_sources_dir_commands_table_matches_the_app() -> None:
+    # Contract (F10, F12): the table the tests below iterate is every command the app registers
+    # with --sources-dir, so a new one cannot skip the classification unnoticed.
+    assert set(_registered_sources_dir_options()) == set(SOURCES_DIR_COMMANDS)
+
+
+@pytest.mark.parametrize("command", SOURCES_DIR_COMMANDS)
+def test_sources_dir_option_is_a_plain_str(command: str) -> None:
+    # typer's Path type stats the argument itself and raises on NUL or a lone surrogate before
+    # the command can classify it (#108). Static pin of the exact click type name; the NUL and
+    # surrogate rows of test_every_sources_dir_command_exits_dir_missing are the behaviour.
+    param = _registered_sources_dir_options()[command]
+    assert type(param.type).__name__ == "StringParamType", (command, type(param.type))  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("command", SOURCES_DIR_COMMANDS)
+@pytest.mark.parametrize("case", _DIR_MISSING_CASES, ids=[c.id for c in _DIR_MISSING_CASES])
+def test_every_sources_dir_command_exits_dir_missing(
+    case: _StatusCase, command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Missing, dangling symlink, regular file, symlink to a file, file as parent, FIFO, empty
+    # string, a name over NAME_MAX, and one row per hostile character class (Cc, Cf, Cs, Zl, Zp,
+    # NUL, invalid UTF-8): each is EXIT_SOURCES_DIR_MISSING with the shared message, on every
+    # command, and the argument is never echoed.
+    monkeypatch.chdir(tmp_path)
+    sources_arg, _, _ = case.build(tmp_path)
+    result = runner.invoke(app, sources_dir_argv(command, sources_arg, tmp_path, _fixture_name()))
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_SOURCES_DIR_MISSING"], (
+        result.exit_code, result.stdout, result.stderr,
+    )
+    assert cli.MSG_SOURCES_DIR_MISSING in result.stderr, result.stderr
+    assert "--sources-dir" in result.stderr, "the message must name the fix"
+    for stream in (result.stdout, result.stderr):
+        assert _NO_SOURCES_MSG not in stream, "missing dir reported as no sources"
+        assert _LOAD_ERROR_MSG not in stream, "missing dir reported as a load error"
+        assert "Unknown source" not in stream, "missing dir reported as an unknown source"
+    _assert_no_leak(tmp_path, result.stdout, result.stderr)
+    if sources_arg and (
+        not sources_arg.isprintable() or len(sources_arg) > os.pathconf(tmp_path, "PC_NAME_MAX")
+    ):
+        assert sources_arg not in result.stdout + result.stderr, "raw --sources-dir argument echoed"
+
+
+def _without_sources_dir(argv: list[str]) -> list[str]:
+    i = argv.index("--sources-dir")
+    return argv[:i] + argv[i + 2:]
+
+
+@pytest.mark.parametrize("command", SOURCES_DIR_COMMANDS)
+def test_default_sources_dir_in_empty_cwd_is_dir_missing(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The default --sources-dir is relative to the cwd; in an empty cwd it names no directory.
+    monkeypatch.chdir(tmp_path)
+    argv = _without_sources_dir(sources_dir_argv(command, "unused", tmp_path, _fixture_name()))
+    result = runner.invoke(app, argv)
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_SOURCES_DIR_MISSING"], (result.exit_code, result.stderr)
+    assert cli.MSG_SOURCES_DIR_MISSING in result.stderr, result.stderr
+    _assert_no_leak(tmp_path, result.stdout, result.stderr)
+
+
+@pytest.mark.parametrize("case", _NO_SOURCES_CASES, ids=[c.id for c in _NO_SOURCES_CASES])
+def test_sources_list_existing_empty_dir_still_exits_zero(
+    case: _StatusCase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Positive control (green today): the owner did not change `sources list` on an existing dir
+    # that holds no source. It is not EXIT_NO_SOURCES and not EXIT_SOURCES_DIR_MISSING.
+    monkeypatch.chdir(tmp_path)
+    sources_arg, _, _ = case.build(tmp_path)
+    result = runner.invoke(app, sources_dir_argv("sources list", sources_arg, tmp_path, ""))
+    assert result.exit_code == 0, (result.exit_code, result.stdout, result.stderr)
+    assert result.stdout.splitlines() == [f"{_NO_SOURCES_MSG}."], result.stdout
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("command", ["fetch", "audit-license"])
+@pytest.mark.parametrize("case", _NO_SOURCES_CASES, ids=[c.id for c in _NO_SOURCES_CASES])
+def test_unknown_source_on_existing_dir_still_exits_one(
+    case: _StatusCase, command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Positive control (green today): an existing dir without the named source is "unknown
+    # source", exit 1, as before. The fold-in only moves the missing-path rows to 6.
+    monkeypatch.chdir(tmp_path)
+    sources_arg, _, _ = case.build(tmp_path)
+    result = runner.invoke(app, sources_dir_argv(command, sources_arg, tmp_path, _fixture_name()))
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_LOAD_ERROR"], (result.exit_code, result.stderr)
+    assert cli.MSG_SOURCES_DIR_MISSING not in result.stderr, result.stderr
+
+
+def test_sources_list_configured_dir_lists_every_source() -> None:
+    # Positive control (green today): the str option still loads and lists a real config.
+    result = runner.invoke(app, ["sources", "list", "--sources-dir", str(_REPO_SOURCES)])
+    assert result.exit_code == 0, (result.exit_code, result.stderr)
+    listed = [line.split()[0] for line in result.stdout.splitlines()[2:]]
+    assert listed == list(load_all(_REPO_SOURCES)), result.stdout
+
+
+# The public codes each command's help must list, as "<code> when <meaning>" clauses like
+# `status --help`. 0 is listed too (every one of these can succeed); 2 (usage) is tool-wide and
+# lives in the top-level help only.
+_COMMAND_HELP_CODES: dict[str, tuple[str, ...]] = {
+    "fetch": ("EXIT_NOT_WIRED", "EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
+    "sources list": ("EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
+    "audit-license": ("EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
+}
+
+
+@pytest.mark.parametrize("command", list(_COMMAND_HELP_CODES))
+def test_sources_dir_command_help_documents_exit_codes(command: str) -> None:
+    names = _COMMAND_HELP_CODES[command]
+    clauses, text = _help_clauses([*command.split(), "--help"])
+    assert sorted(int(code) for code, _ in clauses) == sorted([0, *(PUBLIC_EXIT_CODES[n] for n in names)]), (
+        command, clauses, text,
+    )
+    by_code = {PUBLIC_EXIT_CODES[n]: n for n in names}
+    for code, clause in clauses:
+        if int(code) == 0:
+            if command == "sources list":
+                # Honest about the one outcome that differs from status / refresh: an existing
+                # empty dir is a 0 with "No sources configured.", not EXIT_NO_SOURCES.
+                assert _NO_SOURCES_MSG in clause, (code, clause)
+            continue
+        for phrase in EXIT_CODE_MEANINGS[by_code[int(code)]]:
+            assert phrase in clause, (command, code, phrase, clause)
+
+
+# Command list at the end of a top-level clause, as in "... not wired yet (fetch, refresh)".
+_CLAUSE_SCOPE = re.compile(r"\(([^()]*)\)$")
+
+
+def test_top_level_exit_code_scope_matches_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # `ingester --help` must be true of every --sources-dir command. A clause ending in a
+    # "(cmd, cmd)" list claims exactly those commands; a clause without one claims all of them.
+    # Each code is checked against what the commands actually exit on its trigger.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "empty").mkdir()
+    triggers = {
+        "EXIT_SOURCES_DIR_MISSING": str(tmp_path / "missing"),
+        "EXIT_NO_SOURCES": str(tmp_path / "empty"),
+        "EXIT_NOT_WIRED": str(_REPO_SOURCES),
+    }
+    clauses, text = _help_clauses(["--help"])
+    by_code = {int(code): clause for code, clause in clauses}
+    for name, sources_arg in triggers.items():
+        code = PUBLIC_EXIT_CODES[name]
+        clause = by_code[code].split(". ")[0].rstrip(". ")
+        scope = _CLAUSE_SCOPE.search(clause)
+        claimed = set(scope.group(1).split(", ")) if scope else set(SOURCES_DIR_COMMANDS)
+        observed = {
+            command for command in SOURCES_DIR_COMMANDS
+            if runner.invoke(
+                app, sources_dir_argv(command, sources_arg, tmp_path, _repo_source_name())
+            ).exit_code == code
+        }
+        assert claimed == observed, (name, code, clause, sorted(observed))
 
 
 def test_fetch_dry_run_help() -> None:
