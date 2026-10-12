@@ -31,9 +31,11 @@ issue steps get `GH_TOKEN` (terms-analysis#90).
 
 2. **Run refresh.** Calls `ingester refresh --all` inside the virtualenv, under the
    workflow-level `bash -eo pipefail` shell. Any non-zero exit fails the job, including
-   2 (`EXIT_NO_SOURCES`: `config/sources/` is tracked, so an empty registry means a
-   broken checkout) and 3 (`EXIT_NOT_WIRED`: intentionally red until G2 wires the
-   orchestrator; terms-analysis#90).
+   5 (`EXIT_NO_SOURCES`: `config/sources/` is tracked, so an empty registry means a
+   broken checkout), 6 (`EXIT_SOURCES_DIR_MISSING`: `config/sources/` does not exist
+   or is not a directory, also a broken checkout; #108) and 3 (`EXIT_NOT_WIRED`:
+   intentionally red until G2 wires the orchestrator; terms-analysis#90). The full
+   list is in `ingester --help`.
 
 3. **Detect bundle change.** Runs `scripts/detect_bundle_change.py detect`. It reads
    the bundle `out/current` points at and fingerprints it (SHA256 of its
