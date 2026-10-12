@@ -54,13 +54,15 @@ def test_sources_list_help() -> None:
 #
 # `ingester status` has four outcomes, and each must be told apart from the others:
 #   no_sources  the sources dir loads cleanly but holds no source -> EXIT_NO_SOURCES, stderr says so
-#   load_error  the sources dir cannot be loaded                   -> the code refresh exits with
+#   load_error  the sources dir cannot be loaded                   -> EXIT_LOAD_ERROR, stderr says it
 #   never_run   sources configured, no checkpoint yet              -> 0, "No runs recorded."
 #   healthy     sources configured, checkpoints present            -> 0, one "<name>: <stage>" line
 # never_run stays exit 0 on purpose: the nightly health.yml runs `ingester status` with the repo's
 # config/sources on a fresh hosted runner, whose state dir is empty until refresh is wired and state
-# persists (ADR-016). refresh is the reference for the two failure outcomes (G0-1, terms-analysis#90):
-# status must exit with the code refresh exits with on the same sources dir, so the two cannot drift.
+# persists (ADR-016). Each failure row pins the exact public code (EXIT_NO_SOURCES /
+# EXIT_LOAD_ERROR, whose numeric values test_status_help_documents_exit_codes pins) AND checks
+# that refresh exits with the same code on the same sources dir (G0-1, terms-analysis#90), so
+# neither the shared constant nor either command can drift unnoticed.
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _FIXTURE_SOURCE = _REPO_ROOT / "tests" / "fixtures" / "sources" / "eurlex.yaml"
@@ -159,6 +161,18 @@ def _one_yaml(content: bytes, filename: str = "a.yaml") -> Callable[[Path], tupl
     return build
 
 
+def _absolute(
+    build: Callable[[Path], tuple[str, str, list[str]]],
+) -> Callable[[Path], tuple[str, str, list[str]]]:
+    # Same layout, but --sources-dir is passed as an absolute path. The loader's message names
+    # that path, so echoing it (or the raw exception) would leak it to stderr (F8, mutant M2).
+    def build_absolute(root: Path) -> tuple[str, str, list[str]]:
+        sources_arg, state_arg, lines = build(root)
+        return str(root / sources_arg), state_arg, lines
+
+    return build_absolute
+
+
 def _dir_named_yaml(root: Path) -> tuple[str, str, list[str]]:
     (root / "src" / "x.yaml").mkdir(parents=True)
     return "src", "state", []
@@ -233,6 +247,10 @@ _STATUS_CASES: tuple[_StatusCase, ...] = (
     _StatusCase("hostile-yaml-filename", "load_error", _one_yaml(b"", "\x1b[2J x.yaml")),
     _StatusCase("dir-named-yaml", "load_error", _dir_named_yaml),
     _StatusCase("valid-plus-malformed", "load_error", _valid_plus_malformed),
+    _StatusCase("absolute-missing-dir", "load_error", _absolute(_missing_dir)),
+    _StatusCase("absolute-path-is-a-file", "load_error", _absolute(_sources_path_is_file)),
+    _StatusCase("absolute-valid-plus-malformed", "load_error", _absolute(_valid_plus_malformed)),
+    _StatusCase("absolute-empty-dir", "no_sources", _absolute(_empty_dir)),
     *(
         _StatusCase(f"hostile-name-U+{ord(ch):04X}", "load_error", _hostile_name(ch))
         for ch in _HOSTILE_NAME_CHARS
@@ -254,6 +272,10 @@ def test_status_cases_cover_every_outcome() -> None:
     assert len(ids) == len(set(ids)), ids
     assert len(_HOSTILE_NAME_CHARS) == sum(c.id.startswith("hostile-name-") for c in _STATUS_CASES)
     assert {unicodedata.category(ch) for ch in _HOSTILE_NAME_CHARS} >= {"Cc", "Cf", "Zl", "Zp"}
+    # Both failure outcomes are also fed an absolute --sources-dir, the input whose path the
+    # loader's message carries (F8).
+    absolute_kinds = {c.kind for c in _STATUS_CASES if c.id.startswith("absolute-")}
+    assert absolute_kinds == {"no_sources", "load_error"}, absolute_kinds
 
 
 def _assert_no_leak(root: Path, *streams: str) -> None:
@@ -293,10 +315,14 @@ def test_status_outcome_by_configuration(
 
     if case.kind == "no_sources":
         assert ref.exit_code == cli.EXIT_NO_SOURCES, "control: refresh does not see this row as empty"
+        # The exact public code, not just parity with refresh: if the shared path drifted for
+        # both commands, parity alone would still pass.
+        assert result.exit_code == cli.EXIT_NO_SOURCES, (result.exit_code, result.stderr)
         assert _NO_SOURCES_MSG in result.stderr, result.stderr
         assert _LOAD_ERROR_MSG not in result.stderr, "no-sources reported as a load error"
     else:
-        assert ref.exit_code not in (0, cli.EXIT_NO_SOURCES), "control: refresh loaded this row"
+        assert ref.exit_code == cli.EXIT_LOAD_ERROR, "control: refresh loaded this row"
+        assert result.exit_code == cli.EXIT_LOAD_ERROR, (result.exit_code, result.stderr)
         assert _LOAD_ERROR_MSG in result.stderr, result.stderr
         assert _NO_SOURCES_MSG not in result.stderr, "load error reported as no sources"
 
@@ -312,19 +338,39 @@ def test_status_default_paths_in_empty_dir_is_not_success(
     assert isinstance(ref.exception, SystemExit) and ref.exit_code != 0, "control: refresh succeeded"
     result = runner.invoke(app, ["status"])
     assert result.exit_code == ref.exit_code, (result.exit_code, result.stdout, result.stderr)
+    # The default config/sources does not exist in an empty cwd: that is the load-error code.
+    assert result.exit_code == cli.EXIT_LOAD_ERROR, (result.exit_code, result.stderr)
     assert isinstance(result.exception, SystemExit), repr(result.exception)
     assert _NO_RUNS not in result.stdout
     _assert_no_leak(tmp_path, result.stdout, result.stderr)
 
 
 def test_status_help_documents_exit_codes() -> None:
-    # Card #190: the CLI help states which outcome exits EXIT_NO_SOURCES and that never-run
-    # (sources configured, no checkpoint) is a legitimate exit 0.
+    # Card #190: the CLI help states which outcome exits which code: never-run (sources
+    # configured, no checkpoint) is a legitimate 0, nothing configured is EXIT_NO_SOURCES, an
+    # unloadable sources dir is EXIT_LOAD_ERROR.
+    #
+    # The numeric values are a public contract: this help text prints them and
+    # automations/refresh.md documents 2 for EXIT_NO_SOURCES, so callers may key on the numbers.
+    # They are pinned here, not just compared with each other: renumbering is a breaking change.
+    documented = {"EXIT_LOAD_ERROR": 1, "EXIT_NO_SOURCES": 2}
+    assert {name: getattr(cli, name) for name in documented} == documented
+    outcomes = {
+        0: "sources are configured",
+        cli.EXIT_NO_SOURCES: "holds no source",
+        cli.EXIT_LOAD_ERROR: "cannot be loaded",
+    }
+    assert len(outcomes) == 3, "two status outcomes share an exit code"
+
     result = runner.invoke(app, ["status", "--help"])
     assert result.exit_code == 0
     text = " ".join(strip_ansi(result.output).split())
-    for code in (cli.EXIT_NO_SOURCES, 0):
-        assert re.search(rf"(?<![\w.]){code}(?![\w.])", text), (code, text)
+    # Every "<code> when <outcome>" clause in the help, in order. Exactly the three outcome
+    # codes, each once and each tied to its own outcome: a dropped, extra or swapped code fails.
+    clauses = re.findall(r"(?<![\w.])(\d+) when ([^;]+)", text)
+    assert sorted(int(code) for code, _ in clauses) == sorted(outcomes), (clauses, text)
+    for code, clause in clauses:
+        assert outcomes[int(code)] in clause, (code, clause)
 
 
 def test_fetch_dry_run_help() -> None:
