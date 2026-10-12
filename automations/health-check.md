@@ -17,9 +17,11 @@ The workflow (`.github/workflows/health.yml`) fires on:
 
 The `health` job runs two checks in order:
 
-1. `ingester status` - calls the CLI's built-in status command. It exits 0 on a
-   healthy system (including "No runs recorded."), so it is not masked; a crash
-   fails the job (terms-analysis#90).
+1. `ingester status` - calls the CLI's built-in status command. It exits 0 only
+   when sources are configured: one stage line per source, or "No runs recorded."
+   when none has run yet. No sources configured, or a sources dir that will not
+   load, exits non-zero (codes in `ingester status --help`, terms-analysis#190).
+   It is not masked; a crash fails the job (terms-analysis#90).
 2. `python scripts/health_check.py` - reads `config/sources/*.yaml` to enumerate
    sources, inspects `<state dir>/<source>.checkpoint.json` for last-run time and
    stage, and writes a markdown table to `out/health/YYYY-MM-DD.md`.
