@@ -90,6 +90,10 @@ _HOSTILE_NAME_CHARS = ("\x1b", "\r", "\x0b", "\x0c", "\x85", " ", " ", "​"
 # The same classes in a MISSING --sources-dir argument (#108), plus newline (line forgery), NUL,
 # a lone surrogate and a surrogate-escaped invalid UTF-8 byte (how POSIX argv carries b"\xff").
 _HOSTILE_PATH_CHARS = (*_HOSTILE_NAME_CHARS, "\n", "\x00", "\ud800", "\udcff")
+# The same classes in the name of an EXISTING empty --sources-dir (#108 exit 5). NUL and lone
+# surrogates are left out: no filesystem can hold them in a name (APFS refuses invalid UTF-8), so
+# they can only ever be missing paths, and the dir_missing rows above cover them.
+_HOSTILE_EXISTING_NAME_CHARS = (*_HOSTILE_NAME_CHARS, "\n")
 
 
 def _unsafe_chars(text: str) -> list[str]:
@@ -136,6 +140,32 @@ def _lookalike_files_only(root: Path) -> tuple[str, str, list[str]]:
 def _symlink_to_empty_dir(root: Path) -> tuple[str, str, list[str]]:
     (root / "real").mkdir()
     (root / "src").symlink_to(root / "real", target_is_directory=True)
+    return "src", "state", []
+
+
+def _empty_dir_hostile_name(ch: str) -> Callable[[Path], tuple[str, str, list[str]]]:
+    # #108 exit 5: an EXISTING empty dir whose name forges output (control, format, line and
+    # paragraph separators, newline). Nothing is configured; the raw name is never echoed (F2, F8).
+    def build(root: Path) -> tuple[str, str, list[str]]:
+        (root / f"src{ch}x").mkdir()
+        return f"src{ch}x", "state", []
+
+    return build
+
+
+def _empty_dir_name_max(root: Path) -> tuple[str, str, list[str]]:
+    # Size boundary: an existing empty dir whose name is exactly the filesystem's NAME_MAX (read
+    # from the filesystem, no literal). It exists, so it is no_sources, never dir_missing.
+    name = "e" * os.pathconf(root, "PC_NAME_MAX")
+    (root / name).mkdir()
+    return name, "state", []
+
+
+def _source_only_in_subdir(root: Path) -> tuple[str, str, list[str]]:
+    # Indirection: a valid source one level down is not configured (the loader reads *.yaml in
+    # the dir itself only), so the dir holds no source, exactly as status and refresh see it.
+    (root / "src").mkdir()
+    _copy_fixture(root / "src" / "nested")
     return "src", "state", []
 
 
@@ -300,6 +330,12 @@ _STATUS_CASES: tuple[_StatusCase, ...] = (
     _StatusCase("symlink-to-empty-dir", "no_sources", _symlink_to_empty_dir),
     _StatusCase("orphan-checkpoint", "no_sources", _orphan_checkpoint),
     _StatusCase("hostile-orphan-checkpoint-filename", "no_sources", _hostile_orphan_checkpoint),
+    _StatusCase("empty-dir-name-max", "no_sources", _empty_dir_name_max),
+    _StatusCase("source-only-in-subdir", "no_sources", _source_only_in_subdir),
+    *(
+        _StatusCase(f"empty-dir-hostile-name-U+{ord(ch):04X}", "no_sources", _empty_dir_hostile_name(ch))
+        for ch in _HOSTILE_EXISTING_NAME_CHARS
+    ),
     # #108: these five rows were load_error (exit 1) before the owner gave them their own code.
     _StatusCase("missing-dir", "dir_missing", _missing_dir),
     _StatusCase("dangling-symlink", "dir_missing", _dangling_symlink),
@@ -350,6 +386,11 @@ def test_status_cases_cover_every_outcome() -> None:
     # #108: every hostile path character has its own dir_missing row, across Cc/Cf/Cs/Zl/Zp.
     assert len(_HOSTILE_PATH_CHARS) == sum(c.id.startswith("missing-hostile-path-") for c in _STATUS_CASES)
     assert {unicodedata.category(ch) for ch in _HOSTILE_PATH_CHARS} >= set(_UNSAFE_CATEGORIES)
+    # #108 exit 5: every hostile character also names an existing empty dir (no_sources).
+    assert len(_HOSTILE_EXISTING_NAME_CHARS) == sum(
+        c.id.startswith("empty-dir-hostile-name-") and c.kind == "no_sources" for c in _STATUS_CASES
+    )
+    assert {unicodedata.category(ch) for ch in _HOSTILE_EXISTING_NAME_CHARS} >= {"Cc", "Cf", "Zl", "Zp"}
     # Every failure outcome is also fed an absolute --sources-dir, the input whose path the
     # loader's message carries (F8).
     absolute_kinds = {c.kind for c in _STATUS_CASES if c.id.startswith("absolute-")}
@@ -361,6 +402,18 @@ def _assert_no_leak(root: Path, *streams: str) -> None:
     for stream in streams:
         assert str(root) not in stream and str(root.resolve()) not in stream, stream
         assert _unsafe_chars(stream) == [], (_unsafe_chars(stream), stream)
+
+
+def _assert_arg_not_echoed(root: Path, sources_arg: str, *results: object) -> None:
+    # A hostile (non-printable) or NAME_MAX-sized --sources-dir argument never appears in any
+    # output stream, whole or raw (F2, F8, size). Short printable names are covered by the
+    # absolute-path rows through _assert_no_leak.
+    if sources_arg and (
+        not sources_arg.isprintable() or len(sources_arg) >= os.pathconf(root, "PC_NAME_MAX")
+    ):
+        for result in results:
+            for stream in (result.stdout, result.stderr):  # type: ignore[attr-defined]
+                assert sources_arg not in stream, ("raw --sources-dir argument echoed", stream[:200])
 
 
 @pytest.mark.parametrize("case", _STATUS_CASES, ids=[c.id for c in _STATUS_CASES])
@@ -401,6 +454,9 @@ def test_status_outcome_by_configuration(
         assert result.exit_code == expected, (result.exit_code, result.stderr)
         assert _NO_SOURCES_MSG in result.stderr, result.stderr
         assert _LOAD_ERROR_MSG not in result.stderr, "no-sources reported as a load error"
+        # An existing dir with a hostile or NAME_MAX-long name is never echoed back, by either
+        # command (F2, F8); _assert_no_leak alone lets a raw newline through.
+        _assert_arg_not_echoed(tmp_path, sources_arg, result, ref)
     elif case.kind == "dir_missing":
         expected = PUBLIC_EXIT_CODES["EXIT_SOURCES_DIR_MISSING"]
         assert ref.exit_code == expected, (
@@ -501,9 +557,10 @@ def test_top_level_help_lists_every_exit_code() -> None:
 # `ingester --help` says 6 means a missing --sources-dir for the whole tool, so fetch, sources list
 # and audit-license must exit EXIT_SOURCES_DIR_MISSING on exactly the rows status and refresh do.
 # Before the fold-in they exited 1 through load_all ("Sources directory not found: <path>"), which
-# also echoed the path. Their other outcomes stay: `sources list` on an existing empty dir prints
-# "No sources configured." and exits 0, fetch on a valid dir exits EXIT_NOT_WIRED, and an unknown
-# source is still 1.
+# also echoed the path. A second ruling the same day gives an existing dir that holds no source
+# "its own error code ... 'no source'": fetch and audit-license exit EXIT_NO_SOURCES there, like
+# status and refresh. `sources list` on that dir still prints "No sources configured." and exits
+# 0, fetch on a valid dir exits EXIT_NOT_WIRED, and an unknown source in a configured dir is 1.
 
 _DIR_MISSING_CASES = tuple(c for c in _STATUS_CASES if c.kind == "dir_missing")
 _NO_SOURCES_CASES = tuple(c for c in _STATUS_CASES if c.kind == "no_sources")
@@ -610,16 +667,51 @@ def test_sources_list_existing_empty_dir_still_exits_zero(
 
 @pytest.mark.parametrize("command", ["fetch", "audit-license"])
 @pytest.mark.parametrize("case", _NO_SOURCES_CASES, ids=[c.id for c in _NO_SOURCES_CASES])
-def test_unknown_source_on_existing_dir_still_exits_one(
+def test_fetch_and_audit_license_on_empty_dir_exit_no_sources(
     case: _StatusCase, command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Positive control (green today): an existing dir without the named source is "unknown
-    # source", exit 1, as before. The fold-in only moves the missing-path rows to 6.
+    # Owner ruling 2026-10-12: an empty sources folder "has its own error code and yes, that
+    # should be 'no source'". Was test_unknown_source_on_existing_dir_still_exits_one, which
+    # pinned exit 1 ("Unknown source") here. Every no_sources row status and refresh use (empty,
+    # lookalike files only such as README.md, symlink to an empty dir, source only in a subdir,
+    # hostile or NAME_MAX-long dir name, absolute path) is EXIT_NO_SOURCES with the shared
+    # message, whatever source is named, and the path is never echoed.
     monkeypatch.chdir(tmp_path)
     sources_arg, _, _ = case.build(tmp_path)
+    # Control: refresh defines the row as no_sources (the same check status's table makes).
+    ref = runner.invoke(app, sources_dir_argv("refresh", sources_arg, tmp_path, ""))
+    assert ref.exit_code == PUBLIC_EXIT_CODES["EXIT_NO_SOURCES"], ("control", ref.exit_code, ref.stderr)
+
     result = runner.invoke(app, sources_dir_argv(command, sources_arg, tmp_path, _fixture_name()))
     assert isinstance(result.exception, SystemExit), repr(result.exception)
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_NO_SOURCES"], (
+        command, result.exit_code, result.stdout, result.stderr,
+    )
+    # Honest message (F8): the no-sources stem status and refresh print, on stderr like
+    # status's, and never another outcome's.
+    assert _NO_SOURCES_MSG in result.stderr, result.stderr
+    for stream in (result.stdout, result.stderr):
+        assert "Unknown source" not in stream, "empty dir reported as an unknown source"
+        assert _LOAD_ERROR_MSG not in stream, "empty dir reported as a load error"
+        assert cli.MSG_SOURCES_DIR_MISSING not in stream, "existing empty dir reported as missing"
+    _assert_no_leak(tmp_path, result.stdout, result.stderr)
+    _assert_arg_not_echoed(tmp_path, sources_arg, result)
+
+
+@pytest.mark.parametrize("command", ["fetch", "audit-license"])
+def test_unknown_source_on_configured_dir_still_exits_one(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Positive control (green today): a dir that holds a source, but not the one named, is still
+    # "unknown source", exit 1. Exit 5 is only for a dir that holds no source at all.
+    monkeypatch.chdir(tmp_path)
+    _copy_fixture(tmp_path / "src")
+    absent = f"{_fixture_name()}-absent"  # derived from the config, so never a configured name
+    result = runner.invoke(app, sources_dir_argv(command, "src", tmp_path, absent))
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
     assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_LOAD_ERROR"], (result.exit_code, result.stderr)
+    assert "Unknown source" in result.stderr, result.stderr
+    assert _NO_SOURCES_MSG not in result.stdout + result.stderr, "configured dir reported as no sources"
     assert cli.MSG_SOURCES_DIR_MISSING not in result.stderr, result.stderr
 
 
@@ -635,9 +727,10 @@ def test_sources_list_configured_dir_lists_every_source() -> None:
 # `status --help`. 0 is listed too (every one of these can succeed); 2 (usage) is tool-wide and
 # lives in the top-level help only.
 _COMMAND_HELP_CODES: dict[str, tuple[str, ...]] = {
-    "fetch": ("EXIT_NOT_WIRED", "EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
+    # Owner ruling 2026-10-12: fetch and audit-license exit EXIT_NO_SOURCES on an empty dir.
+    "fetch": ("EXIT_NOT_WIRED", "EXIT_NO_SOURCES", "EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
     "sources list": ("EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
-    "audit-license": ("EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
+    "audit-license": ("EXIT_NO_SOURCES", "EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
 }
 
 
@@ -675,6 +768,15 @@ def test_top_level_exit_code_scope_matches_commands(tmp_path: Path, monkeypatch:
         "EXIT_NO_SOURCES": str(tmp_path / "empty"),
         "EXIT_NOT_WIRED": str(_REPO_SOURCES),
     }
+    # The behaviour the owner ruled (2026-10-12), so the scope cannot be satisfied by moving the
+    # help and the code together in the wrong direction: 6 on every command, 5 ("no source") on
+    # every command but `sources list` (an empty listing is exit 0), 3 where nothing is wired.
+    expected_scope = {
+        "EXIT_SOURCES_DIR_MISSING": set(SOURCES_DIR_COMMANDS),
+        "EXIT_NO_SOURCES": set(SOURCES_DIR_COMMANDS) - {"sources list"},
+        "EXIT_NOT_WIRED": {"fetch", "refresh"},
+    }
+    assert set(expected_scope) == set(triggers)
     clauses, text = _help_clauses(["--help"])
     by_code = {int(code): clause for code, clause in clauses}
     for name, sources_arg in triggers.items():
@@ -688,6 +790,7 @@ def test_top_level_exit_code_scope_matches_commands(tmp_path: Path, monkeypatch:
                 app, sources_dir_argv(command, sources_arg, tmp_path, _repo_source_name())
             ).exit_code == code
         }
+        assert observed == expected_scope[name], (name, code, sorted(observed))
         assert claimed == observed, (name, code, clause, sorted(observed))
 
 
