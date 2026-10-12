@@ -60,7 +60,12 @@ jobs:
           if [ -f .venv/bin/activate ]; then
             source .venv/bin/activate
           fi
-          python scripts/check_approvals.py --approvals-dir config/approvals
+          # Record the checker's exit code for the issue step's text (#13), then exit with
+          # it, so this step's outcome is still the checker's own (terms-analysis#173).
+          rc=0
+          python scripts/check_approvals.py --approvals-dir config/approvals || rc=$?
+          echo "rc=${rc}" >> "$GITHUB_OUTPUT"
+          exit "$rc"
 
       # Scoped to the check step's own outcome: a checkout, Preflight or Install
       # failure leaves approval_check skipped, so no misleading expiry alert opens.
@@ -69,10 +74,38 @@ jobs:
         if: failure() && steps.approval_check.outcome == 'failure'
         env:
           GH_TOKEN: ${{ github.token }}
+          CHECK_RC: ${{ steps.approval_check.outputs.rc }}
+          # check_approvals.py's exit codes, defined once here: 1 is a failing approval
+          # (expired, malformed, undated or bad hash), 2 is its EXIT_CONFIG. The checker
+          # cannot be imported here (the step must work whatever it contains), so the
+          # real-checker tests in tests/unit/test_approval_expiry_workflow_exit.py pin
+          # these against its actual exit codes.
+          EXIT_APPROVAL_FAILED: '1'
+          EXIT_CONFIG: '2'
         run: |
+          : "${EXIT_APPROVAL_FAILED:?}" "${EXIT_CONFIG:?}"
+          # The body depends on the checker's exit code (#13). It never carries checker
+          # output: the step log has the detail.
+          case "$CHECK_RC" in
+            "$EXIT_APPROVAL_FAILED")
+              cause="One or more APPROVAL.yaml files have expired or are failing validation (malformed, undated, or a signed-artifact hash mismatch)."
+              action="Expired or failing approvals block ingest for gated sources (HR9). Review each affected source, obtain a renewed or corrected approval, and update its APPROVAL.yaml before the next ingester refresh."
+              ;;
+            "$EXIT_CONFIG")
+              cause="The approval check could not run because of invalid input or configuration (exit ${EXIT_CONFIG}): the approvals or sources directory is missing, unreadable or holds no approval files. No approval was checked."
+              action="Fix the configuration named in the 'Run approval check' step log, then re-run this workflow."
+              ;;
+            *)
+              # Only a plain number is echoed; anything else the output held is not trusted.
+              if [[ "$CHECK_RC" =~ ^[0-9]{1,3}$ ]]; then code="$CHECK_RC"; else code="unknown"; fi
+              cause="check_approvals.py failed unexpectedly with exit code ${code}, which it does not define. This is a checker or runner failure, not an approval result."
+              action="Read the 'Run approval check' step log for the cause, fix it, then re-run this workflow."
+              ;;
+          esac
+          body="$(printf '%s\n\n%s\n\n%s\n' "$cause" "Run 'python scripts/check_approvals.py' to see the full status table." "$action")"
           # The label must exist or `gh issue create --label` fails; --force makes this idempotent
           # and any real error (auth, permissions) fails the step loudly (terms-analysis#90).
-          gh label create "$ISSUE_LABEL" --force --color B60205 --description "An APPROVAL.yaml has expired or is invalid"
+          gh label create "$ISSUE_LABEL" --force --color B60205 --description "The scheduled APPROVAL.yaml check failed; the issue body names the cause"
           open_count=$(gh issue list --label "$ISSUE_LABEL" --state open --json number --jq 'length') || {
             echo "Warning: gh issue list failed; creating issue unconditionally." >&2
             open_count=0
@@ -80,13 +113,7 @@ jobs:
           if [ "$open_count" -eq 0 ]; then
             gh issue create \
               --title "Approval expiry alert -- $(date -u +%Y-%m-%d)" \
-              --body "One or more APPROVAL.yaml files have expired or are invalid.
-
-          Run 'python scripts/check_approvals.py' to see the full status table.
-
-          Expired approvals block ingest for gated sources (HR9). Review each
-          affected source, obtain renewed approval, and update the APPROVAL.yaml
-          before the next ingester refresh." \
+              --body "$body" \
               --label "$ISSUE_LABEL"
           else
             echo "Approval expiry issue already open (#${open_count} open); skipping duplicate."
