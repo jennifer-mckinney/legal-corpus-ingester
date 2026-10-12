@@ -58,7 +58,10 @@ jobs:
       - name: Run ingester status
         run: |
           source .venv/bin/activate
-          # Exits 0 on a healthy system (incl. 'No runs recorded'); no masking (terms-analysis#90).
+          # Exits 0 only when sources are configured: per-source stages, or 'No runs recorded.' when
+          # none has run yet. No sources configured, or a sources dir that will not load, exits
+          # non-zero with the codes `ingester status --help` lists (terms-analysis#190). No masking
+          # (terms-analysis#90).
           ingester status --state-dir "${XDG_STATE_HOME:-$HOME/.local/state}/legal-corpus-ingester/state"
 
       - name: Upload health report

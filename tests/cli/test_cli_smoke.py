@@ -1,12 +1,21 @@
 from __future__ import annotations
 
+import json
+import re
 import sys
+import unicodedata
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
+import pytest
 import typer.main
 from typer.testing import CliRunner
 
+from legal_corpus_ingester import cli
 from legal_corpus_ingester.cli import app
+from legal_corpus_ingester.pipeline.state import STAGES, CheckpointState, CheckpointStore
+from legal_corpus_ingester.sources.registry import load_all
 from tests.cli.helpers import strip_ansi
 
 runner = CliRunner()
@@ -39,11 +48,329 @@ def test_sources_list_help() -> None:
     assert result.exit_code == 0
 
 
-def test_status_no_checkpoints(tmp_path: object, monkeypatch: object) -> None:  # type: ignore[type-arg]
-    monkeypatch.chdir(tmp_path)  # type: ignore[attr-defined]
+# ---------------------------------------------------------------------------
+# status: "nothing configured" is not success (terms-analysis#190, DEV-FUNDAMENTALS F5)
+# ---------------------------------------------------------------------------
+#
+# `ingester status` has four outcomes, and each must be told apart from the others:
+#   no_sources  the sources dir loads cleanly but holds no source -> EXIT_NO_SOURCES, stderr says so
+#   load_error  the sources dir cannot be loaded                   -> EXIT_LOAD_ERROR, stderr says it
+#   never_run   sources configured, no checkpoint yet              -> 0, "No runs recorded."
+#   healthy     sources configured, checkpoints present            -> 0, one "<name>: <stage>" line
+# never_run stays exit 0 on purpose: the nightly health.yml runs `ingester status` with the repo's
+# config/sources on a fresh hosted runner, whose state dir is empty until refresh is wired and state
+# persists (ADR-016). Each failure row pins the exact public code (EXIT_NO_SOURCES /
+# EXIT_LOAD_ERROR, whose numeric values test_status_help_documents_exit_codes pins) AND checks
+# that refresh exits with the same code on the same sources dir (G0-1, terms-analysis#90), so
+# neither the shared constant nor either command can drift unnoticed.
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_FIXTURE_SOURCE = _REPO_ROOT / "tests" / "fixtures" / "sources" / "eurlex.yaml"
+_REPO_SOURCES = _REPO_ROOT / "config" / "sources"
+_NO_RUNS = "No runs recorded."
+_NO_SOURCES_MSG = "No sources configured"
+_LOAD_ERROR_MSG = "Error loading sources"
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+# One character per hostile class, generated into the `name` field of an otherwise valid source.
+# The loader must reject each; status must then report a load error without echoing the raw byte.
+_HOSTILE_NAME_CHARS = ("\x1b", "\r", "\x0b", "\x0c", "\x85", " ", " ", "​", "‮", "﻿")
+
+
+def _unsafe_chars(text: str) -> list[str]:
+    """Raw control, format, surrogate and line/paragraph-separator characters (newline allowed)."""
+    return [hex(ord(c)) for c in text if c != "\n" and unicodedata.category(c) in _UNSAFE_CATEGORIES]
+
+
+def _fixture_name() -> str:
+    (name,) = load_all(_FIXTURE_SOURCE.parent)  # from the config, not a literal
+    return name
+
+
+def _copy_fixture(sources: Path, filename: str = _FIXTURE_SOURCE.name) -> None:
+    sources.mkdir(exist_ok=True)
+    (sources / filename).write_text(_FIXTURE_SOURCE.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def _save_checkpoint(state: Path, name: str, stage: str) -> None:
+    CheckpointStore(state).save(CheckpointState(source_name=name, stage=stage, corpus_version="v-test"))
+
+
+@dataclass(frozen=True)
+class _StatusCase:
+    id: str
+    kind: str  # no_sources | load_error | never_run | healthy
+    # build(root) lays out the case under root (the cwd) and returns
+    # (--sources-dir argument, --state-dir argument, expected stdout lines for the exit-0 kinds).
+    build: Callable[[Path], tuple[str, str, list[str]]]
+
+
+def _empty_dir(root: Path) -> tuple[str, str, list[str]]:
+    (root / "src").mkdir()
+    return "src", "state", []
+
+
+def _lookalike_files_only(root: Path) -> tuple[str, str, list[str]]:
+    # Valid source content under names the loader does not read: nothing is configured.
+    src = root / "src"
+    for filename in ("eurlex.yml", "eurlex.yaml.disabled", "eurlex.yaml~", "README.md"):
+        _copy_fixture(src, filename)
+    return "src", "state", []
+
+
+def _symlink_to_empty_dir(root: Path) -> tuple[str, str, list[str]]:
+    (root / "real").mkdir()
+    (root / "src").symlink_to(root / "real", target_is_directory=True)
+    return "src", "state", []
+
+
+def _orphan_checkpoint(root: Path) -> tuple[str, str, list[str]]:
+    # A checkpoint left in the state dir must not make "nothing configured" look configured.
+    (root / "src").mkdir()
+    _save_checkpoint(root / "state", _fixture_name(), STAGES[-1])
+    return "src", "state", []
+
+
+def _hostile_orphan_checkpoint(root: Path) -> tuple[str, str, list[str]]:
+    # Orphan checkpoint whose FILE NAME forges a status line with ESC, newline and U+2028.
+    (root / "src").mkdir()
+    forged = f"orphan\n\x1b[31m{_fixture_name()}: {STAGES[-1]} x"
+    _save_checkpoint(root / "state", forged, STAGES[-1])
+    return "src", "state", []
+
+
+def _missing_dir(root: Path) -> tuple[str, str, list[str]]:
+    return "src", "state", []
+
+
+def _dangling_symlink(root: Path) -> tuple[str, str, list[str]]:
+    (root / "src").symlink_to(root / "gone", target_is_directory=True)
+    return "src", "state", []
+
+
+def _sources_path_is_file(root: Path) -> tuple[str, str, list[str]]:
+    (root / "src").write_text(_FIXTURE_SOURCE.read_text(encoding="utf-8"), encoding="utf-8")
+    return "src", "state", []
+
+
+def _one_yaml(content: bytes, filename: str = "a.yaml") -> Callable[[Path], tuple[str, str, list[str]]]:
+    def build(root: Path) -> tuple[str, str, list[str]]:
+        (root / "src").mkdir()
+        (root / "src" / filename).write_bytes(content)
+        return "src", "state", []
+
+    return build
+
+
+def _absolute(
+    build: Callable[[Path], tuple[str, str, list[str]]],
+) -> Callable[[Path], tuple[str, str, list[str]]]:
+    # Same layout, but --sources-dir is passed as an absolute path. The loader's message names
+    # that path, so echoing it (or the raw exception) would leak it to stderr (F8, mutant M2).
+    def build_absolute(root: Path) -> tuple[str, str, list[str]]:
+        sources_arg, state_arg, lines = build(root)
+        return str(root / sources_arg), state_arg, lines
+
+    return build_absolute
+
+
+def _dir_named_yaml(root: Path) -> tuple[str, str, list[str]]:
+    (root / "src" / "x.yaml").mkdir(parents=True)
+    return "src", "state", []
+
+
+def _valid_plus_malformed(root: Path) -> tuple[str, str, list[str]]:
+    # One good source must not hide a broken one: a partial config is a load error, not a status.
+    _copy_fixture(root / "src")
+    (root / "src" / "zz.yaml").write_text("", encoding="utf-8")
+    return "src", "state", []
+
+
+def _hostile_name(ch: str) -> Callable[[Path], tuple[str, str, list[str]]]:
+    def build(root: Path) -> tuple[str, str, list[str]]:
+        (root / "src").mkdir()
+        text = _FIXTURE_SOURCE.read_text(encoding="utf-8")
+        name = _fixture_name()
+        # JSON string syntax is valid YAML, so the escape decodes to the raw character on load.
+        hostile = text.replace(f"name: {name}", f"name: {json.dumps(name + ch + 'x')}", 1)
+        assert hostile != text, "control: the fixture's name line was not found"
+        (root / "src" / "a.yaml").write_text(hostile, encoding="utf-8")
+        return "src", "state", []
+
+    return build
+
+
+def _fixture_never_run(state_exists: bool) -> Callable[[Path], tuple[str, str, list[str]]]:
+    def build(root: Path) -> tuple[str, str, list[str]]:
+        _copy_fixture(root / "src")
+        if state_exists:
+            (root / "state").mkdir()
+        return "src", "state", [_NO_RUNS]
+
+    return build
+
+
+def _repo_sources_never_run(root: Path) -> tuple[str, str, list[str]]:
+    # Exactly what health.yml runs on a fresh runner: the repo's config, a state dir not yet created.
+    return str(_REPO_SOURCES), "state", [_NO_RUNS]
+
+
+def _fixture_healthy(root: Path) -> tuple[str, str, list[str]]:
+    _copy_fixture(root / "src")
+    _save_checkpoint(root / "state", _fixture_name(), STAGES[-1])
+    return "src", "state", [f"{_fixture_name()}: {STAGES[-1]}"]
+
+
+def _repo_sources_healthy(root: Path) -> tuple[str, str, list[str]]:
+    names = list(load_all(_REPO_SOURCES))
+    lines = []
+    for i, name in enumerate(names):
+        stage = STAGES[i % len(STAGES)]
+        _save_checkpoint(root / "state", name, stage)
+        lines.append(f"{name}: {stage}")
+    return str(_REPO_SOURCES), "state", lines
+
+
+_STATUS_CASES: tuple[_StatusCase, ...] = (
+    _StatusCase("empty-dir", "no_sources", _empty_dir),
+    _StatusCase("lookalike-files-only", "no_sources", _lookalike_files_only),
+    _StatusCase("symlink-to-empty-dir", "no_sources", _symlink_to_empty_dir),
+    _StatusCase("orphan-checkpoint", "no_sources", _orphan_checkpoint),
+    _StatusCase("hostile-orphan-checkpoint-filename", "no_sources", _hostile_orphan_checkpoint),
+    _StatusCase("missing-dir", "load_error", _missing_dir),
+    _StatusCase("dangling-symlink", "load_error", _dangling_symlink),
+    _StatusCase("sources-path-is-a-file", "load_error", _sources_path_is_file),
+    _StatusCase("empty-yaml", "load_error", _one_yaml(b"")),
+    _StatusCase("yaml-is-a-list", "load_error", _one_yaml(b"- a\n- b\n")),
+    _StatusCase("invalid-utf8", "load_error", _one_yaml(b"\xff\xfe")),
+    _StatusCase("encoded-lone-surrogate", "load_error", _one_yaml(b"name: \xed\xa0\x80\n")),
+    _StatusCase("nul-byte", "load_error", _one_yaml(b"name: a\x00b\n")),
+    _StatusCase("hostile-yaml-filename", "load_error", _one_yaml(b"", "\x1b[2J x.yaml")),
+    _StatusCase("dir-named-yaml", "load_error", _dir_named_yaml),
+    _StatusCase("valid-plus-malformed", "load_error", _valid_plus_malformed),
+    _StatusCase("absolute-missing-dir", "load_error", _absolute(_missing_dir)),
+    _StatusCase("absolute-path-is-a-file", "load_error", _absolute(_sources_path_is_file)),
+    _StatusCase("absolute-valid-plus-malformed", "load_error", _absolute(_valid_plus_malformed)),
+    _StatusCase("absolute-empty-dir", "no_sources", _absolute(_empty_dir)),
+    *(
+        _StatusCase(f"hostile-name-U+{ord(ch):04X}", "load_error", _hostile_name(ch))
+        for ch in _HOSTILE_NAME_CHARS
+    ),
+    _StatusCase("never-run-empty-state", "never_run", _fixture_never_run(state_exists=True)),
+    _StatusCase("never-run-missing-state", "never_run", _fixture_never_run(state_exists=False)),
+    _StatusCase("never-run-repo-config-health-yml", "never_run", _repo_sources_never_run),
+    _StatusCase("healthy-fixture", "healthy", _fixture_healthy),
+    _StatusCase("healthy-repo-config", "healthy", _repo_sources_healthy),
+)
+
+
+def test_status_cases_cover_every_outcome() -> None:
+    # Contract for the table below: every outcome has at least one row, both failure
+    # (no_sources, load_error) and success (never_run, healthy), and ids are unique.
+    kinds = {c.kind for c in _STATUS_CASES}
+    assert kinds == {"no_sources", "load_error", "never_run", "healthy"}, kinds
+    ids = [c.id for c in _STATUS_CASES]
+    assert len(ids) == len(set(ids)), ids
+    assert len(_HOSTILE_NAME_CHARS) == sum(c.id.startswith("hostile-name-") for c in _STATUS_CASES)
+    assert {unicodedata.category(ch) for ch in _HOSTILE_NAME_CHARS} >= {"Cc", "Cf", "Zl", "Zp"}
+    # Both failure outcomes are also fed an absolute --sources-dir, the input whose path the
+    # loader's message carries (F8).
+    absolute_kinds = {c.kind for c in _STATUS_CASES if c.id.startswith("absolute-")}
+    assert absolute_kinds == {"no_sources", "load_error"}, absolute_kinds
+
+
+def _assert_no_leak(root: Path, *streams: str) -> None:
+    # F8 / attack list A: no absolute path, no raw control or separator characters.
+    for stream in streams:
+        assert str(root) not in stream and str(root.resolve()) not in stream, stream
+        assert _unsafe_chars(stream) == [], (_unsafe_chars(stream), stream)
+
+
+@pytest.mark.parametrize("case", _STATUS_CASES, ids=[c.id for c in _STATUS_CASES])
+def test_status_outcome_by_configuration(
+    case: _StatusCase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    sources_arg, state_arg, expected_lines = case.build(tmp_path)
+    result = runner.invoke(app, ["status", "--sources-dir", sources_arg, "--state-dir", state_arg])
+
+    if case.kind in ("never_run", "healthy"):
+        assert result.exit_code == 0, (result.exit_code, result.stdout, result.stderr)
+        assert result.stdout.splitlines() == expected_lines
+        assert result.stderr == ""
+        return
+
+    # Control: refresh, on the same sources dir, defines which failure this row is (G0-1).
+    ref = runner.invoke(app, ["refresh", "--all", "--sources-dir", sources_arg])
+    assert isinstance(ref.exception, SystemExit), f"control: refresh crashed: {ref.exception!r}"
+
+    # The fix: status never reports nothing-configured or unloadable config as success.
+    assert result.exit_code == ref.exit_code, (
+        f"status exited {result.exit_code}, refresh exited {ref.exit_code} on the same sources dir; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    # An exit through typer.Exit, not a traceback that happens to exit 1.
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
+    assert _NO_RUNS not in result.stdout, "status still prints the never-run message"
+    _assert_no_leak(tmp_path, result.stdout, result.stderr)
+
+    if case.kind == "no_sources":
+        assert ref.exit_code == cli.EXIT_NO_SOURCES, "control: refresh does not see this row as empty"
+        # The exact public code, not just parity with refresh: if the shared path drifted for
+        # both commands, parity alone would still pass.
+        assert result.exit_code == cli.EXIT_NO_SOURCES, (result.exit_code, result.stderr)
+        assert _NO_SOURCES_MSG in result.stderr, result.stderr
+        assert _LOAD_ERROR_MSG not in result.stderr, "no-sources reported as a load error"
+    else:
+        assert ref.exit_code == cli.EXIT_LOAD_ERROR, "control: refresh loaded this row"
+        assert result.exit_code == cli.EXIT_LOAD_ERROR, (result.exit_code, result.stderr)
+        assert _LOAD_ERROR_MSG in result.stderr, result.stderr
+        assert _NO_SOURCES_MSG not in result.stderr, "load error reported as no sources"
+
+
+def test_status_default_paths_in_empty_dir_is_not_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Was test_status_no_checkpoints, which pinned the bug (exit 0, "No runs"). The default
+    # --sources-dir is relative to the cwd; in an empty directory nothing is configured, and
+    # status must fail the way refresh does on the same defaults.
+    monkeypatch.chdir(tmp_path)
+    ref = runner.invoke(app, ["refresh", "--all"])
+    assert isinstance(ref.exception, SystemExit) and ref.exit_code != 0, "control: refresh succeeded"
     result = runner.invoke(app, ["status"])
+    assert result.exit_code == ref.exit_code, (result.exit_code, result.stdout, result.stderr)
+    # The default config/sources does not exist in an empty cwd: that is the load-error code.
+    assert result.exit_code == cli.EXIT_LOAD_ERROR, (result.exit_code, result.stderr)
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
+    assert _NO_RUNS not in result.stdout
+    _assert_no_leak(tmp_path, result.stdout, result.stderr)
+
+
+def test_status_help_documents_exit_codes() -> None:
+    # Card #190: the CLI help states which outcome exits which code: never-run (sources
+    # configured, no checkpoint) is a legitimate 0, nothing configured is EXIT_NO_SOURCES, an
+    # unloadable sources dir is EXIT_LOAD_ERROR.
+    #
+    # The numeric values are a public contract: this help text prints them and
+    # automations/refresh.md documents 2 for EXIT_NO_SOURCES, so callers may key on the numbers.
+    # They are pinned here, not just compared with each other: renumbering is a breaking change.
+    documented = {"EXIT_LOAD_ERROR": 1, "EXIT_NO_SOURCES": 2}
+    assert {name: getattr(cli, name) for name in documented} == documented
+    outcomes = {
+        0: "sources are configured",
+        cli.EXIT_NO_SOURCES: "holds no source",
+        cli.EXIT_LOAD_ERROR: "cannot be loaded",
+    }
+    assert len(outcomes) == 3, "two status outcomes share an exit code"
+
+    result = runner.invoke(app, ["status", "--help"])
     assert result.exit_code == 0
-    assert "No runs" in result.output
+    text = " ".join(strip_ansi(result.output).split())
+    # Every "<code> when <outcome>" clause in the help, in order. Exactly the three outcome
+    # codes, each once and each tied to its own outcome: a dropped, extra or swapped code fails.
+    clauses = re.findall(r"(?<![\w.])(\d+) when ([^;]+)", text)
+    assert sorted(int(code) for code, _ in clauses) == sorted(outcomes), (clauses, text)
+    for code, clause in clauses:
+        assert outcomes[int(code)] in clause, (code, clause)
 
 
 def test_fetch_dry_run_help() -> None:

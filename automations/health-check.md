@@ -15,14 +15,25 @@ The workflow (`.github/workflows/health.yml`) fires on:
 
 ## What it does
 
-The `health` job runs two checks in order:
+The `health` job runs two checks in this order. Neither step has `if:` or
+`continue-on-error`, so if the first fails the second does not run:
 
-1. `ingester status` - calls the CLI's built-in status command. It exits 0 on a
-   healthy system (including "No runs recorded."), so it is not masked; a crash
-   fails the job (terms-analysis#90).
-2. `python scripts/health_check.py` - reads `config/sources/*.yaml` to enumerate
-   sources, inspects `<state dir>/<source>.checkpoint.json` for last-run time and
-   stage, and writes a markdown table to `out/health/YYYY-MM-DD.md`.
+1. `Run health check` (`python scripts/health_check.py`) - reads
+   `config/sources/*.yaml` to enumerate sources, inspects
+   `<state dir>/<source>.checkpoint.json` for last-run time and stage, and writes
+   a markdown table to `out/health/YYYY-MM-DD.md`. It runs first so that an
+   invalid checkpoint surfaces as exit 4 (#17) and fails the job before
+   `ingester status` can crash on the same file.
+2. `Run ingester status` (`ingester status`) - the CLI's built-in status command.
+   It runs only after the health check passed or warned with exit 3. It prints a
+   `<name>: <stage>` line only for configured sources that have a checkpoint;
+   configured sources with no checkpoint print nothing. When no configured
+   source has a checkpoint it prints "No runs recorded." and exits 0. A sources
+   dir that loads but holds no source exits 2 (`EXIT_NO_SOURCES`); a sources dir
+   that cannot be loaded, including one that is missing or not a directory,
+   exits 1 (`EXIT_LOAD_ERROR`). The codes are listed in `ingester status --help`
+   (terms-analysis#190). It is not masked; a crash fails the job
+   (terms-analysis#90).
 
 Both steps pass `--state-dir "${XDG_STATE_HOME:-$HOME/.local/state}/legal-corpus-ingester/state"`,
 outside the checkout. `actions/checkout` cleans ignored files, which wipes the

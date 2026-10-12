@@ -19,8 +19,15 @@ from legal_corpus_ingester.provenance.license_audit import (
     DriftStatus,
 )
 
-# Exit codes for refresh — distinguishes "no sources" from real failure
+# Exit codes for refresh and status — distinguishes "no sources" from real failure
 EXIT_NO_SOURCES: int = 2
+# The sources dir could not be loaded (missing, not a directory, or a config that fails to parse
+# or validate). refresh and status share it so the two cannot drift (terms-analysis#190).
+EXIT_LOAD_ERROR: int = 1
+# Message stems shared by refresh and status; the tests and health docs key on them.
+MSG_LOAD_ERROR = "Error loading sources"
+MSG_NO_SOURCES = "No sources configured"
+MSG_NO_RUNS = "No runs recorded."
 # Pipeline not wired to the orchestrator yet (terms-analysis#90): must never look like success
 EXIT_NOT_WIRED: int = 3
 # Single source for "does `ingester refresh` run the pipeline yet?". scripts/health_check.py
@@ -108,7 +115,15 @@ def sources_list(
         typer.echo(f"{name:<{name_w}}  {cfg.jurisdiction}")
 
 
-@app.command()
+@app.command(
+    help=(
+        "Show the last checkpoint stage for each configured source.\n\n"
+        f"Exit codes: 0 when sources are configured (one '<name>: <stage>' line per source with a"
+        f" checkpoint, or '{MSG_NO_RUNS}' when none has run yet); {EXIT_NO_SOURCES} when the"
+        f" sources dir loads but holds no source; {EXIT_LOAD_ERROR} when the sources dir cannot"
+        " be loaded. The failure codes match `ingester refresh` on the same sources dir."
+    )
+)
 def status(
     sources_dir: Path = typer.Option(
         Path("config/sources"),
@@ -121,42 +136,37 @@ def status(
         help="Directory containing checkpoint files.",
     ),
 ) -> None:
-    """Show the last checkpoint stage for each configured source."""
-    # Load sources; if the directory doesn't exist, still try to read checkpoints
+    # "Nothing configured" and "config unloadable" are failures, never "No runs recorded."
+    # (DEV-FUNDAMENTALS F5, terms-analysis#190). Checkpoints are read only for configured
+    # sources: an orphan checkpoint must not make an empty config look configured, and its
+    # file name (untrusted) is never echoed.
     try:
         registry = load_all(sources_dir)
-    except Exception:
-        registry = {}
-
-    store = CheckpointStore(state_dir)
+    except Exception as exc:
+        # Only the exception type is shown: the loader's message can carry absolute paths and
+        # raw bytes from file names or YAML content (F8). The type is a code identifier.
+        typer.echo(
+            f"{MSG_LOAD_ERROR} ({type(exc).__name__}); check the *.yaml files in --sources-dir."
+            " `ingester sources list` prints the loader's full message.",
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_LOAD_ERROR)
 
     if not registry:
-        # Fall back to scanning the state dir directly
-        if state_dir.is_dir():
-            checkpoints = sorted(state_dir.glob("*.checkpoint.json"))
-        else:
-            checkpoints = []
+        typer.echo(f"{MSG_NO_SOURCES} in --sources-dir; nothing to report.", err=True)
+        raise typer.Exit(code=EXIT_NO_SOURCES)
 
-        if not checkpoints:
-            typer.echo("No runs recorded.")
-            return
-
-        for cp_path in checkpoints:
-            source_name = cp_path.name.replace(".checkpoint.json", "")
-            state = store.load(source_name)
-            if state:
-                typer.echo(f"{source_name}: {state.stage}")
-        return
-
+    store = CheckpointStore(state_dir)
     any_recorded = False
     for name in registry:
+        # Registry names passed SourceConfig's name_is_safe allowlist, so echoing them is safe.
         state = store.load(name)
         if state:
             any_recorded = True
             typer.echo(f"{name}: {state.stage}")
 
     if not any_recorded:
-        typer.echo("No runs recorded.")
+        typer.echo(MSG_NO_RUNS)
 
 
 @app.command()
@@ -214,11 +224,11 @@ def refresh(
     try:
         registry = load_all(sources_dir)
     except Exception as exc:
-        typer.echo(f"Error loading sources: {exc}", err=True)
-        raise typer.Exit(code=1)
+        typer.echo(f"{MSG_LOAD_ERROR}: {exc}", err=True)
+        raise typer.Exit(code=EXIT_LOAD_ERROR)
 
     if not registry:
-        typer.echo("No sources configured; nothing to refresh.")
+        typer.echo(f"{MSG_NO_SOURCES}; nothing to refresh.")
         raise typer.Exit(code=EXIT_NO_SOURCES)
 
     # Full pipeline orchestration not yet wired — placeholder for Phase 1.
