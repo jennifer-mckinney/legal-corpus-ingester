@@ -12,6 +12,8 @@ tests/cli/helpers.PUBLIC_EXIT_CODES; the tests below pin cli, the help and the d
 """
 from __future__ import annotations
 
+import errno
+import os
 import re
 from pathlib import Path
 from typing import Callable
@@ -226,3 +228,105 @@ def test_docs_do_not_call_a_missing_dir_a_load_error() -> None:
             if "EXIT_LOAD_ERROR" in clause and ("not a directory" in clause or "missing" in clause):
                 stale.append(f"{path.relative_to(_REPO_ROOT)}: {clause.strip()[:160]}")
     assert stale == [], stale
+
+
+# --- #108: how the sources dir is classified (mutants M3, M6, M9 from the coder's probes) -----
+
+def _commands(sources_dir: str, root: Path) -> dict[str, list[str]]:
+    """refresh and status share the sources-dir classification; both must give the same code."""
+    return {
+        "status": ["status", "--sources-dir", sources_dir, "--state-dir", str(root / "state")],
+        "refresh": ["refresh", "--all", "--sources-dir", sources_dir],
+    }
+
+
+def _fail_for(monkeypatch: pytest.MonkeyPatch, name: str, target: str, code: int) -> None:
+    """Make os.<name> raise OSError(code) for *target* only; every other path keeps the real call.
+
+    Monkeypatched rather than chmod: CI runners may run as root, which ignores permissions.
+    """
+    real = getattr(os, name)
+
+    def fake(path: object, *args: object, **kwargs: object) -> object:
+        if isinstance(path, (str, os.PathLike)) and os.fspath(path) == target:
+            raise OSError(code, os.strerror(code), target)
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, name, fake)
+
+
+@pytest.mark.parametrize("command", ["status", "refresh"])
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EPERM, errno.EIO], ids=["EACCES", "EPERM", "EIO"])
+def test_stat_error_outside_missing_allowlist_is_load_error_not_dir_missing(
+    command: str, code: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # M3: only the "names no directory" errnos mean missing. A permission or I/O error from stat
+    # (EACCES on a parent fails both stat and the listing) is a load error the operator must fix,
+    # never "wrong path" (6).
+    target = _empty(tmp_path)
+    args = _commands(target, tmp_path)[command]
+    _fail_for(monkeypatch, "stat", target, code)
+    _fail_for(monkeypatch, "scandir", target, code)
+    result = runner.invoke(cli.app, args)
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_LOAD_ERROR"], (result.exit_code, result.stderr)
+    assert cli.MSG_SOURCES_DIR_MISSING not in result.stderr, result.stderr  # message honesty (F8)
+    assert target not in result.output + result.stderr, "the path must not be echoed (F8)"
+
+
+@pytest.mark.parametrize("command", ["status", "refresh"])
+@pytest.mark.parametrize("code", [errno.EACCES, errno.EPERM], ids=["EACCES", "EPERM"])
+def test_existing_unreadable_sources_dir_is_load_error(
+    command: str, code: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # M6: the dir exists and stats as a directory, but its listing cannot be opened. load_all's
+    # glob skips an unreadable dir silently, so without the listing probe this would pass for
+    # "no sources" (5). It must be a load error (1), not 5 and not 6.
+    target = _empty(tmp_path)
+    args = _commands(target, tmp_path)[command]
+    _fail_for(monkeypatch, "scandir", target, code)
+    result = runner.invoke(cli.app, args)
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_LOAD_ERROR"], (result.exit_code, result.stderr)
+    assert cli.MSG_NO_SOURCES not in result.output + result.stderr, result.output
+    assert target not in result.output + result.stderr, "the path must not be echoed (F8)"
+
+
+def _self_loop(root: Path) -> str:
+    (root / "loop").symlink_to(root / "loop")
+    return str(root / "loop")
+
+
+def _two_link_loop(root: Path) -> str:
+    (root / "a").symlink_to(root / "b")
+    (root / "b").symlink_to(root / "a")
+    return str(root / "a")
+
+
+def _loop_as_parent(root: Path) -> str:
+    (root / "loop").symlink_to(root / "loop")
+    return str(root / "loop" / "sources")
+
+
+_SYMLINK_LOOPS: dict[str, Callable[[Path], str]] = {
+    "self-loop": _self_loop,
+    "two-link-loop": _two_link_loop,
+    "loop-as-parent": _loop_as_parent,
+}
+
+
+@pytest.mark.parametrize("command", ["status", "refresh"])
+@pytest.mark.parametrize("build", list(_SYMLINK_LOOPS.values()), ids=list(_SYMLINK_LOOPS))
+def test_symlink_loop_sources_dir_is_dir_missing(
+    command: str, build: Callable[[Path], str], tmp_path: Path
+) -> None:
+    # M9: a symlink loop resolves to no directory, so it is "missing" (6), not a load error (1).
+    # Real symlinks, no permissions involved, so this behaves the same as root on CI.
+    target = build(tmp_path)
+    with pytest.raises(OSError) as raised:
+        os.stat(target)
+    assert raised.value.errno == errno.ELOOP, "control: the fixture must be a real ELOOP"
+    result = runner.invoke(cli.app, _commands(target, tmp_path)[command])
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_SOURCES_DIR_MISSING"], (
+        result.exit_code, result.stderr,
+    )
+    assert cli.MSG_SOURCES_DIR_MISSING in result.stderr, result.stderr
+    assert target not in result.output + result.stderr, "the path must not be echoed (F8)"
