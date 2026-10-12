@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import unicodedata
@@ -16,7 +17,7 @@ from legal_corpus_ingester import cli
 from legal_corpus_ingester.cli import app
 from legal_corpus_ingester.pipeline.state import STAGES, CheckpointState, CheckpointStore
 from legal_corpus_ingester.sources.registry import load_all
-from tests.cli.helpers import strip_ansi
+from tests.cli.helpers import EXIT_CODE_MEANINGS, PUBLIC_EXIT_CODES, strip_ansi
 
 runner = CliRunner()
 
@@ -52,11 +53,15 @@ def test_sources_list_help() -> None:
 # status: "nothing configured" is not success (terms-analysis#190, DEV-FUNDAMENTALS F5)
 # ---------------------------------------------------------------------------
 #
-# `ingester status` has four outcomes, and each must be told apart from the others:
+# `ingester status` has five outcomes, and each must be told apart from the others:
 #   no_sources  the sources dir loads cleanly but holds no source -> EXIT_NO_SOURCES, stderr says so
-#   load_error  the sources dir cannot be loaded                   -> EXIT_LOAD_ERROR, stderr says it
+#   dir_missing the sources path does not exist or is not a dir   -> EXIT_SOURCES_DIR_MISSING (#108)
+#   load_error  the sources dir exists but cannot be loaded        -> EXIT_LOAD_ERROR, stderr says it
 #   never_run   sources configured, no checkpoint yet              -> 0, "No runs recorded."
 #   healthy     sources configured, checkpoints present            -> 0, one "<name>: <stage>" line
+# #108 (owner ruling 2026-10-12): EXIT_NO_SOURCES moved off 2, which is EXIT_USAGE's alone, and a
+# missing or non-directory sources path left EXIT_LOAD_ERROR for its own code. An unreadable dir
+# exists, so it is not dir_missing; it cannot be listed, so it is not no_sources either: load_error.
 # never_run stays exit 0 on purpose: the nightly health.yml runs `ingester status` with the repo's
 # config/sources on a fresh hosted runner, whose state dir is empty until refresh is wired and state
 # persists (ADR-016). Each failure row pins the exact public code (EXIT_NO_SOURCES /
@@ -74,6 +79,11 @@ _UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 # One character per hostile class, generated into the `name` field of an otherwise valid source.
 # The loader must reject each; status must then report a load error without echoing the raw byte.
 _HOSTILE_NAME_CHARS = ("\x1b", "\r", "\x0b", "\x0c", "\x85", " ", " ", "​", "‮", "﻿")
+
+
+# The same classes in a MISSING --sources-dir argument (#108), plus newline (line forgery), NUL,
+# a lone surrogate and a surrogate-escaped invalid UTF-8 byte (how POSIX argv carries b"\xff").
+_HOSTILE_PATH_CHARS = (*_HOSTILE_NAME_CHARS, "\n", "\x00", "\ud800", "\udcff")
 
 
 def _unsafe_chars(text: str) -> list[str]:
@@ -149,6 +159,49 @@ def _dangling_symlink(root: Path) -> tuple[str, str, list[str]]:
 
 def _sources_path_is_file(root: Path) -> tuple[str, str, list[str]]:
     (root / "src").write_text(_FIXTURE_SOURCE.read_text(encoding="utf-8"), encoding="utf-8")
+    return "src", "state", []
+
+
+def _symlink_to_file(root: Path) -> tuple[str, str, list[str]]:
+    (root / "real.yaml").write_text(_FIXTURE_SOURCE.read_text(encoding="utf-8"), encoding="utf-8")
+    (root / "src").symlink_to(root / "real.yaml")
+    return "src", "state", []
+
+
+def _parent_is_a_file(root: Path) -> tuple[str, str, list[str]]:
+    # ENOTDIR on a middle component: the path does not exist as a directory.
+    (root / "f").write_text("x", encoding="utf-8")
+    return "f/src", "state", []
+
+
+def _fifo(root: Path) -> tuple[str, str, list[str]]:
+    # Not a directory, and opening it for reading would block: the check must not read it.
+    os.mkfifo(root / "src")
+    return "src", "state", []
+
+
+def _missing_hostile_name(ch: str) -> Callable[[Path], tuple[str, str, list[str]]]:
+    # A missing path whose name forges output (control, format, line/paragraph separators,
+    # NUL): the exit names the outcome without echoing the raw character (F2, F8).
+    def build(root: Path) -> tuple[str, str, list[str]]:
+        return f"src{ch}x", "state", []
+
+    return build
+
+
+def _missing_name_too_long(root: Path) -> tuple[str, str, list[str]]:
+    # ENAMETOOLONG, sized from the filesystem's own limit (no literal): still "does not exist",
+    # and the huge name is never echoed back (checked in the dir_missing branch).
+    return "a" * (os.pathconf(root, "PC_NAME_MAX") + 1), "state", []
+
+
+def _unreadable_dir(root: Path) -> tuple[str, str, list[str]]:
+    # The dir exists (so not dir_missing) but cannot be listed: glob() would see nothing, which
+    # must not pass for "holds no source". write+search only, so tmp_path cleanup still works.
+    _copy_fixture(root / "src")
+    (root / "src").chmod(0o300)
+    # Control, fail not skip (F9): as root the dir stays readable and the row would prove nothing.
+    assert not os.access(root / "src", os.R_OK), "control: test runs as root; dir is still readable"
     return "src", "state", []
 
 
@@ -236,9 +289,21 @@ _STATUS_CASES: tuple[_StatusCase, ...] = (
     _StatusCase("symlink-to-empty-dir", "no_sources", _symlink_to_empty_dir),
     _StatusCase("orphan-checkpoint", "no_sources", _orphan_checkpoint),
     _StatusCase("hostile-orphan-checkpoint-filename", "no_sources", _hostile_orphan_checkpoint),
-    _StatusCase("missing-dir", "load_error", _missing_dir),
-    _StatusCase("dangling-symlink", "load_error", _dangling_symlink),
-    _StatusCase("sources-path-is-a-file", "load_error", _sources_path_is_file),
+    # #108: these five rows were load_error (exit 1) before the owner gave them their own code.
+    _StatusCase("missing-dir", "dir_missing", _missing_dir),
+    _StatusCase("dangling-symlink", "dir_missing", _dangling_symlink),
+    _StatusCase("sources-path-is-a-file", "dir_missing", _sources_path_is_file),
+    _StatusCase("absolute-missing-dir", "dir_missing", _absolute(_missing_dir)),
+    _StatusCase("absolute-path-is-a-file", "dir_missing", _absolute(_sources_path_is_file)),
+    _StatusCase("symlink-to-file", "dir_missing", _symlink_to_file),
+    _StatusCase("parent-is-a-file", "dir_missing", _parent_is_a_file),
+    _StatusCase("sources-path-is-a-fifo", "dir_missing", _fifo),
+    _StatusCase("missing-name-too-long", "dir_missing", _missing_name_too_long),
+    *(
+        _StatusCase(f"missing-hostile-path-U+{ord(ch):04X}", "dir_missing", _missing_hostile_name(ch))
+        for ch in _HOSTILE_PATH_CHARS
+    ),
+    _StatusCase("unreadable-dir", "load_error", _unreadable_dir),
     _StatusCase("empty-yaml", "load_error", _one_yaml(b"")),
     _StatusCase("yaml-is-a-list", "load_error", _one_yaml(b"- a\n- b\n")),
     _StatusCase("invalid-utf8", "load_error", _one_yaml(b"\xff\xfe")),
@@ -247,8 +312,6 @@ _STATUS_CASES: tuple[_StatusCase, ...] = (
     _StatusCase("hostile-yaml-filename", "load_error", _one_yaml(b"", "\x1b[2J x.yaml")),
     _StatusCase("dir-named-yaml", "load_error", _dir_named_yaml),
     _StatusCase("valid-plus-malformed", "load_error", _valid_plus_malformed),
-    _StatusCase("absolute-missing-dir", "load_error", _absolute(_missing_dir)),
-    _StatusCase("absolute-path-is-a-file", "load_error", _absolute(_sources_path_is_file)),
     _StatusCase("absolute-valid-plus-malformed", "load_error", _absolute(_valid_plus_malformed)),
     _StatusCase("absolute-empty-dir", "no_sources", _absolute(_empty_dir)),
     *(
@@ -265,17 +328,20 @@ _STATUS_CASES: tuple[_StatusCase, ...] = (
 
 def test_status_cases_cover_every_outcome() -> None:
     # Contract for the table below: every outcome has at least one row, both failure
-    # (no_sources, load_error) and success (never_run, healthy), and ids are unique.
+    # (no_sources, dir_missing, load_error) and success (never_run, healthy), and ids are unique.
     kinds = {c.kind for c in _STATUS_CASES}
-    assert kinds == {"no_sources", "load_error", "never_run", "healthy"}, kinds
+    assert kinds == {"no_sources", "dir_missing", "load_error", "never_run", "healthy"}, kinds
     ids = [c.id for c in _STATUS_CASES]
     assert len(ids) == len(set(ids)), ids
     assert len(_HOSTILE_NAME_CHARS) == sum(c.id.startswith("hostile-name-") for c in _STATUS_CASES)
     assert {unicodedata.category(ch) for ch in _HOSTILE_NAME_CHARS} >= {"Cc", "Cf", "Zl", "Zp"}
-    # Both failure outcomes are also fed an absolute --sources-dir, the input whose path the
+    # #108: every hostile path character has its own dir_missing row, across Cc/Cf/Cs/Zl/Zp.
+    assert len(_HOSTILE_PATH_CHARS) == sum(c.id.startswith("missing-hostile-path-") for c in _STATUS_CASES)
+    assert {unicodedata.category(ch) for ch in _HOSTILE_PATH_CHARS} >= set(_UNSAFE_CATEGORIES)
+    # Every failure outcome is also fed an absolute --sources-dir, the input whose path the
     # loader's message carries (F8).
     absolute_kinds = {c.kind for c in _STATUS_CASES if c.id.startswith("absolute-")}
-    assert absolute_kinds == {"no_sources", "load_error"}, absolute_kinds
+    assert absolute_kinds == {"no_sources", "dir_missing", "load_error"}, absolute_kinds
 
 
 def _assert_no_leak(root: Path, *streams: str) -> None:
@@ -313,16 +379,41 @@ def test_status_outcome_by_configuration(
     assert _NO_RUNS not in result.stdout, "status still prints the never-run message"
     _assert_no_leak(tmp_path, result.stdout, result.stderr)
 
+    # Expected codes come from the pinned public table (#108), so a row fails on the exit code
+    # it gets, and test_public_exit_code_values_are_pinned ties the table to cli's constants.
     if case.kind == "no_sources":
-        assert ref.exit_code == cli.EXIT_NO_SOURCES, "control: refresh does not see this row as empty"
+        expected = PUBLIC_EXIT_CODES["EXIT_NO_SOURCES"]
+        assert ref.exit_code == expected, f"refresh exited {ref.exit_code} on an empty sources dir"
         # The exact public code, not just parity with refresh: if the shared path drifted for
         # both commands, parity alone would still pass.
-        assert result.exit_code == cli.EXIT_NO_SOURCES, (result.exit_code, result.stderr)
+        assert result.exit_code == expected, (result.exit_code, result.stderr)
         assert _NO_SOURCES_MSG in result.stderr, result.stderr
         assert _LOAD_ERROR_MSG not in result.stderr, "no-sources reported as a load error"
+    elif case.kind == "dir_missing":
+        expected = PUBLIC_EXIT_CODES["EXIT_SOURCES_DIR_MISSING"]
+        assert ref.exit_code == expected, (
+            f"refresh exited {ref.exit_code} on a missing / non-directory sources path; "
+            f"stderr={ref.stderr!r}"
+        )
+        assert result.exit_code == expected, (result.exit_code, result.stderr)
+        # Honest message (F8): its own stem, never another outcome's, and it names the fix.
+        missing_msg = getattr(cli, "MSG_SOURCES_DIR_MISSING", None)
+        assert isinstance(missing_msg, str) and missing_msg, "cli.MSG_SOURCES_DIR_MISSING not defined"
+        for stream in (result.stderr, ref.stderr):
+            assert missing_msg in stream, stream
+            assert "--sources-dir" in stream, stream
+            assert _NO_SOURCES_MSG not in stream, "missing dir reported as no sources"
+            assert _LOAD_ERROR_MSG not in stream, "missing dir reported as a load error"
+        # refresh's message is new on this path, so it meets the same output bar as status.
+        _assert_no_leak(tmp_path, ref.stdout, ref.stderr)
+        # A hostile or oversized argument is never echoed back, whole or raw (F2, F8, size).
+        if not sources_arg.isprintable() or len(sources_arg) > os.pathconf(tmp_path, "PC_NAME_MAX"):
+            for stream in (result.stdout, result.stderr, ref.stdout, ref.stderr):
+                assert sources_arg not in stream, "raw --sources-dir argument echoed"
     else:
-        assert ref.exit_code == cli.EXIT_LOAD_ERROR, "control: refresh loaded this row"
-        assert result.exit_code == cli.EXIT_LOAD_ERROR, (result.exit_code, result.stderr)
+        expected = PUBLIC_EXIT_CODES["EXIT_LOAD_ERROR"]
+        assert ref.exit_code == expected, f"refresh exited {ref.exit_code} on an unloadable sources dir"
+        assert result.exit_code == expected, (result.exit_code, result.stderr)
         assert _LOAD_ERROR_MSG in result.stderr, result.stderr
         assert _NO_SOURCES_MSG not in result.stderr, "load error reported as no sources"
 
@@ -338,39 +429,59 @@ def test_status_default_paths_in_empty_dir_is_not_success(
     assert isinstance(ref.exception, SystemExit) and ref.exit_code != 0, "control: refresh succeeded"
     result = runner.invoke(app, ["status"])
     assert result.exit_code == ref.exit_code, (result.exit_code, result.stdout, result.stderr)
-    # The default config/sources does not exist in an empty cwd: that is the load-error code.
-    assert result.exit_code == cli.EXIT_LOAD_ERROR, (result.exit_code, result.stderr)
+    # The default config/sources does not exist in an empty cwd: that is the missing-dir code
+    # (#108; it was EXIT_LOAD_ERROR before the owner split it out).
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_SOURCES_DIR_MISSING"], (result.exit_code, result.stderr)
     assert isinstance(result.exception, SystemExit), repr(result.exception)
     assert _NO_RUNS not in result.stdout
     _assert_no_leak(tmp_path, result.stdout, result.stderr)
 
 
+_HELP_CLAUSE = re.compile(r"(?<![\w.])(\d+) when ([^;]+)")
+
+
+def _help_clauses(args: list[str]) -> tuple[list[tuple[str, str]], str]:
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, (result.exit_code, result.output)
+    text = " ".join(strip_ansi(result.output).split())
+    return _HELP_CLAUSE.findall(text), text
+
+
 def test_status_help_documents_exit_codes() -> None:
     # Card #190: the CLI help states which outcome exits which code: never-run (sources
     # configured, no checkpoint) is a legitimate 0, nothing configured is EXIT_NO_SOURCES, an
-    # unloadable sources dir is EXIT_LOAD_ERROR.
+    # unloadable sources dir is EXIT_LOAD_ERROR. #108 adds EXIT_SOURCES_DIR_MISSING for a sources
+    # path that does not exist or is not a directory, and moves EXIT_NO_SOURCES off 2.
     #
-    # The numeric values are a public contract: this help text prints them and
-    # automations/refresh.md documents 2 for EXIT_NO_SOURCES, so callers may key on the numbers.
-    # They are pinned here, not just compared with each other: renumbering is a breaking change.
-    documented = {"EXIT_LOAD_ERROR": 1, "EXIT_NO_SOURCES": 2}
-    assert {name: getattr(cli, name) for name in documented} == documented
-    outcomes = {
-        0: "sources are configured",
-        cli.EXIT_NO_SOURCES: "holds no source",
-        cli.EXIT_LOAD_ERROR: "cannot be loaded",
-    }
-    assert len(outcomes) == 3, "two status outcomes share an exit code"
+    # The numeric values are a public contract (PUBLIC_EXIT_CODES, pinned against cli in
+    # test_public_exit_code_values_are_pinned); the expectations here come from that table.
+    names = ("EXIT_NO_SOURCES", "EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR")
+    outcomes: dict[int, tuple[str, ...]] = {0: ("sources are configured",)}
+    outcomes.update({PUBLIC_EXIT_CODES[n]: EXIT_CODE_MEANINGS[n] for n in names})
+    assert len(outcomes) == 1 + len(names), "two status outcomes share an exit code"
 
-    result = runner.invoke(app, ["status", "--help"])
-    assert result.exit_code == 0
-    text = " ".join(strip_ansi(result.output).split())
-    # Every "<code> when <outcome>" clause in the help, in order. Exactly the three outcome
+    # Every "<code> when <outcome>" clause in the help, in order. Exactly the four outcome
     # codes, each once and each tied to its own outcome: a dropped, extra or swapped code fails.
-    clauses = re.findall(r"(?<![\w.])(\d+) when ([^;]+)", text)
+    clauses, text = _help_clauses(["status", "--help"])
     assert sorted(int(code) for code, _ in clauses) == sorted(outcomes), (clauses, text)
     for code, clause in clauses:
-        assert outcomes[int(code)] in clause, (code, clause)
+        for phrase in outcomes[int(code)]:
+            assert phrase in clause, (code, phrase, clause)
+
+
+def test_top_level_help_lists_every_exit_code() -> None:
+    # #108: `ingester --help` lists every public exit code once, as "<code> when <meaning>",
+    # each clause carrying its own meaning, so 5 and 6 (and 2 = usage only) are discoverable
+    # without reading per-command help. 0 may be listed too; no other number may.
+    clauses, text = _help_clauses(["--help"])
+    by_code = {code: name for name, code in PUBLIC_EXIT_CODES.items()}
+    listed = [int(code) for code, _ in clauses if int(code) != 0]
+    assert sorted(listed) == sorted(by_code), (clauses, text)
+    for code, clause in clauses:
+        if int(code) == 0:
+            continue
+        for phrase in EXIT_CODE_MEANINGS[by_code[int(code)]]:
+            assert phrase in clause, (code, phrase, clause)
 
 
 def test_fetch_dry_run_help() -> None:
