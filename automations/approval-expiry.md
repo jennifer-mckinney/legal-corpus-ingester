@@ -53,9 +53,18 @@ configs (terms-analysis#173).
 `approval-expiry` label if it is missing (`gh label create --force`, idempotent; a real
 error fails the step). It then opens an issue titled `Approval expiry alert -- YYYY-MM-DD`
 with that label. The
-issue body instructs the operator to run `python scripts/check_approvals.py` locally
-for the full status table and to update the affected APPROVAL.yaml files before the
-next ingester refresh.
+issue body depends on the checker's exit code (#13), which the `Run approval check`
+step records as its `rc` output:
+
+| Exit code | Issue body says |
+|---|---|
+| 1 | one or more APPROVAL.yaml files have expired or are failing validation (malformed, undated, or a signed-artifact hash mismatch); renew or correct them before the next ingester refresh |
+| 2 (`EXIT_CONFIG`) | the check could not run because of invalid input or configuration; no approval was checked; fix the configuration named in the step log |
+| any other non-zero | the checker failed unexpectedly with that exit code; this is a checker or runner failure, not an approval result |
+
+Every body also tells the operator to run `python scripts/check_approvals.py` locally
+for the full status table. The body never includes the checker's output; the step log
+has the detail.
 
 No issue is opened when all approvals are current. This keeps the issue tracker quiet
 during normal operation.
@@ -80,7 +89,7 @@ sends its standard failed-scheduled-workflow notification (terms-analysis#90).
 
 If `config/approvals/` is missing, unreadable or holds no `*.yaml` approval files,
 the script prints the reason to stderr and exits 2. The run goes red and the expiry
-issue opens; its body is generic, so read the step log for the exact cause. The job
+issue opens with the invalid-input text; read the step log for the exact cause. The job
 never passes silently on an empty or absent approvals dir (terms-analysis#173).
 
 ## Escalation
