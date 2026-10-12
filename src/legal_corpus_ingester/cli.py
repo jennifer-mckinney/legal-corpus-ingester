@@ -27,7 +27,7 @@ from legal_corpus_ingester.provenance.license_audit import (
 # automations/*.md document it, so callers key on the numbers: renumbering is a breaking change.
 # Each code has exactly one meaning; _EXIT_MEANINGS below holds the help text for each.
 #
-# The sources dir loads cleanly but holds no source (refresh and status).
+# The sources dir loads cleanly but holds no source (fetch, refresh, status and audit-license).
 EXIT_NO_SOURCES: int = 5
 # The --sources-dir path does not exist or is not a directory, on every command that takes
 # --sources-dir (#108; the fold-in of 2026-10-12 added fetch, sources list and audit-license to
@@ -72,9 +72,10 @@ _EXIT_MEANINGS: dict[int, str] = {
         "validate-round-trip could not import the terms-analysis consumer, so the bundle was"
         " not verified end to end"
     ),
-    # Scoped: fetch and audit-license call a source missing from an empty dir unknown (1), and
-    # `sources list` prints that nothing is configured and exits 0.
-    EXIT_NO_SOURCES: "the sources dir loads but holds no source (refresh, status)",
+    # Scoped: every --sources-dir command but `sources list`, which prints that nothing is
+    # configured and exits 0 (owner ruling 2026-10-12: an empty dir is "no source", not an
+    # unknown one, for fetch and audit-license too).
+    EXIT_NO_SOURCES: "the sources dir loads but holds no source (fetch, refresh, status, audit-license)",
     EXIT_SOURCES_DIR_MISSING: "the --sources-dir path does not exist or is not a directory",
 }
 # os.stat errno values meaning "this path names no directory": a component is missing or not a
@@ -288,8 +289,10 @@ def status(
     help=(
         "Fetch a source (use --dry-run to preview without writing).\n\n"
         "Exit codes: 0 when --dry-run prints what would be fetched; "
-        + _exit_code_clauses((EXIT_NOT_WIRED, EXIT_SOURCES_DIR_MISSING, EXIT_LOAD_ERROR))
-        + ". An unknown source also exits 1."
+        + _exit_code_clauses(
+            (EXIT_NOT_WIRED, EXIT_NO_SOURCES, EXIT_SOURCES_DIR_MISSING, EXIT_LOAD_ERROR)
+        )
+        + ". An unknown source in a sources dir that holds sources also exits 1."
     )
 )
 def fetch(
@@ -313,6 +316,12 @@ def fetch(
     except Exception as exc:
         typer.echo(f"{MSG_LOAD_ERROR}: {exc}", err=True)
         raise typer.Exit(code=EXIT_LOAD_ERROR)
+
+    # An empty dir is "no source" (EXIT_NO_SOURCES), not an unknown source: whatever is named,
+    # nothing could be fetched (owner ruling 2026-10-12). The path is never echoed (F2, F8).
+    if not registry:
+        typer.echo(f"{MSG_NO_SOURCES} in --sources-dir; nothing to fetch.", err=True)
+        raise typer.Exit(code=EXIT_NO_SOURCES)
 
     if source not in registry:
         typer.echo(f"Unknown source: {source!r}. Use 'ingester sources list' to see available sources.", err=True)
@@ -371,8 +380,9 @@ def refresh(
         "Check license drift for a source against the stored baseline.\n\n"
         "Exit codes: 0 when the license is unchanged, new or has no URL, or (with --offline)"
         " when the stored baseline, or its absence, is shown; "
-        + _exit_code_clauses((EXIT_SOURCES_DIR_MISSING, EXIT_LOAD_ERROR))
-        + ". An unknown source, license drift or a failed license fetch also exits 1."
+        + _exit_code_clauses((EXIT_NO_SOURCES, EXIT_SOURCES_DIR_MISSING, EXIT_LOAD_ERROR))
+        + ". An unknown source in a sources dir that holds sources, license drift or a failed"
+        " license fetch also exits 1."
     ),
 )
 def audit_license(
@@ -407,6 +417,12 @@ def audit_license(
     except Exception as exc:
         typer.echo(f"{MSG_LOAD_ERROR}: {exc}", err=True)
         raise typer.Exit(code=EXIT_LOAD_ERROR)
+
+    # An empty dir is "no source" (EXIT_NO_SOURCES), not an unknown source (owner ruling
+    # 2026-10-12), checked before any baseline or network work. The path is never echoed (F2, F8).
+    if not registry:
+        typer.echo(f"{MSG_NO_SOURCES} in --sources-dir; nothing to audit.", err=True)
+        raise typer.Exit(code=EXIT_NO_SOURCES)
 
     if source not in registry:
         typer.echo(
