@@ -29,9 +29,12 @@ The `health` job runs two checks in this order. Neither step has `if:` or
    `<name>: <stage>` line only for configured sources that have a checkpoint;
    configured sources with no checkpoint print nothing. When no configured
    source has a checkpoint it prints "No runs recorded." and exits 0. A sources
-   dir that loads but holds no source exits 2 (`EXIT_NO_SOURCES`); a sources dir
-   that cannot be loaded, including one that is missing or not a directory,
-   exits 1 (`EXIT_LOAD_ERROR`). The codes are listed in `ingester status --help`
+   dir that loads but holds no source exits 5 (`EXIT_NO_SOURCES`). A
+   `--sources-dir` path that does not exist or is not a directory exits
+   6 (`EXIT_SOURCES_DIR_MISSING`, #108; it exited 1 before). A sources dir that
+   exists but cannot be loaded (unreadable, or a config that fails to parse or
+   validate) exits 1 (`EXIT_LOAD_ERROR`). Exit 2 is a command-line usage error
+   only. The codes are listed in `ingester status --help` and `ingester --help`
    (terms-analysis#190). It is not masked; a crash fails the job
    (terms-analysis#90).
 

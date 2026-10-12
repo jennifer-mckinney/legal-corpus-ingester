@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import importlib
 import json
+import os
 import shutil
+import stat
 import sys
 from pathlib import Path
 
 import httpx
 import typer
 
-from legal_corpus_ingester.sources.registry import load_all
+from legal_corpus_ingester.sources.registry import RegistryLoadError, load_all
+from legal_corpus_ingester.sources.schema import SourceConfig
 from legal_corpus_ingester.pipeline.state import CheckpointStore
 from legal_corpus_ingester.provenance.license_audit import (
     hash_content,
@@ -19,14 +23,24 @@ from legal_corpus_ingester.provenance.license_audit import (
     DriftStatus,
 )
 
-# Exit codes for refresh and status — distinguishes "no sources" from real failure
-EXIT_NO_SOURCES: int = 2
-# The sources dir could not be loaded (missing, not a directory, or a config that fails to parse
-# or validate). refresh and status share it so the two cannot drift (terms-analysis#190).
+# Public exit-code contract (#108, owner ruling 2026-10-12). `ingester --help` prints it and
+# automations/*.md document it, so callers key on the numbers: renumbering is a breaking change.
+# Each code has exactly one meaning; _EXIT_MEANINGS below holds the help text for each.
+#
+# The sources dir loads cleanly but holds no source (fetch, refresh, status and audit-license).
+EXIT_NO_SOURCES: int = 5
+# The --sources-dir path does not exist or is not a directory, on every command that takes
+# --sources-dir (#108; the fold-in of 2026-10-12 added fetch, sources list and audit-license to
+# refresh and status). It was 1 before; it has its own code so a wrong path is not mistaken for
+# a broken config.
+EXIT_SOURCES_DIR_MISSING: int = 6
+# The sources dir exists but could not be loaded (unreadable, or a config that fails to parse or
+# validate). Every --sources-dir command shares it so they cannot drift (terms-analysis#190).
 EXIT_LOAD_ERROR: int = 1
 # Message stems shared by refresh and status; the tests and health docs key on them.
 MSG_LOAD_ERROR = "Error loading sources"
 MSG_NO_SOURCES = "No sources configured"
+MSG_SOURCES_DIR_MISSING = "Sources directory does not exist or is not a directory"
 MSG_NO_RUNS = "No runs recorded."
 # Pipeline not wired to the orchestrator yet (terms-analysis#90): must never look like success
 EXIT_NOT_WIRED: int = 3
@@ -38,11 +52,93 @@ REFRESH_WIRED: bool = False
 # validate-round-trip could not import the terms-analysis consumer, so the bundle was NOT
 # verified end to end; must not look like VALID unless --allow-missing-consumer (terms-analysis#90)
 EXIT_CONSUMER_SKIPPED: int = 4
-# No subcommand given: click's conventional usage-error code, as the console script returns
+# Command-line usage errors only: click's conventional code for an unknown command or option, a
+# missing argument or value, and (from main) no subcommand at all. No command body exits with it.
 EXIT_USAGE: int = 2
+# Help text for each public exit code, rendered as "<code> when <meaning>" clauses by
+# _exit_code_clauses into the top-level epilog and the status help. A meaning must not contain
+# ";" (the clause separator) or square brackets (rich markup).
+_EXIT_MEANINGS: dict[int, str] = {
+    EXIT_LOAD_ERROR: (
+        "the sources dir exists but cannot be loaded (it is unreadable, or a source config fails"
+        " to parse or validate)"
+    ),
+    EXIT_USAGE: (
+        "the command line is a usage error (unknown command or option, missing argument or"
+        " value, no command)"
+    ),
+    EXIT_NOT_WIRED: "the pipeline behind the command is not wired yet (fetch, refresh)",
+    EXIT_CONSUMER_SKIPPED: (
+        "validate-round-trip could not import the terms-analysis consumer, so the bundle was"
+        " not verified end to end"
+    ),
+    # Scoped: every --sources-dir command but `sources list`, which prints that nothing is
+    # configured and exits 0 (owner ruling 2026-10-12: an empty dir is "no source", not an
+    # unknown one, for fetch and audit-license too).
+    EXIT_NO_SOURCES: "the sources dir loads but holds no source (fetch, refresh, status, audit-license)",
+    EXIT_SOURCES_DIR_MISSING: "the --sources-dir path does not exist or is not a directory",
+}
+# os.stat errno values meaning "this path names no directory": a component is missing or not a
+# directory, the name is too long to exist, or a symlink loop resolves to nothing. Any other
+# OSError (EACCES on a parent, EIO) is not "missing": the load step then fails on it with
+# EXIT_LOAD_ERROR, so an unknown error never passes for a wrong path.
+_DIR_MISSING_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ENAMETOOLONG, errno.ELOOP})
 # The terms-analysis module validate-round-trip loads. Only a ModuleNotFoundError naming this
 # module or one of its parent packages means "consumer not installed".
 _CONSUMER_MODULE = "backend.app.services.legal_kb"
+
+
+def _exit_code_clauses(codes: tuple[int, ...]) -> str:
+    """Render "<code> when <meaning>" clauses, joined by "; ", from the one meanings table."""
+    return "; ".join(f"{code} when {_EXIT_MEANINGS[code]}" for code in codes)
+
+
+def _sources_dir_missing(sources_dir: str) -> bool:
+    """True when *sources_dir* names no directory: missing, dangling, a file, a FIFO, and so on.
+
+    Only stat() is used, never open(), so a FIFO or device is classified without blocking. A
+    ValueError (NUL, or a lone surrogate the file system encoding cannot carry) means no path on
+    disk can have this name, so it is missing too.
+    """
+    try:
+        st = os.stat(sources_dir)
+    except ValueError:
+        return True
+    except OSError as exc:
+        return exc.errno in _DIR_MISSING_ERRNOS
+    return not stat.S_ISDIR(st.st_mode)
+
+
+def _require_sources_dir(sources_dir: str) -> Path:
+    """Return *sources_dir* as a Path, or exit EXIT_SOURCES_DIR_MISSING when it names no directory.
+
+    Shared by every --sources-dir command, called before its load-error handler. The message never
+    echoes the argument: it can be huge or carry control characters, and an absolute path is a
+    leak (F2, F8).
+    """
+    if _sources_dir_missing(sources_dir):
+        typer.echo(
+            f"{MSG_SOURCES_DIR_MISSING}; pass --sources-dir a directory of *.yaml source configs.",
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_SOURCES_DIR_MISSING)
+    return Path(sources_dir)
+
+
+def _load_sources_dir(sources_dir: Path) -> dict[str, SourceConfig]:
+    """Load an existing sources dir for any --sources-dir command; raise on any load failure.
+
+    load_all lists with Path.glob, which silently skips a directory it cannot read, so an
+    unreadable dir would pass for one holding no source (EXIT_NO_SOURCES). The listing is opened
+    once first so that fails as a load error instead. Only the error type is kept in the
+    message: the OSError text carries the path.
+    """
+    try:
+        with os.scandir(sources_dir) as entries:
+            next(entries, None)
+    except OSError as exc:
+        raise RegistryLoadError(f"Sources directory cannot be read ({type(exc).__name__})") from exc
+    return load_all(sources_dir)
 
 
 def _is_consumer_missing(exc: ModuleNotFoundError) -> bool:
@@ -60,6 +156,12 @@ def _is_consumer_missing(exc: ModuleNotFoundError) -> bool:
 app = typer.Typer(
     name="ingester",
     help="Legal corpus ingester CLI — fetch, clean, chunk, embed, and publish legal text.",
+    # Every public exit code, from the one meanings table (#108).
+    epilog=(
+        "Exit codes: "
+        + _exit_code_clauses(tuple(sorted(_EXIT_MEANINGS)))
+        + ". Other command failures (unknown source, license drift, invalid bundle) also exit 1."
+    ),
     no_args_is_help=True,
 )
 
@@ -88,20 +190,31 @@ def init(
     typer.echo("Workspace initialised.")
 
 
-@sources_app.command("list")
+@sources_app.command(
+    "list",
+    help=(
+        "List all configured sources (name + jurisdiction).\n\n"
+        f"Exit codes: 0 when the sources dir loads (one line per source, or '{MSG_NO_SOURCES}.'"
+        " when it holds none); "
+        + _exit_code_clauses((EXIT_SOURCES_DIR_MISSING, EXIT_LOAD_ERROR))
+        + "."
+    ),
+)
 def sources_list(
-    sources_dir: Path = typer.Option(
-        Path("config/sources"),
+    # A plain str, not Path: typer's Path type stats the argument itself and fails on NUL or a
+    # lone surrogate before _require_sources_dir can classify it (#108).
+    sources_dir: str = typer.Option(
+        "config/sources",
         "--sources-dir",
         help="Directory containing *.yaml source configs.",
     ),
 ) -> None:
-    """List all configured sources (name + jurisdiction)."""
+    sources_path = _require_sources_dir(sources_dir)
     try:
-        registry = load_all(sources_dir)
+        registry = _load_sources_dir(sources_path)
     except Exception as exc:
-        typer.echo(f"Error loading sources: {exc}", err=True)
-        raise typer.Exit(code=1)
+        typer.echo(f"{MSG_LOAD_ERROR}: {exc}", err=True)
+        raise typer.Exit(code=EXIT_LOAD_ERROR)
 
     if not registry:
         typer.echo("No sources configured.")
@@ -119,14 +232,16 @@ def sources_list(
     help=(
         "Show the last checkpoint stage for each configured source.\n\n"
         f"Exit codes: 0 when sources are configured (one '<name>: <stage>' line per source with a"
-        f" checkpoint, or '{MSG_NO_RUNS}' when none has run yet); {EXIT_NO_SOURCES} when the"
-        f" sources dir loads but holds no source; {EXIT_LOAD_ERROR} when the sources dir cannot"
-        " be loaded. The failure codes match `ingester refresh` on the same sources dir."
+        f" checkpoint, or '{MSG_NO_RUNS}' when none has run yet); "
+        + _exit_code_clauses((EXIT_NO_SOURCES, EXIT_SOURCES_DIR_MISSING, EXIT_LOAD_ERROR))
+        + ". The failure codes match `ingester refresh` on the same sources dir."
     )
 )
 def status(
-    sources_dir: Path = typer.Option(
-        Path("config/sources"),
+    # A plain str, not Path: typer's Path type stats the argument itself and fails on NUL or a
+    # lone surrogate before _require_sources_dir can classify it (#108).
+    sources_dir: str = typer.Option(
+        "config/sources",
         "--sources-dir",
         help="Directory containing *.yaml source configs.",
     ),
@@ -140,8 +255,9 @@ def status(
     # (DEV-FUNDAMENTALS F5, terms-analysis#190). Checkpoints are read only for configured
     # sources: an orphan checkpoint must not make an empty config look configured, and its
     # file name (untrusted) is never echoed.
+    sources_path = _require_sources_dir(sources_dir)
     try:
-        registry = load_all(sources_dir)
+        registry = _load_sources_dir(sources_path)
     except Exception as exc:
         # Only the exception type is shown: the loader's message can carry absolute paths and
         # raw bytes from file names or YAML content (F8). The type is a code identifier.
@@ -169,7 +285,16 @@ def status(
         typer.echo(MSG_NO_RUNS)
 
 
-@app.command()
+@app.command(
+    help=(
+        "Fetch a source (use --dry-run to preview without writing).\n\n"
+        "Exit codes: 0 when --dry-run prints what would be fetched; "
+        + _exit_code_clauses(
+            (EXIT_NOT_WIRED, EXIT_NO_SOURCES, EXIT_SOURCES_DIR_MISSING, EXIT_LOAD_ERROR)
+        )
+        + ". An unknown source in a sources dir that holds sources also exits 1."
+    )
+)
 def fetch(
     source: str = typer.Argument(..., help="Name of the source to fetch."),
     dry_run: bool = typer.Option(
@@ -177,18 +302,26 @@ def fetch(
         "--dry-run",
         help="Print what would be fetched without writing anything.",
     ),
-    sources_dir: Path = typer.Option(
-        Path("config/sources"),
+    # A plain str, not Path: typer's Path type stats the argument itself and fails on NUL or a
+    # lone surrogate before _require_sources_dir can classify it (#108).
+    sources_dir: str = typer.Option(
+        "config/sources",
         "--sources-dir",
         help="Directory containing *.yaml source configs.",
     ),
 ) -> None:
-    """Fetch a source (use --dry-run to preview without writing)."""
+    sources_path = _require_sources_dir(sources_dir)
     try:
-        registry = load_all(sources_dir)
+        registry = _load_sources_dir(sources_path)
     except Exception as exc:
-        typer.echo(f"Error loading sources: {exc}", err=True)
-        raise typer.Exit(code=1)
+        typer.echo(f"{MSG_LOAD_ERROR}: {exc}", err=True)
+        raise typer.Exit(code=EXIT_LOAD_ERROR)
+
+    # An empty dir is "no source" (EXIT_NO_SOURCES), not an unknown source: whatever is named,
+    # nothing could be fetched (owner ruling 2026-10-12). The path is never echoed (F2, F8).
+    if not registry:
+        typer.echo(f"{MSG_NO_SOURCES} in --sources-dir; nothing to fetch.", err=True)
+        raise typer.Exit(code=EXIT_NO_SOURCES)
 
     if source not in registry:
         typer.echo(f"Unknown source: {source!r}. Use 'ingester sources list' to see available sources.", err=True)
@@ -214,15 +347,18 @@ def refresh(
         "--all",
         help="Refresh all configured sources.",
     ),
-    sources_dir: Path = typer.Option(
-        Path("config/sources"),
+    # A plain str, not Path: typer's Path type stats the argument itself and fails on NUL or a
+    # lone surrogate before _require_sources_dir can classify it (#108).
+    sources_dir: str = typer.Option(
+        "config/sources",
         "--sources-dir",
         help="Directory containing *.yaml source configs.",
     ),
 ) -> None:
     """Refresh corpus bundles for all configured sources (or a single source)."""
+    sources_path = _require_sources_dir(sources_dir)
     try:
-        registry = load_all(sources_dir)
+        registry = _load_sources_dir(sources_path)
     except Exception as exc:
         typer.echo(f"{MSG_LOAD_ERROR}: {exc}", err=True)
         raise typer.Exit(code=EXIT_LOAD_ERROR)
@@ -238,11 +374,23 @@ def refresh(
     raise typer.Exit(code=EXIT_NOT_WIRED)
 
 
-@app.command("audit-license")
+@app.command(
+    "audit-license",
+    help=(
+        "Check license drift for a source against the stored baseline.\n\n"
+        "Exit codes: 0 when the license is unchanged, new or has no URL, or (with --offline)"
+        " when the stored baseline, or its absence, is shown; "
+        + _exit_code_clauses((EXIT_NO_SOURCES, EXIT_SOURCES_DIR_MISSING, EXIT_LOAD_ERROR))
+        + ". An unknown source in a sources dir that holds sources, license drift or a failed"
+        " license fetch also exits 1."
+    ),
+)
 def audit_license(
     source: str = typer.Argument(..., help="Name of the source to audit."),
-    sources_dir: Path = typer.Option(
-        Path("config/sources"),
+    # A plain str, not Path: typer's Path type stats the argument itself and fails on NUL or a
+    # lone surrogate before _require_sources_dir can classify it (#108).
+    sources_dir: str = typer.Option(
+        "config/sources",
         "--sources-dir",
         help="Directory containing *.yaml source configs.",
     ),
@@ -262,13 +410,19 @@ def audit_license(
         help="Skip live fetch; compare stored baseline only (for restricted-egress CI).",
     ),
 ) -> None:
-    """Check license drift for a source against the stored baseline."""
     # Load source registry
+    sources_path = _require_sources_dir(sources_dir)
     try:
-        registry = load_all(sources_dir)
+        registry = _load_sources_dir(sources_path)
     except Exception as exc:
-        typer.echo(f"Error loading sources: {exc}", err=True)
-        raise typer.Exit(code=1)
+        typer.echo(f"{MSG_LOAD_ERROR}: {exc}", err=True)
+        raise typer.Exit(code=EXIT_LOAD_ERROR)
+
+    # An empty dir is "no source" (EXIT_NO_SOURCES), not an unknown source (owner ruling
+    # 2026-10-12), checked before any baseline or network work. The path is never echoed (F2, F8).
+    if not registry:
+        typer.echo(f"{MSG_NO_SOURCES} in --sources-dir; nothing to audit.", err=True)
+        raise typer.Exit(code=EXIT_NO_SOURCES)
 
     if source not in registry:
         typer.echo(

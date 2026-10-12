@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import unicodedata
@@ -16,7 +17,13 @@ from legal_corpus_ingester import cli
 from legal_corpus_ingester.cli import app
 from legal_corpus_ingester.pipeline.state import STAGES, CheckpointState, CheckpointStore
 from legal_corpus_ingester.sources.registry import load_all
-from tests.cli.helpers import strip_ansi
+from tests.cli.helpers import (
+    EXIT_CODE_MEANINGS,
+    PUBLIC_EXIT_CODES,
+    SOURCES_DIR_COMMANDS,
+    sources_dir_argv,
+    strip_ansi,
+)
 
 runner = CliRunner()
 
@@ -52,11 +59,15 @@ def test_sources_list_help() -> None:
 # status: "nothing configured" is not success (terms-analysis#190, DEV-FUNDAMENTALS F5)
 # ---------------------------------------------------------------------------
 #
-# `ingester status` has four outcomes, and each must be told apart from the others:
+# `ingester status` has five outcomes, and each must be told apart from the others:
 #   no_sources  the sources dir loads cleanly but holds no source -> EXIT_NO_SOURCES, stderr says so
-#   load_error  the sources dir cannot be loaded                   -> EXIT_LOAD_ERROR, stderr says it
+#   dir_missing the sources path does not exist or is not a dir   -> EXIT_SOURCES_DIR_MISSING (#108)
+#   load_error  the sources dir exists but cannot be loaded        -> EXIT_LOAD_ERROR, stderr says it
 #   never_run   sources configured, no checkpoint yet              -> 0, "No runs recorded."
 #   healthy     sources configured, checkpoints present            -> 0, one "<name>: <stage>" line
+# #108 (owner ruling 2026-10-12): EXIT_NO_SOURCES moved off 2, which is EXIT_USAGE's alone, and a
+# missing or non-directory sources path left EXIT_LOAD_ERROR for its own code. An unreadable dir
+# exists, so it is not dir_missing; it cannot be listed, so it is not no_sources either: load_error.
 # never_run stays exit 0 on purpose: the nightly health.yml runs `ingester status` with the repo's
 # config/sources on a fresh hosted runner, whose state dir is empty until refresh is wired and state
 # persists (ADR-016). Each failure row pins the exact public code (EXIT_NO_SOURCES /
@@ -74,6 +85,15 @@ _UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 # One character per hostile class, generated into the `name` field of an otherwise valid source.
 # The loader must reject each; status must then report a load error without echoing the raw byte.
 _HOSTILE_NAME_CHARS = ("\x1b", "\r", "\x0b", "\x0c", "\x85", " ", " ", "​", "‮", "﻿")
+
+
+# The same classes in a MISSING --sources-dir argument (#108), plus newline (line forgery), NUL,
+# a lone surrogate and a surrogate-escaped invalid UTF-8 byte (how POSIX argv carries b"\xff").
+_HOSTILE_PATH_CHARS = (*_HOSTILE_NAME_CHARS, "\n", "\x00", "\ud800", "\udcff")
+# The same classes in the name of an EXISTING empty --sources-dir (#108 exit 5). NUL and lone
+# surrogates are left out: no filesystem can hold them in a name (APFS refuses invalid UTF-8), so
+# they can only ever be missing paths, and the dir_missing rows above cover them.
+_HOSTILE_EXISTING_NAME_CHARS = (*_HOSTILE_NAME_CHARS, "\n")
 
 
 def _unsafe_chars(text: str) -> list[str]:
@@ -123,6 +143,32 @@ def _symlink_to_empty_dir(root: Path) -> tuple[str, str, list[str]]:
     return "src", "state", []
 
 
+def _empty_dir_hostile_name(ch: str) -> Callable[[Path], tuple[str, str, list[str]]]:
+    # #108 exit 5: an EXISTING empty dir whose name forges output (control, format, line and
+    # paragraph separators, newline). Nothing is configured; the raw name is never echoed (F2, F8).
+    def build(root: Path) -> tuple[str, str, list[str]]:
+        (root / f"src{ch}x").mkdir()
+        return f"src{ch}x", "state", []
+
+    return build
+
+
+def _empty_dir_name_max(root: Path) -> tuple[str, str, list[str]]:
+    # Size boundary: an existing empty dir whose name is exactly the filesystem's NAME_MAX (read
+    # from the filesystem, no literal). It exists, so it is no_sources, never dir_missing.
+    name = "e" * os.pathconf(root, "PC_NAME_MAX")
+    (root / name).mkdir()
+    return name, "state", []
+
+
+def _source_only_in_subdir(root: Path) -> tuple[str, str, list[str]]:
+    # Indirection: a valid source one level down is not configured (the loader reads *.yaml in
+    # the dir itself only), so the dir holds no source, exactly as status and refresh see it.
+    (root / "src").mkdir()
+    _copy_fixture(root / "src" / "nested")
+    return "src", "state", []
+
+
 def _orphan_checkpoint(root: Path) -> tuple[str, str, list[str]]:
     # A checkpoint left in the state dir must not make "nothing configured" look configured.
     (root / "src").mkdir()
@@ -149,6 +195,54 @@ def _dangling_symlink(root: Path) -> tuple[str, str, list[str]]:
 
 def _sources_path_is_file(root: Path) -> tuple[str, str, list[str]]:
     (root / "src").write_text(_FIXTURE_SOURCE.read_text(encoding="utf-8"), encoding="utf-8")
+    return "src", "state", []
+
+
+def _symlink_to_file(root: Path) -> tuple[str, str, list[str]]:
+    (root / "real.yaml").write_text(_FIXTURE_SOURCE.read_text(encoding="utf-8"), encoding="utf-8")
+    (root / "src").symlink_to(root / "real.yaml")
+    return "src", "state", []
+
+
+def _parent_is_a_file(root: Path) -> tuple[str, str, list[str]]:
+    # ENOTDIR on a middle component: the path does not exist as a directory.
+    (root / "f").write_text("x", encoding="utf-8")
+    return "f/src", "state", []
+
+
+def _fifo(root: Path) -> tuple[str, str, list[str]]:
+    # Not a directory, and opening it for reading would block: the check must not read it.
+    os.mkfifo(root / "src")
+    return "src", "state", []
+
+
+def _missing_hostile_name(ch: str) -> Callable[[Path], tuple[str, str, list[str]]]:
+    # A missing path whose name forges output (control, format, line/paragraph separators,
+    # NUL): the exit names the outcome without echoing the raw character (F2, F8).
+    def build(root: Path) -> tuple[str, str, list[str]]:
+        return f"src{ch}x", "state", []
+
+    return build
+
+
+def _empty_string_path(root: Path) -> tuple[str, str, list[str]]:
+    # Boundary: --sources-dir "" names nothing (stat("") is ENOENT); it must not fall back to the cwd.
+    return "", "state", []
+
+
+def _missing_name_too_long(root: Path) -> tuple[str, str, list[str]]:
+    # ENAMETOOLONG, sized from the filesystem's own limit (no literal): still "does not exist",
+    # and the huge name is never echoed back (checked in the dir_missing branch).
+    return "a" * (os.pathconf(root, "PC_NAME_MAX") + 1), "state", []
+
+
+def _unreadable_dir(root: Path) -> tuple[str, str, list[str]]:
+    # The dir exists (so not dir_missing) but cannot be listed: glob() would see nothing, which
+    # must not pass for "holds no source". write+search only, so tmp_path cleanup still works.
+    _copy_fixture(root / "src")
+    (root / "src").chmod(0o300)
+    # Control, fail not skip (F9): as root the dir stays readable and the row would prove nothing.
+    assert not os.access(root / "src", os.R_OK), "control: test runs as root; dir is still readable"
     return "src", "state", []
 
 
@@ -236,9 +330,28 @@ _STATUS_CASES: tuple[_StatusCase, ...] = (
     _StatusCase("symlink-to-empty-dir", "no_sources", _symlink_to_empty_dir),
     _StatusCase("orphan-checkpoint", "no_sources", _orphan_checkpoint),
     _StatusCase("hostile-orphan-checkpoint-filename", "no_sources", _hostile_orphan_checkpoint),
-    _StatusCase("missing-dir", "load_error", _missing_dir),
-    _StatusCase("dangling-symlink", "load_error", _dangling_symlink),
-    _StatusCase("sources-path-is-a-file", "load_error", _sources_path_is_file),
+    _StatusCase("empty-dir-name-max", "no_sources", _empty_dir_name_max),
+    _StatusCase("source-only-in-subdir", "no_sources", _source_only_in_subdir),
+    *(
+        _StatusCase(f"empty-dir-hostile-name-U+{ord(ch):04X}", "no_sources", _empty_dir_hostile_name(ch))
+        for ch in _HOSTILE_EXISTING_NAME_CHARS
+    ),
+    # #108: these five rows were load_error (exit 1) before the owner gave them their own code.
+    _StatusCase("missing-dir", "dir_missing", _missing_dir),
+    _StatusCase("dangling-symlink", "dir_missing", _dangling_symlink),
+    _StatusCase("sources-path-is-a-file", "dir_missing", _sources_path_is_file),
+    _StatusCase("absolute-missing-dir", "dir_missing", _absolute(_missing_dir)),
+    _StatusCase("absolute-path-is-a-file", "dir_missing", _absolute(_sources_path_is_file)),
+    _StatusCase("symlink-to-file", "dir_missing", _symlink_to_file),
+    _StatusCase("parent-is-a-file", "dir_missing", _parent_is_a_file),
+    _StatusCase("sources-path-is-a-fifo", "dir_missing", _fifo),
+    _StatusCase("missing-name-too-long", "dir_missing", _missing_name_too_long),
+    _StatusCase("empty-string-path", "dir_missing", _empty_string_path),
+    *(
+        _StatusCase(f"missing-hostile-path-U+{ord(ch):04X}", "dir_missing", _missing_hostile_name(ch))
+        for ch in _HOSTILE_PATH_CHARS
+    ),
+    _StatusCase("unreadable-dir", "load_error", _unreadable_dir),
     _StatusCase("empty-yaml", "load_error", _one_yaml(b"")),
     _StatusCase("yaml-is-a-list", "load_error", _one_yaml(b"- a\n- b\n")),
     _StatusCase("invalid-utf8", "load_error", _one_yaml(b"\xff\xfe")),
@@ -247,8 +360,6 @@ _STATUS_CASES: tuple[_StatusCase, ...] = (
     _StatusCase("hostile-yaml-filename", "load_error", _one_yaml(b"", "\x1b[2J x.yaml")),
     _StatusCase("dir-named-yaml", "load_error", _dir_named_yaml),
     _StatusCase("valid-plus-malformed", "load_error", _valid_plus_malformed),
-    _StatusCase("absolute-missing-dir", "load_error", _absolute(_missing_dir)),
-    _StatusCase("absolute-path-is-a-file", "load_error", _absolute(_sources_path_is_file)),
     _StatusCase("absolute-valid-plus-malformed", "load_error", _absolute(_valid_plus_malformed)),
     _StatusCase("absolute-empty-dir", "no_sources", _absolute(_empty_dir)),
     *(
@@ -265,17 +376,25 @@ _STATUS_CASES: tuple[_StatusCase, ...] = (
 
 def test_status_cases_cover_every_outcome() -> None:
     # Contract for the table below: every outcome has at least one row, both failure
-    # (no_sources, load_error) and success (never_run, healthy), and ids are unique.
+    # (no_sources, dir_missing, load_error) and success (never_run, healthy), and ids are unique.
     kinds = {c.kind for c in _STATUS_CASES}
-    assert kinds == {"no_sources", "load_error", "never_run", "healthy"}, kinds
+    assert kinds == {"no_sources", "dir_missing", "load_error", "never_run", "healthy"}, kinds
     ids = [c.id for c in _STATUS_CASES]
     assert len(ids) == len(set(ids)), ids
     assert len(_HOSTILE_NAME_CHARS) == sum(c.id.startswith("hostile-name-") for c in _STATUS_CASES)
     assert {unicodedata.category(ch) for ch in _HOSTILE_NAME_CHARS} >= {"Cc", "Cf", "Zl", "Zp"}
-    # Both failure outcomes are also fed an absolute --sources-dir, the input whose path the
+    # #108: every hostile path character has its own dir_missing row, across Cc/Cf/Cs/Zl/Zp.
+    assert len(_HOSTILE_PATH_CHARS) == sum(c.id.startswith("missing-hostile-path-") for c in _STATUS_CASES)
+    assert {unicodedata.category(ch) for ch in _HOSTILE_PATH_CHARS} >= set(_UNSAFE_CATEGORIES)
+    # #108 exit 5: every hostile character also names an existing empty dir (no_sources).
+    assert len(_HOSTILE_EXISTING_NAME_CHARS) == sum(
+        c.id.startswith("empty-dir-hostile-name-") and c.kind == "no_sources" for c in _STATUS_CASES
+    )
+    assert {unicodedata.category(ch) for ch in _HOSTILE_EXISTING_NAME_CHARS} >= {"Cc", "Cf", "Zl", "Zp"}
+    # Every failure outcome is also fed an absolute --sources-dir, the input whose path the
     # loader's message carries (F8).
     absolute_kinds = {c.kind for c in _STATUS_CASES if c.id.startswith("absolute-")}
-    assert absolute_kinds == {"no_sources", "load_error"}, absolute_kinds
+    assert absolute_kinds == {"no_sources", "dir_missing", "load_error"}, absolute_kinds
 
 
 def _assert_no_leak(root: Path, *streams: str) -> None:
@@ -283,6 +402,18 @@ def _assert_no_leak(root: Path, *streams: str) -> None:
     for stream in streams:
         assert str(root) not in stream and str(root.resolve()) not in stream, stream
         assert _unsafe_chars(stream) == [], (_unsafe_chars(stream), stream)
+
+
+def _assert_arg_not_echoed(root: Path, sources_arg: str, *results: object) -> None:
+    # A hostile (non-printable) or NAME_MAX-sized --sources-dir argument never appears in any
+    # output stream, whole or raw (F2, F8, size). Short printable names are covered by the
+    # absolute-path rows through _assert_no_leak.
+    if sources_arg and (
+        not sources_arg.isprintable() or len(sources_arg) >= os.pathconf(root, "PC_NAME_MAX")
+    ):
+        for result in results:
+            for stream in (result.stdout, result.stderr):  # type: ignore[attr-defined]
+                assert sources_arg not in stream, ("raw --sources-dir argument echoed", stream[:200])
 
 
 @pytest.mark.parametrize("case", _STATUS_CASES, ids=[c.id for c in _STATUS_CASES])
@@ -313,16 +444,42 @@ def test_status_outcome_by_configuration(
     assert _NO_RUNS not in result.stdout, "status still prints the never-run message"
     _assert_no_leak(tmp_path, result.stdout, result.stderr)
 
+    # Expected codes come from the pinned public table (#108), so a row fails on the exit code
+    # it gets, and test_public_exit_code_values_are_pinned ties the table to cli's constants.
     if case.kind == "no_sources":
-        assert ref.exit_code == cli.EXIT_NO_SOURCES, "control: refresh does not see this row as empty"
+        expected = PUBLIC_EXIT_CODES["EXIT_NO_SOURCES"]
+        assert ref.exit_code == expected, f"refresh exited {ref.exit_code} on an empty sources dir"
         # The exact public code, not just parity with refresh: if the shared path drifted for
         # both commands, parity alone would still pass.
-        assert result.exit_code == cli.EXIT_NO_SOURCES, (result.exit_code, result.stderr)
+        assert result.exit_code == expected, (result.exit_code, result.stderr)
         assert _NO_SOURCES_MSG in result.stderr, result.stderr
         assert _LOAD_ERROR_MSG not in result.stderr, "no-sources reported as a load error"
+        # An existing dir with a hostile or NAME_MAX-long name is never echoed back, by either
+        # command (F2, F8); _assert_no_leak alone lets a raw newline through.
+        _assert_arg_not_echoed(tmp_path, sources_arg, result, ref)
+    elif case.kind == "dir_missing":
+        expected = PUBLIC_EXIT_CODES["EXIT_SOURCES_DIR_MISSING"]
+        assert ref.exit_code == expected, (
+            f"refresh exited {ref.exit_code} on a missing / non-directory sources path; "
+            f"stderr={ref.stderr!r}"
+        )
+        assert result.exit_code == expected, (result.exit_code, result.stderr)
+        # Honest message (F8): its own stem, never another outcome's, and it names the fix.
+        for stream in (result.stderr, ref.stderr):
+            assert cli.MSG_SOURCES_DIR_MISSING in stream, stream
+            assert "--sources-dir" in stream, stream
+            assert _NO_SOURCES_MSG not in stream, "missing dir reported as no sources"
+            assert _LOAD_ERROR_MSG not in stream, "missing dir reported as a load error"
+        # refresh's message is new on this path, so it meets the same output bar as status.
+        _assert_no_leak(tmp_path, ref.stdout, ref.stderr)
+        # A hostile or oversized argument is never echoed back, whole or raw (F2, F8, size).
+        if not sources_arg.isprintable() or len(sources_arg) > os.pathconf(tmp_path, "PC_NAME_MAX"):
+            for stream in (result.stdout, result.stderr, ref.stdout, ref.stderr):
+                assert sources_arg not in stream, "raw --sources-dir argument echoed"
     else:
-        assert ref.exit_code == cli.EXIT_LOAD_ERROR, "control: refresh loaded this row"
-        assert result.exit_code == cli.EXIT_LOAD_ERROR, (result.exit_code, result.stderr)
+        expected = PUBLIC_EXIT_CODES["EXIT_LOAD_ERROR"]
+        assert ref.exit_code == expected, f"refresh exited {ref.exit_code} on an unloadable sources dir"
+        assert result.exit_code == expected, (result.exit_code, result.stderr)
         assert _LOAD_ERROR_MSG in result.stderr, result.stderr
         assert _NO_SOURCES_MSG not in result.stderr, "load error reported as no sources"
 
@@ -338,39 +495,303 @@ def test_status_default_paths_in_empty_dir_is_not_success(
     assert isinstance(ref.exception, SystemExit) and ref.exit_code != 0, "control: refresh succeeded"
     result = runner.invoke(app, ["status"])
     assert result.exit_code == ref.exit_code, (result.exit_code, result.stdout, result.stderr)
-    # The default config/sources does not exist in an empty cwd: that is the load-error code.
-    assert result.exit_code == cli.EXIT_LOAD_ERROR, (result.exit_code, result.stderr)
+    # The default config/sources does not exist in an empty cwd: that is the missing-dir code
+    # (#108; it was EXIT_LOAD_ERROR before the owner split it out).
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_SOURCES_DIR_MISSING"], (result.exit_code, result.stderr)
     assert isinstance(result.exception, SystemExit), repr(result.exception)
     assert _NO_RUNS not in result.stdout
     _assert_no_leak(tmp_path, result.stdout, result.stderr)
 
 
+_HELP_CLAUSE = re.compile(r"(?<![\w.])(\d+) when ([^;]+)")
+
+
+def _help_clauses(args: list[str]) -> tuple[list[tuple[str, str]], str]:
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, (result.exit_code, result.output)
+    text = " ".join(strip_ansi(result.output).split())
+    return _HELP_CLAUSE.findall(text), text
+
+
 def test_status_help_documents_exit_codes() -> None:
     # Card #190: the CLI help states which outcome exits which code: never-run (sources
     # configured, no checkpoint) is a legitimate 0, nothing configured is EXIT_NO_SOURCES, an
-    # unloadable sources dir is EXIT_LOAD_ERROR.
+    # unloadable sources dir is EXIT_LOAD_ERROR. #108 adds EXIT_SOURCES_DIR_MISSING for a sources
+    # path that does not exist or is not a directory, and moves EXIT_NO_SOURCES off 2.
     #
-    # The numeric values are a public contract: this help text prints them and
-    # automations/refresh.md documents 2 for EXIT_NO_SOURCES, so callers may key on the numbers.
-    # They are pinned here, not just compared with each other: renumbering is a breaking change.
-    documented = {"EXIT_LOAD_ERROR": 1, "EXIT_NO_SOURCES": 2}
-    assert {name: getattr(cli, name) for name in documented} == documented
-    outcomes = {
-        0: "sources are configured",
-        cli.EXIT_NO_SOURCES: "holds no source",
-        cli.EXIT_LOAD_ERROR: "cannot be loaded",
-    }
-    assert len(outcomes) == 3, "two status outcomes share an exit code"
+    # The numeric values are a public contract (PUBLIC_EXIT_CODES, pinned against cli in
+    # test_public_exit_code_values_are_pinned); the expectations here come from that table.
+    names = ("EXIT_NO_SOURCES", "EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR")
+    outcomes: dict[int, tuple[str, ...]] = {0: ("sources are configured",)}
+    outcomes.update({PUBLIC_EXIT_CODES[n]: EXIT_CODE_MEANINGS[n] for n in names})
+    assert len(outcomes) == 1 + len(names), "two status outcomes share an exit code"
 
-    result = runner.invoke(app, ["status", "--help"])
-    assert result.exit_code == 0
-    text = " ".join(strip_ansi(result.output).split())
-    # Every "<code> when <outcome>" clause in the help, in order. Exactly the three outcome
+    # Every "<code> when <outcome>" clause in the help, in order. Exactly the four outcome
     # codes, each once and each tied to its own outcome: a dropped, extra or swapped code fails.
-    clauses = re.findall(r"(?<![\w.])(\d+) when ([^;]+)", text)
+    clauses, text = _help_clauses(["status", "--help"])
     assert sorted(int(code) for code, _ in clauses) == sorted(outcomes), (clauses, text)
     for code, clause in clauses:
-        assert outcomes[int(code)] in clause, (code, clause)
+        for phrase in outcomes[int(code)]:
+            assert phrase in clause, (code, phrase, clause)
+
+
+def test_top_level_help_lists_every_exit_code() -> None:
+    # #108: `ingester --help` lists every public exit code once, as "<code> when <meaning>",
+    # each clause carrying its own meaning, so 5 and 6 (and 2 = usage only) are discoverable
+    # without reading per-command help. 0 may be listed too; no other number may.
+    clauses, text = _help_clauses(["--help"])
+    by_code = {code: name for name, code in PUBLIC_EXIT_CODES.items()}
+    listed = [int(code) for code, _ in clauses if int(code) != 0]
+    assert sorted(listed) == sorted(by_code), (clauses, text)
+    for code, clause in clauses:
+        if int(code) == 0:
+            continue
+        for phrase in EXIT_CODE_MEANINGS[by_code[int(code)]]:
+            assert phrase in clause, (code, phrase, clause)
+
+
+# ---------------------------------------------------------------------------
+# #108 fold-in (owner ruling 2026-10-12): every --sources-dir command classifies the path alike
+# ---------------------------------------------------------------------------
+#
+# `ingester --help` says 6 means a missing --sources-dir for the whole tool, so fetch, sources list
+# and audit-license must exit EXIT_SOURCES_DIR_MISSING on exactly the rows status and refresh do.
+# Before the fold-in they exited 1 through load_all ("Sources directory not found: <path>"), which
+# also echoed the path. A second ruling the same day gives an existing dir that holds no source
+# "its own error code ... 'no source'": fetch and audit-license exit EXIT_NO_SOURCES there, like
+# status and refresh. `sources list` on that dir still prints "No sources configured." and exits
+# 0, fetch on a valid dir exits EXIT_NOT_WIRED, and an unknown source in a configured dir is 1.
+
+_DIR_MISSING_CASES = tuple(c for c in _STATUS_CASES if c.kind == "dir_missing")
+_NO_SOURCES_CASES = tuple(c for c in _STATUS_CASES if c.kind == "no_sources")
+
+
+def _repo_source_name() -> str:
+    return next(iter(load_all(_REPO_SOURCES)))  # from the config, not a literal
+
+
+def _registered_sources_dir_options() -> dict[str, object]:
+    """{command name as `--help` shows it: its --sources-dir parameter}, from the real app."""
+    found: dict[str, object] = {}
+
+    def walk(command: object, path: tuple[str, ...]) -> None:
+        subcommands = getattr(command, "commands", None)
+        if subcommands:
+            for name, sub in subcommands.items():
+                walk(sub, (*path, name))
+            return
+        for param in getattr(command, "params", []):
+            if "--sources-dir" in getattr(param, "opts", []):
+                found[" ".join(path)] = param
+
+    walk(typer.main.get_command(app), ())
+    return found
+
+
+def test_sources_dir_commands_table_matches_the_app() -> None:
+    # Contract (F10, F12): the table the tests below iterate is every command the app registers
+    # with --sources-dir, so a new one cannot skip the classification unnoticed.
+    assert set(_registered_sources_dir_options()) == set(SOURCES_DIR_COMMANDS)
+
+
+@pytest.mark.parametrize("command", SOURCES_DIR_COMMANDS)
+def test_sources_dir_option_is_a_plain_str(command: str) -> None:
+    # typer's Path type stats the argument itself and raises on NUL or a lone surrogate before
+    # the command can classify it (#108). Static pin of the exact click type name; the NUL and
+    # surrogate rows of test_every_sources_dir_command_exits_dir_missing are the behaviour.
+    param = _registered_sources_dir_options()[command]
+    assert type(param.type).__name__ == "StringParamType", (command, type(param.type))  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("command", SOURCES_DIR_COMMANDS)
+@pytest.mark.parametrize("case", _DIR_MISSING_CASES, ids=[c.id for c in _DIR_MISSING_CASES])
+def test_every_sources_dir_command_exits_dir_missing(
+    case: _StatusCase, command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Missing, dangling symlink, regular file, symlink to a file, file as parent, FIFO, empty
+    # string, a name over NAME_MAX, and one row per hostile character class (Cc, Cf, Cs, Zl, Zp,
+    # NUL, invalid UTF-8): each is EXIT_SOURCES_DIR_MISSING with the shared message, on every
+    # command, and the argument is never echoed.
+    monkeypatch.chdir(tmp_path)
+    sources_arg, _, _ = case.build(tmp_path)
+    result = runner.invoke(app, sources_dir_argv(command, sources_arg, tmp_path, _fixture_name()))
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_SOURCES_DIR_MISSING"], (
+        result.exit_code, result.stdout, result.stderr,
+    )
+    assert cli.MSG_SOURCES_DIR_MISSING in result.stderr, result.stderr
+    assert "--sources-dir" in result.stderr, "the message must name the fix"
+    for stream in (result.stdout, result.stderr):
+        assert _NO_SOURCES_MSG not in stream, "missing dir reported as no sources"
+        assert _LOAD_ERROR_MSG not in stream, "missing dir reported as a load error"
+        assert "Unknown source" not in stream, "missing dir reported as an unknown source"
+    _assert_no_leak(tmp_path, result.stdout, result.stderr)
+    if sources_arg and (
+        not sources_arg.isprintable() or len(sources_arg) > os.pathconf(tmp_path, "PC_NAME_MAX")
+    ):
+        assert sources_arg not in result.stdout + result.stderr, "raw --sources-dir argument echoed"
+
+
+def _without_sources_dir(argv: list[str]) -> list[str]:
+    i = argv.index("--sources-dir")
+    return argv[:i] + argv[i + 2:]
+
+
+@pytest.mark.parametrize("command", SOURCES_DIR_COMMANDS)
+def test_default_sources_dir_in_empty_cwd_is_dir_missing(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The default --sources-dir is relative to the cwd; in an empty cwd it names no directory.
+    monkeypatch.chdir(tmp_path)
+    argv = _without_sources_dir(sources_dir_argv(command, "unused", tmp_path, _fixture_name()))
+    result = runner.invoke(app, argv)
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_SOURCES_DIR_MISSING"], (result.exit_code, result.stderr)
+    assert cli.MSG_SOURCES_DIR_MISSING in result.stderr, result.stderr
+    _assert_no_leak(tmp_path, result.stdout, result.stderr)
+
+
+@pytest.mark.parametrize("case", _NO_SOURCES_CASES, ids=[c.id for c in _NO_SOURCES_CASES])
+def test_sources_list_existing_empty_dir_still_exits_zero(
+    case: _StatusCase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Positive control (green today): the owner did not change `sources list` on an existing dir
+    # that holds no source. It is not EXIT_NO_SOURCES and not EXIT_SOURCES_DIR_MISSING.
+    monkeypatch.chdir(tmp_path)
+    sources_arg, _, _ = case.build(tmp_path)
+    result = runner.invoke(app, sources_dir_argv("sources list", sources_arg, tmp_path, ""))
+    assert result.exit_code == 0, (result.exit_code, result.stdout, result.stderr)
+    assert result.stdout.splitlines() == [f"{_NO_SOURCES_MSG}."], result.stdout
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("command", ["fetch", "audit-license"])
+@pytest.mark.parametrize("case", _NO_SOURCES_CASES, ids=[c.id for c in _NO_SOURCES_CASES])
+def test_fetch_and_audit_license_on_empty_dir_exit_no_sources(
+    case: _StatusCase, command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Owner ruling 2026-10-12: an empty sources folder "has its own error code and yes, that
+    # should be 'no source'". Was test_unknown_source_on_existing_dir_still_exits_one, which
+    # pinned exit 1 ("Unknown source") here. Every no_sources row status and refresh use (empty,
+    # lookalike files only such as README.md, symlink to an empty dir, source only in a subdir,
+    # hostile or NAME_MAX-long dir name, absolute path) is EXIT_NO_SOURCES with the shared
+    # message, whatever source is named, and the path is never echoed.
+    monkeypatch.chdir(tmp_path)
+    sources_arg, _, _ = case.build(tmp_path)
+    # Control: refresh defines the row as no_sources (the same check status's table makes).
+    ref = runner.invoke(app, sources_dir_argv("refresh", sources_arg, tmp_path, ""))
+    assert ref.exit_code == PUBLIC_EXIT_CODES["EXIT_NO_SOURCES"], ("control", ref.exit_code, ref.stderr)
+
+    result = runner.invoke(app, sources_dir_argv(command, sources_arg, tmp_path, _fixture_name()))
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_NO_SOURCES"], (
+        command, result.exit_code, result.stdout, result.stderr,
+    )
+    # Honest message (F8): the no-sources stem status and refresh print, on stderr like
+    # status's, and never another outcome's.
+    assert _NO_SOURCES_MSG in result.stderr, result.stderr
+    for stream in (result.stdout, result.stderr):
+        assert "Unknown source" not in stream, "empty dir reported as an unknown source"
+        assert _LOAD_ERROR_MSG not in stream, "empty dir reported as a load error"
+        assert cli.MSG_SOURCES_DIR_MISSING not in stream, "existing empty dir reported as missing"
+    _assert_no_leak(tmp_path, result.stdout, result.stderr)
+    _assert_arg_not_echoed(tmp_path, sources_arg, result)
+
+
+@pytest.mark.parametrize("command", ["fetch", "audit-license"])
+def test_unknown_source_on_configured_dir_still_exits_one(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Positive control (green today): a dir that holds a source, but not the one named, is still
+    # "unknown source", exit 1. Exit 5 is only for a dir that holds no source at all.
+    monkeypatch.chdir(tmp_path)
+    _copy_fixture(tmp_path / "src")
+    absent = f"{_fixture_name()}-absent"  # derived from the config, so never a configured name
+    result = runner.invoke(app, sources_dir_argv(command, "src", tmp_path, absent))
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_LOAD_ERROR"], (result.exit_code, result.stderr)
+    assert "Unknown source" in result.stderr, result.stderr
+    assert _NO_SOURCES_MSG not in result.stdout + result.stderr, "configured dir reported as no sources"
+    assert cli.MSG_SOURCES_DIR_MISSING not in result.stderr, result.stderr
+
+
+def test_sources_list_configured_dir_lists_every_source() -> None:
+    # Positive control (green today): the str option still loads and lists a real config.
+    result = runner.invoke(app, ["sources", "list", "--sources-dir", str(_REPO_SOURCES)])
+    assert result.exit_code == 0, (result.exit_code, result.stderr)
+    listed = [line.split()[0] for line in result.stdout.splitlines()[2:]]
+    assert listed == list(load_all(_REPO_SOURCES)), result.stdout
+
+
+# The public codes each command's help must list, as "<code> when <meaning>" clauses like
+# `status --help`. 0 is listed too (every one of these can succeed); 2 (usage) is tool-wide and
+# lives in the top-level help only.
+_COMMAND_HELP_CODES: dict[str, tuple[str, ...]] = {
+    # Owner ruling 2026-10-12: fetch and audit-license exit EXIT_NO_SOURCES on an empty dir.
+    "fetch": ("EXIT_NOT_WIRED", "EXIT_NO_SOURCES", "EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
+    "sources list": ("EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
+    "audit-license": ("EXIT_NO_SOURCES", "EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
+}
+
+
+@pytest.mark.parametrize("command", list(_COMMAND_HELP_CODES))
+def test_sources_dir_command_help_documents_exit_codes(command: str) -> None:
+    names = _COMMAND_HELP_CODES[command]
+    clauses, text = _help_clauses([*command.split(), "--help"])
+    assert sorted(int(code) for code, _ in clauses) == sorted([0, *(PUBLIC_EXIT_CODES[n] for n in names)]), (
+        command, clauses, text,
+    )
+    by_code = {PUBLIC_EXIT_CODES[n]: n for n in names}
+    for code, clause in clauses:
+        if int(code) == 0:
+            if command == "sources list":
+                # Honest about the one outcome that differs from status / refresh: an existing
+                # empty dir is a 0 with "No sources configured.", not EXIT_NO_SOURCES.
+                assert _NO_SOURCES_MSG in clause, (code, clause)
+            continue
+        for phrase in EXIT_CODE_MEANINGS[by_code[int(code)]]:
+            assert phrase in clause, (command, code, phrase, clause)
+
+
+# Command list at the end of a top-level clause, as in "... not wired yet (fetch, refresh)".
+_CLAUSE_SCOPE = re.compile(r"\(([^()]*)\)$")
+
+
+def test_top_level_exit_code_scope_matches_commands(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # `ingester --help` must be true of every --sources-dir command. A clause ending in a
+    # "(cmd, cmd)" list claims exactly those commands; a clause without one claims all of them.
+    # Each code is checked against what the commands actually exit on its trigger.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "empty").mkdir()
+    triggers = {
+        "EXIT_SOURCES_DIR_MISSING": str(tmp_path / "missing"),
+        "EXIT_NO_SOURCES": str(tmp_path / "empty"),
+        "EXIT_NOT_WIRED": str(_REPO_SOURCES),
+    }
+    # The behaviour the owner ruled (2026-10-12), so the scope cannot be satisfied by moving the
+    # help and the code together in the wrong direction: 6 on every command, 5 ("no source") on
+    # every command but `sources list` (an empty listing is exit 0), 3 where nothing is wired.
+    expected_scope = {
+        "EXIT_SOURCES_DIR_MISSING": set(SOURCES_DIR_COMMANDS),
+        "EXIT_NO_SOURCES": set(SOURCES_DIR_COMMANDS) - {"sources list"},
+        "EXIT_NOT_WIRED": {"fetch", "refresh"},
+    }
+    assert set(expected_scope) == set(triggers)
+    clauses, text = _help_clauses(["--help"])
+    by_code = {int(code): clause for code, clause in clauses}
+    for name, sources_arg in triggers.items():
+        code = PUBLIC_EXIT_CODES[name]
+        clause = by_code[code].split(". ")[0].rstrip(". ")
+        scope = _CLAUSE_SCOPE.search(clause)
+        claimed = set(scope.group(1).split(", ")) if scope else set(SOURCES_DIR_COMMANDS)
+        observed = {
+            command for command in SOURCES_DIR_COMMANDS
+            if runner.invoke(
+                app, sources_dir_argv(command, sources_arg, tmp_path, _repo_source_name())
+            ).exit_code == code
+        }
+        assert observed == expected_scope[name], (name, code, sorted(observed))
+        assert claimed == observed, (name, code, clause, sorted(observed))
 
 
 def test_fetch_dry_run_help() -> None:
