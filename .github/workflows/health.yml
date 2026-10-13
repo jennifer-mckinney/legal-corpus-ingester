@@ -45,7 +45,7 @@ jobs:
           # Only exit 3 (cli.EXIT_NOT_WIRED: refresh is not wired, so no source can have run) is
           # excused, as a warning. Refresh is wired since terms-analysis#93, so health_check.py no
           # longer exits 3; the row stays for the reserved code. Every other non-zero code fails
-          # the run: 1 = stale or never-run source, 2 = config problem, 4 = invalid checkpoint
+          # the run: 1 = stale, failed or never-run source, 2 = config problem, 4 = invalid checkpoint
           # (#17), or a crash.
           case "$rc" in
             0) ;;

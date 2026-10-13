@@ -5,7 +5,10 @@ Reads source configs, checks checkpoint state, and writes a markdown
 freshness report to out/health/YYYY-MM-DD.md.
 
 Exit 0: all sources are fresh (lag < stale_days).
-Exit 1: a source is stale, or has never run although refresh is wired.
+Exit 1: a source is stale, its last run did not end at the success stage
+        (pipeline.state.SUCCESS_STAGE; any other stage, including not_approved,
+        *_failed, an unfinished or an unknown stage, reports as failed), or it
+        has never run although refresh is wired.
 Exit 2: config problem, never "nothing to do": the config dir is missing
         (terms-analysis#90), unreadable or holds zero source configs, a *.yaml
         entry is not a regular file, or a source YAML is empty or not a
@@ -39,7 +42,7 @@ from pathlib import Path
 import yaml
 
 from legal_corpus_ingester.cli import EXIT_NOT_WIRED, REFRESH_WIRED
-from legal_corpus_ingester.pipeline.state import checkpoint_problem
+from legal_corpus_ingester.pipeline.state import SUCCESS_STAGE, checkpoint_problem
 
 # A stale source, or a never-run source once refresh is wired: a real problem.
 EXIT_SOURCE_PROBLEM: int = 1
@@ -53,6 +56,10 @@ EXIT_CHECKPOINT_INVALID: int = 4
 # Status label for a source whose checkpoint cannot be trusted. Its row never claims
 # fresh, stale or never-run.
 STATUS_CHECKPOINT_INVALID: str = "checkpoint-invalid"
+# Status label for a source whose last checkpoint stage is not SUCCESS_STAGE, however recent:
+# a failed, unfinished, not_approved or unknown stage is never fresh (terms-analysis#93 ruling
+# C). The Stage column, escaped, says which stage it was.
+STATUS_FAILED: str = "failed"
 
 # Checkpoint validity is pipeline.state.checkpoint_problem, the same rule set
 # CheckpointStore.load enforces, so a checkpoint this script passes never crashes
@@ -397,6 +404,18 @@ def _status_label(lag_hours: float | None, stale_days: int) -> str:
     return "fresh"
 
 
+def _source_status(stage: str, lag_hours: float | None, stale_days: int) -> str:
+    """Status for a valid or missing checkpoint: only SUCCESS_STAGE can be fresh or stale.
+
+    Fails closed: the stage is compared exactly, never normalised, so a case, whitespace or
+    look-alike variant of the success stage is failed. A missing checkpoint (lag_hours None)
+    stays never-run. Kept outside _status_label, which judges age alone.
+    """
+    if lag_hours is not None and stage != SUCCESS_STAGE:
+        return STATUS_FAILED
+    return _status_label(lag_hours, stale_days)
+
+
 def _lag_display(lag_hours: float | None) -> str:
     """Return lag formatted as fractional days, or '-' for never-run."""
     if lag_hours is None:
@@ -450,7 +469,7 @@ def build_report(
     for source in sources:
         last_run, stage, lag_hours, problem = _checkpoint_info(state_dir, source)
         if problem is None:
-            status = _status_label(lag_hours, stale_days)
+            status = _source_status(stage, lag_hours, stale_days)
         else:
             status = STATUS_CHECKPOINT_INVALID
             invalid_notes.append(problem)

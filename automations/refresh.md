@@ -36,10 +36,12 @@ issue steps get `GH_TOKEN` (terms-analysis#90).
    or is not a directory, also a broken checkout; #108), 7 (`EXIT_NO_APPROVED_SOURCES`:
    no source holds a valid approval, so nothing ran; every repo approval is a
    placeholder until the owner signs real hashes, so the run is red until then) and
-   8 (`EXIT_SOURCE_FAILED`: at least one approved source failed; each is named on
-   stderr and checkpointed, and the remaining sources still run; terms-analysis#93).
-   Sources without a valid approval are named on stderr and skipped. The full list
-   is in `ingester --help`.
+   8 (`EXIT_SOURCE_FAILED`: at least one source failed; each is named on stderr and
+   checkpointed, and the remaining sources still run; terms-analysis#93). A source
+   without a valid approval, while another source has one, is such a failure: it is
+   not run, it is named on stderr and it is checkpointed as `not_approved`, so a
+   partly signed run is red, never a silent partial success. `--dry-run` exits with
+   the same code and writes nothing. The full list is in `ingester --help`.
 
 3. **Detect bundle change.** Runs `scripts/detect_bundle_change.py detect`. It reads
    the bundle `out/current` points at and fingerprints it (SHA256 of its

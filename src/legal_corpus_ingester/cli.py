@@ -13,6 +13,7 @@ import sys
 import warnings
 from datetime import date
 from pathlib import Path
+from typing import NoReturn
 
 import httpx
 import typer
@@ -34,7 +35,7 @@ from legal_corpus_ingester.sources.registry import (
     resolve_stage_class,
 )
 from legal_corpus_ingester.sources.schema import SourceConfig
-from legal_corpus_ingester.pipeline.state import CheckpointStore
+from legal_corpus_ingester.pipeline.state import STAGE_NOT_APPROVED, CheckpointState, CheckpointStore
 from legal_corpus_ingester.types import FetchResult
 from legal_corpus_ingester.provenance.license_audit import (
     hash_content,
@@ -81,9 +82,10 @@ EXIT_USAGE: int = 2
 # ruling 1 of 2026-10-13). Every approval in the repo is a placeholder until the owner signs real
 # hashes, so a real refresh exits 7 until then: the intended loud failure, never a silent pass.
 EXIT_NO_APPROVED_SOURCES: int = 7
-# At least one source failed: fetch, the post-fetch approval hash check, clean, chunk, embed or
-# publish. refresh continues with the remaining sources and names every failed one on stderr
-# with the exception type only (terms-analysis#93, lead rulings 1 and 3).
+# At least one source failed: it had no valid approval while another source did (decision B),
+# or it failed fetch, the post-fetch approval hash check, clean, chunk, embed or publish.
+# refresh continues with the remaining sources and names every failed one on stderr with the
+# exception type only (terms-analysis#93, lead rulings 1 and 3).
 EXIT_SOURCE_FAILED: int = 8
 # Help text for each public exit code, rendered as "<code> when <meaning>" clauses by
 # _exit_code_clauses into the top-level epilog and the status help. A meaning must not contain
@@ -111,8 +113,9 @@ _EXIT_MEANINGS: dict[int, str] = {
         "no requested source holds a valid approval, so nothing ran (fetch, refresh)"
     ),
     EXIT_SOURCE_FAILED: (
-        "at least one source failed to fetch, match its approved hash, clean, chunk, embed or"
-        " publish (fetch, refresh), and each failed source is named on stderr"
+        "at least one source failed: it was not approved while another was, or it failed to"
+        " fetch, match its approved hash, clean, chunk, embed or publish (fetch, refresh), and"
+        " each failed source is named on stderr"
     ),
 }
 # os.stat errno values meaning "this path names no directory": a component is missing or not a
@@ -286,13 +289,16 @@ def _approval_problem(approval_file: Path, source_name: str, today: date) -> str
 
 def _approved_sources(
     names: list[str], approvals_dir: Path, today: date
-) -> list[str]:
-    """The *names* whose approval is valid; the rest are named on stderr with the reason.
+) -> tuple[list[str], dict[str, str]]:
+    """Split *names* into (approved, unsigned), where unsigned maps each name to its reason.
 
+    An unsigned source is a source failure, not a skip (lead ruling 4, decision B): it is
+    named on stderr as failed here, and the caller records it and counts it in the exit code.
     A malformed or unreadable approval file exits EXIT_LOAD_ERROR before any fetch, naming the
     source and the error type (lead ruling 4).
     """
     approved: list[str] = []
+    unsigned: dict[str, str] = {}
     for name in names:
         try:
             problem = _approval_problem(approvals_dir / f"{name}.yaml", name, today)
@@ -306,9 +312,26 @@ def _approved_sources(
         if problem is None:
             approved.append(name)
         else:
+            unsigned[name] = problem
             # Source names passed SourceConfig's name_is_safe allowlist, so echoing them is safe.
-            typer.echo(f"{name}: not run, {problem}.", err=True)
-    return approved
+            typer.echo(f"{name}: failed, not run, {problem}.", err=True)
+    return approved, unsigned
+
+
+def _record_not_approved(settings: Settings, unsigned: dict[str, str]) -> None:
+    """Checkpoint each unsigned source as STAGE_NOT_APPROVED under Settings.state_dir.
+
+    The state record then matches the exit code (lead rulings B and D), and health_check
+    reports the source as failed. The error is the fixed reason text from _approval_problem,
+    never bytes read from the approval file (F8). A checkpoint that cannot be written is
+    named on stderr by exception type only; the run still exits non-zero for that source.
+    """
+    store = CheckpointStore(settings.state_dir)
+    for name, reason in unsigned.items():
+        try:
+            store.save(CheckpointState(name, STAGE_NOT_APPROVED, "", error=reason))
+        except (OSError, ValueError) as exc:
+            typer.echo(f"{name}: failed to record its checkpoint ({_type_name(exc)}).", err=True)
 
 
 class _ApprovalGatedFetcher:
@@ -362,15 +385,17 @@ def _run_sources(
     classes: dict[str, dict[str, type]],
     approvals_dir: Path,
     today: date,
+    unsigned: dict[str, str],
 ) -> None:
     """Run the Orchestrator for each source in *names*; exit EXIT_SOURCE_FAILED if any failed.
 
     One failing source does not stop the rest (lead ruling 3): each checkpoints its own failure
     and the run ends non-zero naming every failed source, with the exception type only (F8).
+    The *unsigned* sources were never run and count as failed (decision B).
     Dirs, the LocalAI URL and model all come from Settings (F13); embedder_model is left to the
     Orchestrator's default (terms-analysis#98 owns it).
     """
-    failed: list[str] = []
+    failed: list[str] = list(unsigned)
     for name in names:
         stage = classes[name]
         try:
@@ -400,10 +425,20 @@ def _run_sources(
         raise typer.Exit(code=EXIT_SOURCE_FAILED)
 
 
-def _exit_no_approved_sources() -> None:
+def _exit_no_approved_sources(
+    settings: Settings, unsigned: dict[str, str], dry_run: bool
+) -> NoReturn:
+    """Exit EXIT_NO_APPROVED_SOURCES; a real run first checkpoints every source (ruling D).
+
+    The hash to sign is the payload sha256 in the source's cassette sidecar manifest (#96):
+    fetch never downloads an unsigned source (decision A), so the message says where it is.
+    """
+    if not dry_run:
+        _record_not_approved(settings, unsigned)
     typer.echo(
-        "No requested source holds a valid approval; nothing was run. Sign the approval files"
-        f" under {APPROVALS_SUBDIR}/ in INGESTER_CONFIG_DIR.",
+        "No requested source holds a valid approval; nothing was run. Sign each approval file"
+        f" under {APPROVALS_SUBDIR}/ in INGESTER_CONFIG_DIR with the payload sha256 from the"
+        " source's cassette sidecar manifest.",
         err=True,
     )
     raise typer.Exit(code=EXIT_NO_APPROVED_SOURCES)
@@ -601,24 +636,25 @@ def fetch(
         return
 
     # fetch applies the same legal gate as refresh: an unsigned source is refused before any
-    # network call (test_fetch_of_unsigned_source_refuses; see the #93 coder report, deviation A).
+    # network call and checkpointed as not_approved (#93 lead decisions A and D).
     settings = _load_settings()
     approvals_dir = _approvals_dir(settings)
     today = date.today()
-    if not _approved_sources([source], approvals_dir, today):
-        _exit_no_approved_sources()
-    classes = _stage_classes(registry, [source])
-    _run_sources(settings, registry, [source], classes, approvals_dir, today)
+    approved, unsigned = _approved_sources([source], approvals_dir, today)
+    if not approved:
+        _exit_no_approved_sources(settings, unsigned, dry_run=False)
+    classes = _stage_classes(registry, approved)
+    _run_sources(settings, registry, approved, classes, approvals_dir, today, {})
 
 
 @app.command(
     help=(
         "Refresh every configured source whose approval is valid: fetch, check the approved"
-        " hash, clean, chunk, embed and publish each under INGESTER_OUT_DIR. Sources without a"
-        " valid approval are named on stderr and not run. A failing source does not stop the"
-        " rest.\n\n"
-        "Exit codes: 0 when every approved source is published, or --dry-run lists what would"
-        " run; "
+        " hash, clean, chunk, embed and publish each under INGESTER_OUT_DIR. A source without a"
+        " valid approval is not run and counts as failed: it is named on stderr and checkpointed"
+        " as not_approved. A failing source does not stop the rest.\n\n"
+        "Exit codes: 0 when every configured source is approved and published, or --dry-run"
+        " finds every source approved; "
         + _exit_code_clauses(
             (
                 EXIT_NO_APPROVED_SOURCES,
@@ -667,17 +703,28 @@ def refresh(
     settings = _load_settings()
     approvals_dir = _approvals_dir(settings)
     today = date.today()
-    approved = _approved_sources(list(registry), approvals_dir, today)
+    approved, unsigned = _approved_sources(list(registry), approvals_dir, today)
     if not approved:
-        _exit_no_approved_sources()
+        _exit_no_approved_sources(settings, unsigned, dry_run)
     classes = _stage_classes(registry, approved)
 
     if dry_run:
         for name in approved:
             typer.echo(f"DRY RUN: would refresh {name}")
+        if unsigned:
+            # The real run would fail each unsigned source, so the dry run exits as it would
+            # (ruling E); it writes no checkpoint.
+            typer.echo(
+                f"DRY RUN: {len(unsigned)} source(s) would fail, not approved:"
+                f" {', '.join(unsigned)}.",
+                err=True,
+            )
+            raise typer.Exit(code=EXIT_SOURCE_FAILED)
         return
 
-    _run_sources(settings, registry, approved, classes, approvals_dir, today)
+    # Only after every offline check passed: a load error (exit 1) writes nothing.
+    _record_not_approved(settings, unsigned)
+    _run_sources(settings, registry, approved, classes, approvals_dir, today, unsigned)
 
 
 @app.command(

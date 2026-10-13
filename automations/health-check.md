@@ -71,7 +71,7 @@ decided:
 | Exit | Meaning | Workflow result |
 |------|---------|-----------------|
 | 0 | Every source is fresh | green |
-| 1 | A source is stale, or never-run while refresh is wired | red |
+| 1 | A source is stale, its last checkpoint stage is not the success stage `done` (status `failed`: `not_approved`, any `*_failed`, an unfinished or unknown stage, however recent), or it is never-run while refresh is wired | red |
 | 2 | Config problem: `config/sources/` missing, unreadable or holding zero source configs, a non-file `*.yaml` entry, or an empty / non-mapping source YAML | red |
 | 3 (`EXIT_NOT_WIRED`) | The only problem is never-run sources and `cli.REFRESH_WIRED` is False | green with a "Refresh not wired" warning annotation |
 | 4 (`EXIT_CHECKPOINT_INVALID`) | A checkpoint file exists but is not a valid `CheckpointState` for its source (see below). Outranks 1 and 3 (stale or never-run sources do not mask it), wired or not | red |
@@ -102,7 +102,7 @@ python scripts/health_check.py --stale-days 14
 
 ## Failure mode
 
-If `health_check.py` exits 1 (stale source, or never-run once refresh is wired),
+If `health_check.py` exits 1 (stale or failed source, or never-run once refresh is wired),
 2 (config problem: `config/sources/` missing, unreadable or holding zero source
 configs, a `*.yaml` entry that is not a regular file, or a source YAML that is
 empty or not a mapping; terms-analysis#90, #173), 4 (an invalid checkpoint;

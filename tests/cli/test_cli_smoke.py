@@ -763,6 +763,10 @@ def test_sources_dir_command_help_documents_exit_codes(command: str) -> None:
                 # Honest about the one outcome that differs from status / refresh: an existing
                 # empty dir is a 0 with "No sources configured.", not EXIT_NO_SOURCES.
                 assert _NO_SOURCES_MSG in clause, (code, clause)
+            if command == "refresh":
+                # terms-analysis#93 decision B: an unsigned source fails the run, so 0 needs
+                # every configured source approved, not just "every approved source published".
+                assert "every configured source is approved" in clause, (code, clause)
             continue
         for phrase in EXIT_CODE_MEANINGS[by_code[int(code)]]:
             assert phrase in clause, (command, code, phrase, clause)
