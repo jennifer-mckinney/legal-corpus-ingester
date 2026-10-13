@@ -32,6 +32,9 @@ PUBLIC_EXIT_CODES: dict[str, int] = {
     # terms-analysis#93 (lead rulings of 2026-10-13): fetch and refresh run the pipeline.
     "EXIT_NO_APPROVED_SOURCES": 7,
     "EXIT_SOURCE_FAILED": 8,
+    # terms-analysis#93 Round 11 (rthoB): refresh with no licence baseline and no seed opt-in.
+    # Its own code, not 8: no source failed, and every code has exactly one meaning.
+    "EXIT_LICENSE_BASELINE_MISSING": 9,
 }
 
 # What each code means, as the phrases a "<code> when <meaning>" help clause must carry. Every
@@ -45,6 +48,7 @@ EXIT_CODE_MEANINGS: dict[str, tuple[str, ...]] = {
     "EXIT_SOURCES_DIR_MISSING": ("does not exist", "not a directory"),
     "EXIT_NO_APPROVED_SOURCES": ("valid approval", "nothing ran"),
     "EXIT_SOURCE_FAILED": ("failed", "named on stderr"),
+    "EXIT_LICENSE_BASELINE_MISSING": ("baseline", "nothing ran"),
 }
 
 # Every command that takes --sources-dir, by the name `ingester --help` shows (#108, owner ruling

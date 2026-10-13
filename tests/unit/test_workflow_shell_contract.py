@@ -1170,3 +1170,78 @@ def test_bundle_record_lives_in_the_cached_state(tmp_path: Path, monkeypatch: py
         assert any(state_file.is_relative_to(c) for c in cached), (
             f"{label}: the bundle record {state_file} is outside every cached path {cached}"
         )
+
+
+# --- terms-analysis#93 Round 11 (rthoB): only a seed dispatch seeds the licence baseline -------
+# What `inputs.seed_bundle_record` evaluates to on each trigger, and whether that run may seed. A
+# schedule has no inputs (the expression renders as ''); a plain dispatch keeps the default.
+_SEED_EVENTS: dict[str, tuple[str, bool]] = {
+    "schedule": ("", False),
+    "dispatch-default": ("false", False),
+    "dispatch-seed": ("true", True),
+}
+
+
+def test_seed_event_table_has_both_verdicts() -> None:
+    assert {seeds for _, seeds in _SEED_EVENTS.values()} == {True, False}
+
+
+def _run_refresh_step(tmp_path: Path, seed_input: str) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+    """Run refresh.yml's one `ingester refresh` step with a fake `ingester` that logs its argv.
+
+    The step's own `env:` is rendered with the dispatch input set to *seed_input*. Only plain
+    `${{ inputs.x }}` / `${{ github.event.inputs.x }}` references are modelled; any other
+    expression raises _Unmodelled rather than being guessed.
+    """
+    doc = _load(_REFRESH_YML)
+    job_name, _, step = _one_cmd_step(doc, _REFRESH_RUN)
+    checkout = tmp_path / "checkout"
+    (checkout / ".venv" / "bin").mkdir(parents=True)
+    (checkout / ".venv" / "bin" / "activate").write_text("")
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    argv_log = tmp_path / "argv.json"
+    (fakebin / "ingester").write_text(
+        "#!/bin/bash\n"
+        f'"{sys.executable}" -c "import json,sys; json.dump(sys.argv[2:], open(sys.argv[1], \'w\'))"'
+        f' "{argv_log}" "$@"\n'
+    )
+    (fakebin / "ingester").chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    contexts = _contexts(tmp_path, checkout)
+    job_env = _job_env(doc, job_name, contexts)
+    inputs = {
+        "inputs.seed_bundle_record": seed_input,
+        "github.event.inputs.seed_bundle_record": seed_input,
+    }
+    env = {"PATH": f"{fakebin}{os.pathsep}/usr/bin{os.pathsep}/bin", "HOME": str(home), **job_env}
+    for name, value in (step.get("env") or {}).items():
+        env[str(name)] = _render(value, {**contexts, **inputs}, job_env)
+    script = tmp_path / "step.sh"
+    script.write_text(str(step["run"]))
+    shell = _default_shell(doc)
+    assert shell == _REQUIRED_SHELL
+    result = subprocess.run(
+        shell.replace("{0}", str(script)).split(),
+        cwd=checkout, env=env, capture_output=True, text=True, timeout=60,
+    )
+    argv = json.loads(argv_log.read_text()) if argv_log.exists() else []
+    return result, argv
+
+
+@pytest.mark.parametrize("event", sorted(_SEED_EVENTS))
+def test_refresh_step_passes_the_seed_flag_only_on_a_seed_dispatch(tmp_path: Path, event: str) -> None:
+    # Round 11 item 2: the flag is cli's constant (never restated here); a scheduled run and a
+    # plain dispatch never seed, so a cache miss there stays red instead of re-baselining.
+    flag = getattr(cli, "REFRESH_SEED_FLAG", None)
+    assert isinstance(flag, str) and flag.startswith("--"), "cli names no REFRESH_SEED_FLAG (Round 11 item 2)"
+    doc = _load(_REFRESH_YML)
+    _, _, step = _one_cmd_step(doc, _REFRESH_RUN)
+    # Refresh itself runs on every trigger; only the flag depends on the input.
+    assert "if" not in step, step.get("if")
+    seed_input, seeds = _SEED_EVENTS[event]
+    result, argv = _run_refresh_step(tmp_path, seed_input)
+    assert result.returncode == 0, (event, result.stderr[-400:])
+    assert argv[:2] == ["refresh", "--all"], (event, argv)
+    assert argv.count(flag) == (1 if seeds else 0), (event, argv)

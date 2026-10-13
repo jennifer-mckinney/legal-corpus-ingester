@@ -79,6 +79,7 @@ import numpy as np
 import pydantic
 import pytest
 import yaml
+from typer.main import get_command
 from typer.testing import CliRunner, Result
 
 from legal_corpus_ingester import cli
@@ -91,6 +92,7 @@ from legal_corpus_ingester.errors import (
     LicenseDriftError,
     UpstreamNotFoundError,
 )
+from legal_corpus_ingester.fetchers import eurlex as eurlex_fetcher
 from legal_corpus_ingester.fetchers.eurlex import EURLEX_BASE_URL
 from legal_corpus_ingester.pipeline.approval_gate import (
     _PLACEHOLDER_SHA,
@@ -149,6 +151,7 @@ _USAGE = PUBLIC_EXIT_CODES["EXIT_USAGE"]
 _LOAD_ERROR = PUBLIC_EXIT_CODES["EXIT_LOAD_ERROR"]
 _NO_APPROVED = PUBLIC_EXIT_CODES["EXIT_NO_APPROVED_SOURCES"]
 _SOURCE_FAILED = PUBLIC_EXIT_CODES["EXIT_SOURCE_FAILED"]
+_BASELINE_MISSING = PUBLIC_EXIT_CODES["EXIT_LICENSE_BASELINE_MISSING"]
 # Lead decision B: the checkpoint stage a requested source without a valid approval records.
 _NOT_APPROVED_STAGE = "not_approved"
 
@@ -161,6 +164,39 @@ def _refresh_baseline_name() -> str:
     constant = getattr(license_audit, "REFRESH_BASELINE_FILE", None)
     assert constant is not None, "license_audit names no REFRESH_BASELINE_FILE constant (ruling P)"
     return Path(constant).name
+
+
+# What the fixture's baseline file holds: valid JSON with no source entry (Round 11 item 3).
+_SEEDED_BASELINE = "{}\n"
+
+
+def _state_untouched(ws: _Workspace) -> bool:
+    """The state dir holds exactly what the fixture put there: the seeded baseline, nothing else."""
+    return _files(ws.state) == {_refresh_baseline_name(): _digest(_SEEDED_BASELINE.encode())}
+
+
+def _digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _files(root: Path) -> dict[str, str]:
+    """Every file and link under *root*: relative path -> content digest or link target.
+
+    Directories are left out (Settings may create the configured dirs), so "nothing written"
+    means no file, link or byte changed anywhere under the workspace.
+    """
+    found: dict[str, str] = {}
+    if not root.is_dir():
+        return found
+    for dirpath, dirnames, filenames in os.walk(root):
+        for name in dirnames + filenames:
+            path = Path(dirpath) / name
+            rel = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                found[rel] = "link -> " + os.readlink(path)
+            elif path.is_file():
+                found[rel] = _digest(path.read_bytes())
+    return found
 
 
 def _repo_names() -> list[str]:
@@ -269,6 +305,11 @@ def _make_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signed: tup
             ws.sign(name)
         else:
             ws.unsign(name)
+    # Round 11 (rthoB): a missing refresh licence baseline fails closed unless the run seeds, so
+    # every workspace starts as a restored cache does: the baseline file present. "{}" holds no
+    # entry yet, so each source is still NEW and allowed (item 3); the Round 11 tests remove it.
+    ws.state.mkdir()
+    (ws.state / _refresh_baseline_name()).write_text(_SEEDED_BASELINE, encoding="utf-8")
     return ws
 
 
@@ -568,7 +609,7 @@ def test_refresh_all_dry_run_lists_without_writing(ws: _Workspace, spy: _Spy, ne
         assert _named_with(_output(result), name, "approv"), (name, _why(result))
     assert spy.constructed == [] and spy.runs == []
     assert net.attempts == []
-    assert _is_empty(ws.out) and _is_empty(ws.state) and _is_empty(ws.cwd)
+    assert _is_empty(ws.out) and _state_untouched(ws) and _is_empty(ws.cwd)
 
 
 def test_refresh_all_dry_run_fully_signed_exits_zero(ws_all: _Workspace, spy: _Spy, net: _Net) -> None:
@@ -585,7 +626,7 @@ def test_refresh_all_dry_run_fully_signed_exits_zero(ws_all: _Workspace, spy: _S
     assert result.stderr == "", _why(result)
     assert spy.constructed == [] and spy.runs == []
     assert net.attempts == []
-    assert _is_empty(ws.out) and _is_empty(ws.state) and _is_empty(ws.cwd)
+    assert _is_empty(ws.out) and _state_untouched(ws) and _is_empty(ws.cwd)
     _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
 
 
@@ -1775,7 +1816,7 @@ def test_refresh_dry_run_real_pipeline_stays_offline(ws: _Workspace, net: _Net) 
     assert net.attempts == [], net.attempts
     for name in _TIER1:
         assert name in result.stdout, (name, _why(result))
-    assert _is_empty(ws.out) and _is_empty(ws.state) and _is_empty(ws.cwd)
+    assert _is_empty(ws.out) and _state_untouched(ws) and _is_empty(ws.cwd)
 
 
 def test_fetched_artifact_must_match_the_signed_sha(ws: _Workspace, net: _Net) -> None:
@@ -1805,7 +1846,7 @@ def test_refresh_with_no_valid_approval_fails_loudly(
     ws = _make_workspace(tmp_path, monkeypatch, signed=())
     # Dry run first: it writes nothing (ruling E keeps its exit code equal to the real run's).
     dry = _invoke(ws.argv("refresh", "--all", "--dry-run"))
-    assert _is_empty(ws.state), "a dry run wrote a checkpoint"
+    assert _state_untouched(ws), "a dry run wrote a checkpoint"
     real = _invoke(ws.argv("refresh", "--all"))
     # Ruling D: exit 7 still records a not_approved checkpoint for every requested source,
     # so the state matches an exit-8 run and health reports each as failed (ruling C).
@@ -1833,7 +1874,7 @@ def test_fetch_of_unsigned_source_refuses(ws: _Workspace, spy: _Spy, net: _Net) 
     assert dry.exit_code == _NO_APPROVED, _why(dry)
     assert _named_with(_output(dry), name, "approv"), _why(dry)
     assert spy.constructed == [] and spy.runs == [] and net.attempts == [], _why(dry)
-    assert _is_empty(ws.out) and _is_empty(ws.state) and _is_empty(ws.cwd), _why(dry)
+    assert _is_empty(ws.out) and _state_untouched(ws) and _is_empty(ws.cwd), _why(dry)
     _assert_safe_output(dry, str(ws.root), str(ws.root.resolve()))
     result = _invoke(ws.argv("fetch", name))
     _assert_failed_loudly(result)
@@ -2016,7 +2057,7 @@ def test_refresh_runs_a_source_only_with_a_valid_approval(
         assert result.exit_code == _LOAD_ERROR, _why(result)
         assert spy.constructed == [] and spy.runs == [], _why(result)
         assert _named_with(_output(result), "eurlex_gdpr", "approv"), _why(result)
-        assert _is_empty(ws.state), "a load error left a checkpoint behind (round 4 H)"
+        assert _state_untouched(ws), "a load error left a checkpoint behind (round 4 H)"
     _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
     assert net.attempts == []
 
@@ -2227,11 +2268,11 @@ def test_config_class_path_must_name_a_class_defined_in_its_own_stage(
     # Lead ruling 5: the dry run exits with the code the real run would, and writes nothing.
     dry = _invoke(ws.argv("refresh", "--all", "--dry-run"))
     assert dry.exit_code == _LOAD_ERROR, _why(dry)
-    assert _is_empty(ws.state), "a dry run left a checkpoint behind"
+    assert _state_untouched(ws), "a dry run left a checkpoint behind"
     result = _invoke(ws.argv("refresh", "--all"))
     assert result.exit_code == _LOAD_ERROR, _why(result)
     assert spy.constructed == [] and spy.runs == [], _why(result)
-    assert _is_empty(ws.state), f"a stage-class load error left a checkpoint behind ({signed} signed)"
+    assert _state_untouched(ws), f"a stage-class load error left a checkpoint behind ({signed} signed)"
     assert "eurlex_gdpr" in _output(result), _why(result)
     _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
     assert net.attempts == []
@@ -2339,7 +2380,7 @@ def test_fetch_dry_run_stays_offline_and_writes_nothing(ws: _Workspace, spy: _Sp
     assert "eurlex_gdpr" in result.stdout
     assert spy.constructed == [] and spy.runs == []
     assert net.attempts == []
-    assert _is_empty(ws.out) and _is_empty(ws.state) and _is_empty(ws.cwd)
+    assert _is_empty(ws.out) and _state_untouched(ws) and _is_empty(ws.cwd)
 
 
 def test_fetch_unknown_source_exits_one_without_running(ws: _Workspace, spy: _Spy, net: _Net) -> None:
@@ -2357,3 +2398,304 @@ def test_refresh_empty_sources_dir_still_exits_no_sources(ws: _Workspace, spy: _
     assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_NO_SOURCES"], _why(result)
     assert spy.constructed == [] and spy.runs == []
     assert net.attempts == []
+
+
+# ---------------------------------------------------------------------------
+# Round 11 (rthoB): a missing refresh licence baseline fails closed unless the run seeds
+# ---------------------------------------------------------------------------
+# A cache miss empties INGESTER_STATE_DIR. Before Round 11 the licence-drift gate then read every
+# source as NEW, published, and recorded the current SPDX as the new baseline: a silent
+# re-baseline of a legal control. These tests pin the contract (items 1-7 of the ruling).
+
+
+def _seed_flag() -> str:
+    """Item 2: the seed opt-in is one cli constant naming an option of `refresh` (F13)."""
+    flag = getattr(cli, "REFRESH_SEED_FLAG", None)
+    assert isinstance(flag, str), "cli names no REFRESH_SEED_FLAG constant (Round 11 item 2)"
+    assert flag.startswith("--") and len(flag) > 2, flag
+    command = get_command(app)
+    refresh_cmd = command.commands["refresh"]  # type: ignore[attr-defined]
+    options = {opt for param in refresh_cmd.params for opt in param.opts}
+    assert flag in options, (flag, sorted(options))
+    return flag
+
+
+def _upstream_spdx() -> str:
+    """The SPDX the EUR-Lex fetcher reports today (every repo source is EUR-Lex)."""
+    return str(eurlex_fetcher.EURLEX_LICENSE)
+
+
+def _set_upstream_spdx(monkeypatch: pytest.MonkeyPatch, spdx: str) -> None:
+    """The licence upstream now declares: what the fetcher reports on the next run."""
+    monkeypatch.setattr(eurlex_fetcher, "EURLEX_LICENSE", spdx)
+
+
+def _baseline(ws: _Workspace) -> dict[str, Any]:
+    data: dict[str, Any] = json.loads((ws.state / _refresh_baseline_name()).read_text(encoding="utf-8"))
+    return data
+
+
+def _remove_file(ws: _Workspace) -> None:
+    (ws.state / _refresh_baseline_name()).unlink()
+
+
+def _remove_state_dir(ws: _Workspace) -> None:
+    # The whole cache missed: no checkpoint, no record, no baseline.
+    shutil.rmtree(ws.state)
+
+
+def _dangling_link(ws: _Workspace) -> None:
+    path = ws.state / _refresh_baseline_name()
+    path.unlink()
+    path.symlink_to(ws.root / "no-such-baseline.json")
+
+
+def _directory_in_its_place(ws: _Workspace) -> None:
+    path = ws.state / _refresh_baseline_name()
+    path.unlink()
+    path.mkdir()
+
+
+# Item 1, every way "the baseline file is missing" reaches the CLI (attack list A: indirection).
+_MISSING_BASELINE: dict[str, Callable[[_Workspace], None]] = {
+    "file-removed": _remove_file,
+    "state-dir-removed": _remove_state_dir,
+    "dangling-link": _dangling_link,
+    "directory-in-its-place": _directory_in_its_place,
+}
+
+
+def _assert_baseline_gate(
+    ws: _Workspace, result: Result, spy: _Spy | None, net: _Net, approved: tuple[str, ...] | None = None
+) -> None:
+    """Item 1 and 4: a named, documented non-zero exit, before any source ran, reason only.
+
+    *approved* are the sources the gate stopped (default: all). An unsigned source may still be
+    reported as not approved; an approved one must never be blamed for the missing baseline.
+    """
+    _assert_failed_loudly(result)
+    assert result.exit_code == _BASELINE_MISSING, _why(result)
+    assert getattr(cli, "EXIT_LICENSE_BASELINE_MISSING", None) == _BASELINE_MISSING, "no named constant"
+    assert result.exit_code in cli._EXIT_MEANINGS, _why(result)
+    if spy is not None:
+        assert spy.constructed == [] and spy.runs == [], ("a source ran", _why(result))
+    assert net.attempts == [] and net.served == [], ("a source was fetched", _why(result))
+    text = _output(result)
+    # Item 4: the reason is named, and it is not the per-source failure message.
+    assert "baseline" in text.lower(), _why(result)
+    for name in _repo_names() if approved is None else approved:
+        assert not _named_with(text, name, "fail"), (name, "the gate blamed a source", _why(result))
+    assert "Traceback" not in text, _why(result)
+    # No path values: neither the workspace nor the state dir is echoed.
+    _assert_safe_output(result, str(ws.root), str(ws.root.resolve()), str(ws.state))
+
+
+@pytest.mark.parametrize("how", sorted(_MISSING_BASELINE))
+@pytest.mark.parametrize("prior", ["first-run", "after-a-run"])
+@pytest.mark.parametrize("signed", ["all", "tier1"])
+def test_missing_refresh_baseline_fails_closed_before_any_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spy: _Spy, net: _Net, how: str, prior: str, signed: str
+) -> None:
+    ws = _make_workspace(tmp_path, monkeypatch, signed=tuple(_repo_names()) if signed == "all" else _TIER1)
+    if prior == "after-a-run":
+        # A run before the cache miss: checkpoints, and with every source signed a published
+        # bundle, a version record and out/current that the blocked run must leave alone.
+        earlier = _invoke(ws.argv("refresh", "--all"))
+        if signed == "all":
+            assert earlier.exit_code == 0, _why(earlier)
+            _assert_current_bundle(ws, _repo_names())
+            assert _record_path(ws).is_file(), "the earlier run wrote no version record"
+        spy.constructed.clear()
+        spy.runs.clear()
+    _MISSING_BASELINE[how](ws)
+    before = _files(ws.root)
+    published = _published_state(ws.out)
+
+    # Item 5: the dry run exits as the real run will, offline, and writes nothing.
+    dry = _invoke(ws.argv("refresh", "--all", "--dry-run"))
+    assert _files(ws.root) == before, ("a dry run wrote", _why(dry))
+    result = _invoke(ws.argv("refresh", "--all"))
+    _assert_baseline_gate(ws, result, spy, net, None if signed == "all" else _TIER1)
+    assert dry.exit_code == result.exit_code, ("the dry run does not mirror the real run", _why(dry))
+    _assert_safe_output(dry, str(ws.root), str(ws.root.resolve()), str(ws.state))
+    # Nothing written: no checkpoint (not even not_approved), no baseline, no version record,
+    # out/current and every bundle as they were.
+    assert _files(ws.root) == before, sorted(set(_files(ws.root).items()) ^ set(before.items()))
+    assert _published_state(ws.out) == published, "the blocked run published or repointed a bundle"
+    for name in _repo_names():
+        if prior == "first-run" or how == "state-dir-removed":
+            assert CheckpointStore(ws.state).load(name) is None, (name, "the blocked run checkpointed")
+
+
+@pytest.mark.parametrize("how", ["file-removed", "state-dir-removed"])
+def test_the_seed_flag_runs_with_a_missing_baseline(ws_all: _Workspace, spy: _Spy, net: _Net, how: str) -> None:
+    # Item 2: seeding is the one explicit way past a missing baseline; its dry run mirrors it.
+    ws = ws_all
+    _MISSING_BASELINE[how](ws)
+    flag = _seed_flag()
+    before = _files(ws.root)
+    dry = _invoke(ws.argv("refresh", "--all", "--dry-run", flag))
+    assert dry.exit_code == 0, _why(dry)
+    assert spy.constructed == [] and net.attempts == [], _why(dry)
+    assert _files(ws.root) == before, ("a seeding dry run wrote", _why(dry))
+    result = _invoke(ws.argv("refresh", "--all", flag))
+    assert result.exit_code == 0, _why(result)
+    assert spy.run_names() == _repo_names(), _why(result)
+    _assert_current_bundle(ws, _repo_names())
+    _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
+
+
+@pytest.mark.parametrize("content", ["empty-object", "unconfigured-source-only"])
+def test_a_baseline_without_the_source_is_new_and_allowed(
+    ws_all: _Workspace, spy: _Spy, net: _Net, content: str
+) -> None:
+    # Item 3: only the whole file missing fails closed. Green today (no gate yet): the control
+    # that the gate keys on the file, not on a per-source entry.
+    ws = ws_all
+    entries = {} if content == "empty-object" else {"retired_source": {"hash": "0" * 64, "spdx": _upstream_spdx()}}
+    assert not set(entries) & set(_repo_names())
+    (ws.state / _refresh_baseline_name()).write_text(json.dumps(entries), encoding="utf-8")
+    result = _invoke(ws.argv("refresh", "--all"))
+    assert result.exit_code == 0, _why(result)
+    assert spy.run_names() == _repo_names(), _why(result)
+
+
+def test_a_newly_approved_source_is_new_against_an_existing_baseline(ws: _Workspace, net: _Net) -> None:
+    # Item 3, the real pipeline: Tier 1 records its baseline entries, then the rest are signed.
+    # Their entries are missing from an existing file, so they are NEW and publish without a seed.
+    net.upstream = ws
+    first = _invoke(ws.argv("refresh", "--all"))
+    assert first.exit_code == _SOURCE_FAILED, _why(first)
+    assert set(_baseline(ws)) == set(_TIER1), sorted(_baseline(ws))
+    for name in _unsigned():
+        ws.sign(name)
+    second = _invoke(ws.argv("refresh", "--all"))
+    assert second.exit_code == 0, _why(second)
+    assert set(_baseline(ws)) == set(_repo_names()), sorted(_baseline(ws))
+    _assert_current_bundle(ws, _repo_names())
+
+
+def test_real_refresh_with_a_missing_baseline_writes_nothing(ws_all: _Workspace, net: _Net) -> None:
+    # Item 1 on the real composition (no spy): no fetch, no embed call, no file.
+    ws = ws_all
+    net.upstream = ws
+    _remove_file(ws)
+    before = _files(ws.root)
+    dry = _invoke(ws.argv("refresh", "--all", "--dry-run"))
+    result = _invoke(ws.argv("refresh", "--all"))
+    _assert_baseline_gate(ws, result, None, net)
+    assert dry.exit_code == result.exit_code, _why(dry)
+    assert _files(ws.root) == before, sorted(set(_files(ws.root).items()) ^ set(before.items()))
+    assert not os.path.lexists(ws.state / _refresh_baseline_name()), "the blocked run wrote a baseline"
+    assert not _record_path(ws).exists(), "the blocked run wrote a version record"
+
+
+# A second SPDX for the drift scenario; any value but the configured one.
+_OTHER_SPDX = "CC0-1.0"
+
+
+def test_cache_miss_never_rebaselines_a_changed_licence_without_the_seed(
+    ws_all: _Workspace, net: _Net, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # rthoB end to end on the real pipeline. Baseline SPDX A; upstream now reports B.
+    ws = ws_all
+    net.upstream = ws
+    first = _invoke(ws.argv("refresh", "--all"))
+    assert first.exit_code == 0, _why(first)
+    spdx_a = _upstream_spdx()
+    assert spdx_a != _OTHER_SPDX
+    assert {n: e["spdx"] for n, e in _baseline(ws).items()} == dict.fromkeys(_repo_names(), spdx_a)
+    _set_upstream_spdx(monkeypatch, _OTHER_SPDX)
+
+    # Control: with the cache intact, the drift gate blocks B (the gate a cache miss bypassed).
+    kept = _invoke(ws.argv("refresh", "--all"))
+    assert kept.exit_code == _SOURCE_FAILED, _why(kept)
+    for name in _repo_names():
+        assert _named_with(kept.stderr, name, "fail"), (name, _why(kept))
+
+    # The cache misses: a hosted runner starts with no state and no out/.
+    shutil.rmtree(ws.state)
+    shutil.rmtree(ws.out)
+    before = _files(ws.root)
+    net.attempts.clear()  # the earlier runs fetched; the gated run must not
+    net.served.clear()
+    unseeded = _invoke(ws.argv("refresh", "--all"))
+    _assert_baseline_gate(ws, unseeded, None, net)
+    assert _files(ws.root) == before, "the unseeded run after a cache miss wrote something"
+    assert not os.path.lexists(ws.out / _CURRENT), "the unseeded run published B"
+    dry = _invoke(ws.argv("refresh", "--all", "--dry-run"))
+    assert dry.exit_code == unseeded.exit_code and _files(ws.root) == before, _why(dry)
+
+    # The documented trade-off: seeding accepts the current SPDX (B) as the baseline.
+    seeded = _invoke(ws.argv("refresh", "--all", _seed_flag()))
+    assert seeded.exit_code == 0, _why(seeded)
+    _assert_current_bundle(ws, _repo_names())
+    assert {n: e["spdx"] for n, e in _baseline(ws).items()} == dict.fromkeys(_repo_names(), _OTHER_SPDX)
+    # And the next scheduled run (no seed) uses that baseline: no drift, no gate.
+    after = _invoke(ws.argv("refresh", "--all"))
+    assert after.exit_code == 0, _why(after)
+
+
+def test_the_seed_flag_never_overrides_drift_on_an_existing_baseline(
+    ws_all: _Workspace, net: _Net, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Item 1 makes the seed an exception to the missing-file gate only. A seed dispatch on an
+    # intact cache must not accept a changed SPDX: the baseline keeps A and the source is blocked.
+    ws = ws_all
+    net.upstream = ws
+    name = "eurlex_gdpr"
+    first = _invoke(ws.argv("refresh", "--all"))
+    assert first.exit_code == 0, _why(first)
+    recorded = _baseline(ws)
+    _set_upstream_spdx(monkeypatch, _OTHER_SPDX)
+    published = _published_state(ws.out)
+    seeded = _invoke(ws.argv("refresh", "--all", _seed_flag()))
+    assert seeded.exit_code == _SOURCE_FAILED, _why(seeded)
+    assert _named_with(seeded.stderr, name, "fail"), _why(seeded)
+    assert _baseline(ws) == recorded, "a seed run re-baselined a drifted licence"
+    assert _published_state(ws.out) == published, "a seed run published past SPDX drift"
+    state = CheckpointStore(ws.state).load(name)
+    assert state is not None and state.stage == "license_failed", state
+
+
+@pytest.mark.parametrize("how", ["file-removed", "state-dir-removed"])
+def test_fetch_dry_run_mirrors_fetch_with_a_missing_baseline(ws: _Workspace, spy: _Spy, net: _Net, how: str) -> None:
+    # Item 5: whatever fetch does with a missing baseline, its dry run exits the same way and
+    # writes nothing.
+    _MISSING_BASELINE[how](ws)
+    before = _files(ws.root)
+    dry = _invoke(ws.argv("fetch", "eurlex_gdpr", "--dry-run"))
+    assert _files(ws.root) == before, ("a fetch dry run wrote", _why(dry))
+    assert spy.constructed == [] and net.attempts == [], _why(dry)
+    real = _invoke(ws.argv("fetch", "eurlex_gdpr"))
+    assert dry.exit_code == real.exit_code, (_why(dry), _why(real))
+
+
+_REFRESH_DOC = _REPO / "automations" / "refresh.md"
+
+
+def _paragraphs(text: str) -> list[str]:
+    return [" ".join(block.split()) for block in re.split(r"\n\s*\n", text) if block.strip()]
+
+
+def test_refresh_doc_says_seeding_accepts_the_current_licence() -> None:
+    # Item 6. (a) every "re-baseline" claim covers the licence baseline by name; (b) the seed
+    # procedure says seeding accepts the current SPDX, so the person seeding checks it first;
+    # (c) the manual path names the opt-in.
+    text = _REFRESH_DOC.read_text(encoding="utf-8")
+    name = _refresh_baseline_name()
+    paragraphs = _paragraphs(text)
+    claims = [p for p in paragraphs if re.search(r"re-?baseline", p, re.IGNORECASE)]
+    assert claims, "control: refresh.md makes no re-baseline claim at all"
+    uncovered = [p[:240] for p in claims if name not in p]
+    assert uncovered == [], uncovered
+    seed = [
+        p
+        for p in paragraphs
+        if "seed_bundle_record" in p
+        and name in p
+        and "SPDX" in p
+        and re.search(r"\b(confirm|check|verif|review)", p, re.IGNORECASE)
+    ]
+    assert seed, "refresh.md: no seed paragraph says seeding accepts the current SPDX as the baseline"
+    assert _seed_flag() in text, "refresh.md does not name the seed flag for a manual run"

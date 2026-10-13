@@ -740,6 +740,8 @@ _COMMAND_HELP_CODES: dict[str, tuple[str, ...]] = {
     "refresh": (
         "EXIT_NO_APPROVED_SOURCES",
         "EXIT_SOURCE_FAILED",
+        # terms-analysis#93 Round 11: only refresh gates on the licence baseline.
+        "EXIT_LICENSE_BASELINE_MISSING",
         "EXIT_NO_SOURCES",
         "EXIT_SOURCES_DIR_MISSING",
         "EXIT_LOAD_ERROR",
