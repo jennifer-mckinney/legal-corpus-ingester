@@ -21,6 +21,10 @@ B. In `refresh`, a requested source with no valid approval is a source FAILURE, 
    signed. A partly signed run that exits 0 would be a silent partial success.
    An approval file that cannot be parsed as a mapping fails the whole run (exit 1, ruling 4).
 
+Round 3 (2026-10-13): C. health treats every non-success checkpoint stage as failed
+(tests/unit/test_health_check.py). D. exit 7 also writes a `not_approved` checkpoint for every
+requested source. E. a dry run exits 8 when any requested source is unsigned, and writes nothing.
+
 The card's `--out <tmp>` is replaced by the `Settings.out_dir` env var (ruling 3).
 """
 
@@ -557,8 +561,14 @@ def test_refresh_with_no_valid_approval_fails_loudly(
 ) -> None:
     # Every approval is the repo's unsigned template, as on main today.
     ws = _make_workspace(tmp_path, monkeypatch, signed=())
-    real = _invoke(ws.argv("refresh", "--all"))
+    # Dry run first: it writes nothing (ruling E keeps its exit code equal to the real run's).
     dry = _invoke(ws.argv("refresh", "--all", "--dry-run"))
+    assert _is_empty(ws.state), "a dry run wrote a checkpoint"
+    real = _invoke(ws.argv("refresh", "--all"))
+    # Ruling D: exit 7 still records a not_approved checkpoint for every requested source,
+    # so the state matches an exit-8 run and health reports each as failed (ruling C).
+    for name in _repo_names():
+        _assert_not_approved_checkpoint(ws, name)
     for result in (real, dry):
         _assert_failed_loudly(result)
         for name in _repo_names():
@@ -578,6 +588,7 @@ def test_fetch_of_unsigned_source_refuses(ws: _Workspace, spy: _Spy, net: _Net) 
     result = _invoke(ws.argv("fetch", name))
     _assert_failed_loudly(result)
     assert result.exit_code == _NO_APPROVED, _why(result)  # decision A
+    _assert_not_approved_checkpoint(ws, name)  # ruling D: the requested source is recorded
     assert name not in spy.run_names()
     assert _named_with(_output(result), name, "approv"), _why(result)
     assert net.attempts == []
@@ -763,6 +774,7 @@ def test_fetch_of_unsigned_source_names_where_the_hash_comes_from(
     _write_state(ws, "eurlex_gdpr", key)
     result = _invoke(ws.argv("fetch", "eurlex_gdpr"))
     assert result.exit_code == _NO_APPROVED, _why(result)
+    _assert_not_approved_checkpoint(ws, "eurlex_gdpr")  # ruling D
     assert spy.constructed == [] and spy.runs == []
     assert any(
         "cassette" in line.lower() and "sha256" in line.lower() for line in _output(result).splitlines()
