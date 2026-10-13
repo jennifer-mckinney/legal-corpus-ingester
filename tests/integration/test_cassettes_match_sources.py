@@ -57,6 +57,7 @@ from legal_corpus_ingester.sources.registry import load_all
 from legal_corpus_ingester.sources.schema import SourceConfig
 from tests.integration import test_eurlex_fetcher as _eurlex_vcr
 from tests.unit.test_cellar_fetcher import (
+    _LEGAL_VALUE_FOR_KIND,
     AI_ACT_CELEX,
     CELEX_BASE,
     WAF_HEADER,
@@ -545,6 +546,50 @@ def test_zip_manifest_matches_cassette(
     if not problems:
         problems = _sidecar_problems(data, sidecar, source, cfg.pipeline.celex_id)
     assert not problems, "\n".join(problems)
+
+
+def _kind_swapped(celex: str, kind: str) -> str:
+    """The same CELEX with its document-type letter (after sector and year) replaced."""
+    return celex[:5] + kind + celex[6:]
+
+
+@pytest.mark.parametrize("source", TIER1_SOURCES)
+def test_recorded_zip_names_its_document_type_once(
+    source: str, registry: dict[str, SourceConfig], cassette_dir: Path
+) -> None:
+    """The field the base-CELEX type check reads exists in every recording: exactly one
+    DOC.MAIN.PUB/LEGAL.VALUE in the zip's DOC manifest, naming the CELEX type letter."""
+    cfg = registry[source]
+    data, problems = _read_cassette(_cassette_path(cfg, cassette_dir), source, _REPO)
+    raw, more = (None, []) if problems else _zip_body(data, source)
+    assert raw is not None, "\n".join(problems + more)
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        manifests = [_parse_hardened(archive.read(n)) for n in archive.namelist() if ".doc." in n]
+    manifests = [m for m in manifests if m.tag == "DOC"]
+    assert len(manifests) == 1, f"{source}: {len(manifests)} DOC manifests"
+    values = [el.text for el in manifests[0].findall("FMX/DOC.MAIN.PUB/LEGAL.VALUE")]
+    kind = cfg.pipeline.celex_id[5]
+    assert values == [_LEGAL_VALUE_FOR_KIND[kind]], f"{source}: LEGAL.VALUE {values!r}"
+
+
+@pytest.mark.parametrize("kind", sorted(_LEGAL_VALUE_FOR_KIND))
+@pytest.mark.parametrize("source", TIER1_SOURCES)
+def test_recorded_zip_is_refused_for_a_kind_swapped_celex(
+    source: str, kind: str, registry: dict[str, SourceConfig], cassette_dir: Path
+) -> None:
+    """A recorded Regulation must not be accepted when a Directive or Decision with the same
+    year and number is requested (F5). The own-kind case is the positive control."""
+    cfg = registry[source]
+    data, problems = _read_cassette(_cassette_path(cfg, cassette_dir), source, _REPO)
+    raw, more = (None, []) if problems else _zip_body(data, source)
+    assert raw is not None, "\n".join(problems + more)
+    cellar = _cellar()
+    celex = _kind_swapped(cfg.pipeline.celex_id, kind)
+    if celex == cfg.pipeline.celex_id:
+        assert cellar.read_formex_zip(raw, celex, cellar.load_cellar_settings())
+        return
+    with pytest.raises(SchemaDriftError, match="CELEX"):
+        cellar.read_formex_zip(raw, celex, cellar.load_cellar_settings())
 
 
 # ---------------------------------------------------------------------------

@@ -37,7 +37,11 @@ Contract the coder implements (the names below are part of it):
     is how the orchestrator calls ``fetch``). Each request starts at least
     ``1 / rate_limit_rps`` seconds after the previous one, measured with
     ``time.monotonic()`` (looked up on the ``time`` module at call time) and waited out
-    with ``asyncio.sleep``.
+    with ``asyncio.sleep``. This holds for N concurrent ``fetch`` coroutines in one loop
+    too, and when a sleep wakes early the limiter re-reads the clock and waits again: no
+    request is ever sent before its slot (red r4, lead ruling on b1e3a5b).
+  * ``reset_cellar_rate_limiter()`` forgets the last request, so the next request does
+    not wait; this module calls it around every test.
   * Redirects are handled by hand: exactly one 303 whose single ``Location`` is
     ``http(s)://publications.europa.eu/resource/cellar/<uuid>[.NNNN.NN]/zip``; the
     target is rewritten to https before it is fetched. Then one 200 with media type
@@ -55,6 +59,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import heapq
 import importlib
 import importlib.metadata
 import io
@@ -67,7 +72,7 @@ import time
 import unicodedata
 import warnings
 import zipfile
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import ModuleType
@@ -79,7 +84,7 @@ import yaml
 
 from legal_corpus_ingester.cleaners.xml_akn import MAX_XML_BYTES
 from legal_corpus_ingester.errors import SchemaDriftError, UpstreamNotFoundError
-from legal_corpus_ingester.fetchers.eurlex import EurLexFetcher
+from legal_corpus_ingester.fetchers.eurlex import EurLexFetcher, reset_cellar_rate_limiter
 from legal_corpus_ingester.sources.registry import load_all
 from legal_corpus_ingester.types import FetchResult
 
@@ -252,6 +257,20 @@ def formex_manifest(main: str | None, subs: list[str], *, main_extra: str = "", 
     return _xml("DOC", f"<BIB.DOC>{bib}</BIB.DOC><FMX>{main_el}{subs_el}</FMX>")
 
 
+# The document type sits in the DOC manifest as DOC.MAIN.PUB/LEGAL.VALUE: the recorded
+# AI Act, DSA and GDPR manifests each carry exactly one, "REG", right after LG.DOC. A base
+# CELEX's type letter maps to it (CELEX sector 3: R regulation, L directive, D decision).
+_LEGAL_VALUE_FOR_KIND = {"R": "REG", "L": "DIR", "D": "DEC"}
+
+
+def _legal(value: str) -> str:
+    """DOC.MAIN.PUB's leading children as Cellar records them."""
+    return f'<LG.DOC>EN</LG.DOC><LEGAL.VALUE>{value}</LEGAL.VALUE><DATE ISO="20240613">20240613</DATE>'
+
+
+_NO_LEGAL = "<LG.DOC>EN</LG.DOC>"
+
+
 @dataclass
 class Member:
     name: str
@@ -303,13 +322,19 @@ def ai_pkg(
     act_size: int = 4096,
     annexes: tuple[str, ...] = AI_ANNEXES,
     annex_size: int = 2048,
+    main_extra: str = _legal("REG"),
+    bib_extra: str = "",
 ) -> Pkg:
-    """AI Act shape: TOC, DOC manifest, ACT, ANNEXes. Annexes are zipped in REVERSE manifest order."""
+    """AI Act shape: TOC, DOC manifest, ACT, ANNEXes. Annexes are zipped in REVERSE manifest order.
+
+    ``main_extra`` is DOC.MAIN.PUB's content before REF.PHYS (the document type lives there);
+    ``bib_extra`` is appended to the manifest's BIB.DOC."""
     subs = list(annexes)
     act = formex_act(year, number, size=act_size) if act is None else act
+    manifest = formex_manifest(AI_ACT, subs, main_extra=main_extra, bib=_no_doc(year, number) + bib_extra)
     members = [
         Member(AI_TOC, formex_toc([AI_DOC, AI_ACT, *subs])),
-        Member(AI_DOC, formex_manifest(AI_ACT, subs, bib=_no_doc(year, number))),
+        Member(AI_DOC, manifest),
         Member(AI_ACT, act),
         *[Member(n, formex_annex(i, size=annex_size, seed=10 + i)) for i, n in reversed(list(enumerate(subs, 1)))],
     ]
@@ -322,7 +347,7 @@ def gdpr_pkg(
     """GDPR consolidated shape: CONS.ACT plus a ``.doc.xml`` manifest, no TOC."""
     members = [
         Member(GDPR_ACT, formex_cons(ref, start, size=act_size)),
-        Member(GDPR_DOC, formex_manifest(GDPR_ACT, [], main_extra="<NO.CELEX>32016R0679</NO.CELEX>")),
+        Member(GDPR_DOC, formex_manifest(GDPR_ACT, [], main_extra=_legal("REG") + "<NO.CELEX>32016R0679</NO.CELEX>")),
     ]
     return Pkg(celex, members, [(GDPR_ACT, "CONS.ACT")])
 
@@ -336,7 +361,7 @@ def pkg_for(celex: str, *, act_size: int = 4096) -> Pkg:
     assert match is not None, f"no synthetic package shape for CELEX {celex!r}"
     sector, year, kind, number, date = match.groups()
     if sector == "3" and date is None:
-        return ai_pkg(celex, year=year, number=number, act_size=act_size)
+        return ai_pkg(celex, year=year, number=number, act_size=act_size, main_extra=_legal(_LEGAL_VALUE_FOR_KIND[kind]))
     assert sector == "0" and date is not None, celex
     return gdpr_pkg(celex, ref=f"{year}{kind}{number}", start=date, act_size=act_size)
 
@@ -653,7 +678,7 @@ def _set(pkg: Pkg, name: str, **changes: Any) -> Pkg:
 
 
 def _manifest_pkg(main: str | None, subs: list[str], *extra: Member) -> Pkg:
-    pkg = ai_pkg().with_data(AI_DOC, formex_manifest(main, subs, bib=_no_doc("2024", "1689")))
+    pkg = ai_pkg().with_data(AI_DOC, formex_manifest(main, subs, main_extra=_legal("REG"), bib=_no_doc("2024", "1689")))
     return _extra(pkg, *extra)
 
 
@@ -780,6 +805,29 @@ ZIP_VECTORS: list[tuple[str, str, Callable[[], tuple[bytes, str, Any]], Any, str
     ("celex-fullwidth-year", "celex", _body(ai_pkg(year="２０２４")), None, "CELEX"),
     ("celex-no-doc-missing", "celex", _body(ai_pkg(act=formex_act(bib=""))), None, "CELEX"),
     ("celex-no-doc-outside-bib", "celex", _body(ai_pkg(act=formex_act(bib="", article_extra=_no_doc("2024", "1689")))), None, "CELEX"),
+    # --- document type (CELEX letter) vs the manifest's DOC.MAIN.PUB/LEGAL.VALUE (F5) ---
+    *[
+        (f"celex-kind-{kind}-matches-{value}", "celex", _ok(ai_pkg(f"32024{kind}1689", main_extra=_legal(value))), None, _ALLOW)
+        for kind, value in _LEGAL_VALUE_FOR_KIND.items()
+    ],
+    ("celex-kind-reg-requested-as-decision", "celex", _raw(ai_pkg().body(), "32024D1689"), None, "CELEX"),
+    ("celex-kind-reg-requested-as-directive", "celex", _raw(ai_pkg().body(), "32024L1689"), None, "CELEX"),
+    ("celex-kind-dir-package-for-regulation", "celex", _body(ai_pkg(main_extra=_legal("DIR"))), None, "CELEX"),
+    ("celex-kind-gdpr-number-as-directive", "celex", _raw(ai_pkg("32016R0679", year="2016", number="0679").body(), "32016L0679"), None, "CELEX"),
+    ("legal-value-missing", "celex", _body(ai_pkg(main_extra=_NO_LEGAL)), None, "CELEX"),
+    ("legal-value-empty", "celex", _body(ai_pkg(main_extra=_legal(""))), None, "CELEX"),
+    ("legal-value-empty-element", "celex", _body(ai_pkg(main_extra=_NO_LEGAL + "<LEGAL.VALUE/>")), None, "CELEX"),
+    ("legal-value-duplicate-same", "celex", _body(ai_pkg(main_extra=_legal("REG") + "<LEGAL.VALUE>REG</LEGAL.VALUE>")), None, "CELEX"),
+    ("legal-value-duplicate-match-first", "celex", _body(ai_pkg(main_extra=_legal("REG") + "<LEGAL.VALUE>DIR</LEGAL.VALUE>")), None, "CELEX"),
+    ("legal-value-duplicate-match-last", "celex", _body(ai_pkg(main_extra=_legal("DIR") + "<LEGAL.VALUE>REG</LEGAL.VALUE>")), None, "CELEX"),
+    ("legal-value-unknown", "celex", _body(ai_pkg(main_extra=_legal("XYZ"))), None, "CELEX"),
+    ("legal-value-lowercase", "celex", _body(ai_pkg(main_extra=_legal("reg"))), None, "CELEX"),
+    ("legal-value-padded", "celex", _body(ai_pkg(main_extra=_legal(" REG\n"))), None, "CELEX"),
+    ("legal-value-fullwidth", "celex", _body(ai_pkg(main_extra=_legal("ＲＥＧ"))), None, "CELEX"),
+    ("legal-value-zero-width", "celex", _body(ai_pkg(main_extra=_legal("RE\u200bG"))), None, "CELEX"),
+    ("legal-value-nested-child", "celex", _body(ai_pkg(main_extra=_legal("<X>REG</X>"))), None, "CELEX"),
+    ("legal-value-only-below-main", "celex", _body(ai_pkg(main_extra=_NO_LEGAL + "<X><LEGAL.VALUE>REG</LEGAL.VALUE></X>")), None, "CELEX"),
+    ("legal-value-only-in-bib", "celex", _body(ai_pkg(main_extra=_NO_LEGAL, bib_extra="<LEGAL.VALUE>REG</LEGAL.VALUE>")), None, "CELEX"),
     ("cons-ref-mismatch", "celex", _body(gdpr_pkg(ref="2016R0680")), None, "CELEX"),
     ("cons-start-date-mismatch", "celex", _body(gdpr_pkg(start="20180525")), None, "CELEX"),
     ("cons-info-missing", "celex", _body(replace(gdpr_pkg(), members=[Member(GDPR_ACT, formex_cons(info="")), gdpr_pkg().members[1]])), None, "CELEX"),
@@ -899,10 +947,17 @@ class FakeNet:
     routes: list[Route] = field(default_factory=list)
     requests: list[httpx.Request] = field(default_factory=list)
     sleeps: list[tuple[int, float]] = field(default_factory=list)
+    slept: float = 0.0  # virtual seconds added to the real monotonic clock by the fake sleep
+
+
+_REAL_MONOTONIC = time.monotonic
 
 
 @pytest.fixture
 def net(monkeypatch: pytest.MonkeyPatch) -> FakeNet:
+    """Fake transport plus a fake ``asyncio.sleep`` that advances ``time.monotonic`` by the
+    requested delay instead of waiting, so a limiter that re-checks the clock after waking
+    terminates at once rather than spinning in real time."""
     fake = FakeNet()
 
     async def handle(self: Any, request: httpx.Request) -> httpx.Response:
@@ -918,7 +973,10 @@ def net(monkeypatch: pytest.MonkeyPatch) -> FakeNet:
 
     async def sleep(delay: float, *_a: object, **_k: object) -> None:
         fake.sleeps.append((len(fake.requests), float(delay)))
+        assert len(fake.sleeps) <= _MAX_SLEEPS, "limiter keeps sleeping without progress"
+        fake.slept += max(0.0, float(delay))
 
+    monkeypatch.setattr(time, "monotonic", lambda: _REAL_MONOTONIC() + fake.slept)
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handle)
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", handle_sync)
     monkeypatch.setattr(asyncio, "sleep", sleep)
@@ -1006,23 +1064,74 @@ def test_fetch_waits_for_the_rate_limit_between_hops(net: FakeNet) -> None:
 # --- one rate limiter for every Cellar request in the process (lead ruling, 565e280) ---
 
 
+# Captured at import, before any fixture patches ``asyncio.sleep``.
+_REAL_SLEEP = asyncio.sleep
+# How early a simulated wake-up returns (asyncio can wake about one clock tick early).
+_EARLY_WAKE_SECONDS = 0.001
+# Concurrent fetch coroutines per event loop in the concurrency tests.
+_CONCURRENT_FETCHES = 4
+# A limiter that sleeps more often than this per test is looping without progress.
+_MAX_SLEEPS = 10_000
+
+
+@pytest.fixture(autouse=True)
+def _fresh_cellar_limiter() -> Iterator[None]:
+    """The limiter is process-wide; every test here starts and ends with it reset."""
+    reset_cellar_rate_limiter()
+    yield
+    reset_cellar_rate_limiter()
+
+
 @dataclass
 class VirtualClock:
+    """Virtual time with a timer queue. A sleeper parks on a future; a ticker task wakes
+    the earliest one once every runnable coroutine has yielded, so concurrent coroutines
+    really interleave and the clock only moves when everyone is waiting."""
+
     now: float
     stamps: list[float] = field(default_factory=list)
+    early: float = 0.0
+    timers: list[tuple[float, int, asyncio.Future[None]]] = field(default_factory=list)
+    seq: int = 0
+    peak_sleepers: int = 0
+    ticker: asyncio.Task[None] | None = None
+
+    async def tick(self) -> None:
+        try:
+            while True:
+                for _ in range(50):
+                    await _REAL_SLEEP(0)
+                if not self.timers:
+                    return
+                wake, _seq, fut = heapq.heappop(self.timers)
+                self.now = max(self.now, wake)
+                if not fut.done():
+                    fut.set_result(None)
+        finally:
+            self.ticker = None
 
 
 @pytest.fixture
 def vclock(net: FakeNet, monkeypatch: pytest.MonkeyPatch) -> VirtualClock:
     """Virtual time: ``time.monotonic`` reads it and the fake ``asyncio.sleep`` advances
-    it, so spacing is measured exactly and no test really sleeps. It starts at the real
-    monotonic time, so limiter state from other tests is never far in the future."""
+    it, so spacing is measured exactly and no test really sleeps. With ``early`` set, a
+    sleep longer than ``2 * early`` wakes ``early`` seconds before it was asked to."""
     clock = VirtualClock(now=time.monotonic())
 
     async def sleep(delay: float, *_a: object, **_k: object) -> None:
         net.sleeps.append((len(net.requests), float(delay)))
-        if delay > 0:
-            clock.now += float(delay)
+        assert len(net.sleeps) <= _MAX_SLEEPS, "limiter keeps sleeping without progress"
+        if delay <= 0:
+            await _REAL_SLEEP(0)
+            return
+        advance = delay - clock.early if delay > 2 * clock.early else delay
+        fut: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        clock.seq += 1
+        heapq.heappush(clock.timers, (clock.now + advance, clock.seq, fut))
+        clock.peak_sleepers = max(clock.peak_sleepers, len(clock.timers))
+        if clock.ticker is None:
+            clock.ticker = asyncio.get_running_loop().create_task(clock.tick())
+        await fut
 
     monkeypatch.setattr(asyncio, "sleep", sleep)
     monkeypatch.setattr(time, "monotonic", lambda: clock.now)
@@ -1056,6 +1165,78 @@ def _two_fetches(clock: VirtualClock, net: FakeNet, make: Callable[[], EurLexFet
     for _ in range(2):
         # One asyncio.run per fetch, as Orchestrator.run does for each source.
         assert asyncio.run(make().fetch(AI_ACT_CELEX)).raw_bytes == body
+
+
+def _router(clock: VirtualClock, body: bytes) -> Route:
+    """Answer by URL, not by request order, so interleaved fetches each get the right hop."""
+
+    def route(request: httpx.Request) -> httpx.Response:
+        clock.stamps.append(clock.now)
+        if str(request.url).startswith(CELEX_BASE):
+            return redirect()(request)
+        return zip_ok(body)(request)
+
+    return route
+
+
+def _concurrent_batches(clock: VirtualClock, net: FakeNet, loops: int) -> int:
+    """``loops`` separate ``asyncio.run`` loops, each running N fetches at once."""
+    body = ai_pkg().body()
+    total = 2 * _CONCURRENT_FETCHES * loops
+    net.routes = [_router(clock, body)] * total
+
+    async def batch() -> None:
+        results = await asyncio.gather(*(EurLexFetcher().fetch(AI_ACT_CELEX) for _ in range(_CONCURRENT_FETCHES)))
+        assert [r.raw_bytes for r in results] == [body] * _CONCURRENT_FETCHES
+
+    for _ in range(loops):
+        asyncio.run(batch())
+    # Self-check: the fetches really overlapped (several parked on the limiter at once).
+    assert clock.peak_sleepers >= 2, clock.peak_sleepers
+    return total
+
+
+@pytest.mark.parametrize("loops", [1, 2], ids=["one-loop", "two-asyncio-run-loops"])
+def test_concurrent_fetches_stay_spaced(net: FakeNet, vclock: VirtualClock, loops: int) -> None:
+    total = _concurrent_batches(vclock, net, loops)
+    _assert_spaced(vclock, _default_tunable("rate_limit_rps"), total)
+
+
+@pytest.mark.parametrize("concurrent", [False, True], ids=["consecutive", "concurrent"])
+def test_early_wake_never_sends_a_request_before_its_slot(
+    net: FakeNet, vclock: VirtualClock, concurrent: bool
+) -> None:
+    """A sleep that returns early must make the limiter re-check the clock and wait
+    again; the request may never go out before its slot."""
+    vclock.early = _EARLY_WAKE_SECONDS
+    if concurrent:
+        total = _concurrent_batches(vclock, net, 1)
+    else:
+        total = 4
+        _two_fetches(vclock, net, EurLexFetcher)
+    _assert_spaced(vclock, _default_tunable("rate_limit_rps"), total)
+
+
+def test_reset_clears_state_carried_from_an_earlier_request(net: FakeNet, vclock: VirtualClock) -> None:
+    interval = 1 / _default_tunable("rate_limit_rps")
+    body = ai_pkg().body()
+    net.routes = _stamped(vclock, redirect(), zip_ok(body), redirect(), zip_ok(body))
+    asyncio.run(EurLexFetcher().fetch(AI_ACT_CELEX))
+    # The autouse reset ran before this test: its first request did not wait.
+    assert [s for s in net.sleeps if s[0] == 0] == [], net.sleeps
+    reset_cellar_rate_limiter()
+    asyncio.run(EurLexFetcher().fetch(AI_ACT_CELEX))
+    # The first request after the reset does not wait for the earlier one ...
+    assert [s for s in net.sleeps if s[0] == 2] == [], net.sleeps
+    assert vclock.stamps[2] == vclock.stamps[1], vclock.stamps
+    # ... and the limiter still spaces the requests that follow it.
+    assert vclock.stamps[3] - vclock.stamps[2] >= interval - 1e-9, vclock.stamps
+
+
+def test_without_reset_the_next_fetch_waits(net: FakeNet, vclock: VirtualClock) -> None:
+    """Negative control for the reset test: the same two fetches, no reset, do wait."""
+    _two_fetches(vclock, net, EurLexFetcher)
+    assert [s for s in net.sleeps if s[0] == 2 and s[1] > 0] != [], net.sleeps
 
 
 def test_rate_limit_holds_across_consecutive_fetches(net: FakeNet, vclock: VirtualClock) -> None:
@@ -1265,6 +1446,7 @@ _SECOND_HOP: tuple[tuple[str, Callable[[], Route], type[Exception] | None], ...]
     ("html-body-zip-type", lambda: zip_ok(b"<html>blocked</html>"), SchemaDriftError),
     ("empty-body", lambda: zip_ok(b""), SchemaDriftError),
     ("celex-mismatch", lambda: zip_ok(ai_pkg(number="1688").body()), SchemaDriftError),
+    ("celex-kind-mismatch", lambda: zip_ok(ai_pkg(main_extra=_legal("DEC")).body()), SchemaDriftError),
 )
 
 
