@@ -33,7 +33,8 @@ I. `fetch --dry-run` of an unsigned source exits 7, offline, as the real fetch d
 Round 8 (2026-10-13, grumpy HIGH at cli.py:415): `refresh` publishes ONE combined calver bundle
 per run through TermsAnalysisPublisher: `out/current` is a relative symlink to a `YYYY.M.N` dir
 that `scripts/detect_bundle_change.py` accepts. Any failed source means no new bundle and no
-repoint; a later successful run makes a new version that detect reports as changed.
+repoint. Round 8b: a second run with identical content publishes nothing new (detect: unchanged);
+one with changed content makes a newer version that detect reports as changed.
 
 The card's `--out <tmp>` is replaced by the `Settings.out_dir` env var (ruling 3).
 """
@@ -316,6 +317,8 @@ class _Net:
     licence_pages: dict[str, bytes] = field(default_factory=dict)
     # CELEX ids EUR-Lex answers 404 for: one source's fetch fails, the others are served.
     missing_celex: set[str] = field(default_factory=set)
+    # CELEX id -> XML body served instead of the workspace body (one source's text changed).
+    bodies: dict[str, bytes] = field(default_factory=dict)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         url = request.url
@@ -323,9 +326,10 @@ class _Net:
         if ws is not None:
             if url.host == _EURLEX_HOST and "/XML/" in url.path and request.method == "GET":
                 self.served.append(request)
-                if str(url.params.get("uri", "")).removeprefix("CELEX:") in self.missing_celex:
+                celex = str(url.params.get("uri", "")).removeprefix("CELEX:")
+                if celex in self.missing_celex:
                     return httpx.Response(404, request=request)
-                return httpx.Response(200, content=ws.body, request=request)
+                return httpx.Response(200, content=self.bodies.get(celex, ws.body), request=request)
             if request.method == "POST" and str(url) == ws.localai_url.rstrip("/") + "/embeddings":
                 self.served.append(request)
                 payload = json.loads(request.content)
@@ -846,20 +850,56 @@ def test_partial_failure_table_has_a_row_per_failure_stage_and_both_ends() -> No
     assert hows == {"unsign", "missing"} and positions == {0, -1}, _PARTIAL_FAILURES
 
 
-@pytest.mark.parametrize("between_runs", ["keep-current", "current-removed"])
-def test_second_refresh_publishes_a_new_version_detect_reports_changed(
-    ws_all: _Workspace, net: _Net, between_runs: str
-) -> None:
-    # Round 8 item 4. "current-removed": a lost link must not make run 2 reuse run 1's version
-    # dir (the calver comes from what is on disk, not from the link alone).
-    ws = ws_all
+def _first_run_recorded(ws: _Workspace, net: _Net) -> tuple[str, str]:
+    """Run 1 of item 4: a clean refresh, then the workflow's record step. Returns (v1, digest)."""
     net.upstream = ws
     first = _invoke(ws.argv("refresh", "--all"))
     assert first.exit_code == 0, _why(first)
     v1 = _assert_current_bundle(ws, _repo_names())
-    v1_digest = _tree_digest(ws.out / v1)
     seed, _ = _bundle_script(ws, "record")
     assert seed.returncode == 0, seed.stderr
+    return v1, _tree_digest(ws.out / v1)
+
+
+def test_identical_second_refresh_publishes_nothing_new(ws_all: _Workspace, net: _Net) -> None:
+    # Round 8b item 4a: the same fixtures again. Same chunk texts and the same corpus/ and index/
+    # bytes, so no new version, no repoint, bundle 1's bytes as they were, and no weekly
+    # "new bundle" alert: detect against run 1's record says changed=false.
+    ws = ws_all
+    v1, _ = _first_run_recorded(ws, net)
+    before = _published_state(ws.out)
+    second = _invoke(ws.argv("refresh", "--all"))
+    assert second.exit_code == 0, _why(second)
+    assert _published_state(ws.out) == before, (sorted(before), sorted(_published_state(ws.out)))
+    assert _bundle_versions(ws.out) == {v1}, _bundle_versions(ws.out)
+    assert os.readlink(ws.out / _CURRENT) == v1
+    detect, outputs = _bundle_script(ws, "detect", "--require-state")
+    assert detect.returncode == 0, detect.stderr
+    assert outputs == {"changed": "false", "new_target": v1}, outputs
+    assert net.attempts == [], net.attempts
+    assert _is_empty(ws.cwd)
+
+
+def _changed_body(body: bytes) -> bytes:
+    # One more sentence inside the first paragraph: the cleaned text, and so a chunk, changes.
+    changed = body.replace(b"</p>", b" Amended under test.</p>", 1)
+    assert changed != body, "the fixture has no paragraph to change"
+    return changed
+
+
+@pytest.mark.parametrize("between_runs", ["keep-current", "current-removed"])
+def test_changed_second_refresh_publishes_a_new_version_detect_reports_changed(
+    ws_all: _Workspace, net: _Net, between_runs: str
+) -> None:
+    # Round 8b item 4b: one source's text changed (and re-signed for its new artifact sha).
+    # "current-removed": a lost link must not make run 2 reuse run 1's version dir (the calver
+    # comes from what is on disk, not from the link alone).
+    ws = ws_all
+    v1, v1_digest = _first_run_recorded(ws, net)
+    victim = _repo_names()[0]
+    changed = _changed_body(ws.body)
+    net.bodies[load_all(ws.sources)[victim].pipeline.celex_id] = changed
+    ws.sign(victim, signed_artifact_sha256=hashlib.sha256(changed).hexdigest())
     if between_runs == "current-removed":
         (ws.out / _CURRENT).unlink()
 
