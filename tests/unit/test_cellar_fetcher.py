@@ -9,12 +9,17 @@ Contract the coder implements (the names below are part of it):
 
 ``legal_corpus_ingester.fetchers.cellar``
   * ``CellarSettings``: immutable, int fields ``max_zip_bytes``, ``max_members``,
-    ``max_member_bytes``, ``max_total_bytes`` and ``max_ratio`` (F13: caps are config).
+    ``max_member_bytes``, ``max_total_bytes`` and ``max_ratio`` (F13: caps are config),
+    plus the two tunables ``timeout_seconds`` and ``rate_limit_rps`` (int or float, never
+    bool; round 3, lead ruling on 565e280).
   * ``load_cellar_settings(path: Path | None = None) -> CellarSettings``. The default
     file is ``config/fetchers/cellar.yaml``: a mapping whose keys are exactly the field
-    names, each a positive int, with ``max_member_bytes <= max_total_bytes``. Anything
+    names, each cap a positive int, with ``max_member_bytes <= max_total_bytes``;
+    ``0 < timeout_seconds <= 120`` and ``0.01 <= rate_limit_rps <= 0.5`` (finite). Anything
     else raises ``ValueError`` naming the key; a missing file raises
-    ``FileNotFoundError``. No message carries an absolute path.
+    ``FileNotFoundError``. No message carries an absolute path. The Cellar host, the
+    ``/resource/celex/`` base and the redirect pattern are code constants (F3); the
+    config never carries them.
   * ``read_formex_zip(body, celex_id, settings) -> tuple[FormexPart, ...]`` validates
     the zip in memory and returns the act, then its annexes, in the manifest's
     ``REF.PHYS`` order (never zip order). ``FormexPart`` has ``name``, ``root`` (the
@@ -25,8 +30,14 @@ Contract the coder implements (the names below are part of it):
 ``EurLexFetcher(settings: CellarSettings | None = None)``
   * GET ``https://publications.europa.eu/resource/celex/<id>`` with
     ``Accept: application/zip;mtype=fmx4``, ``Accept-Language: eng`` and a
-    ``legal-corpus-ingester/<version>`` User-Agent; at most 0.5 requests per second,
-    waiting through ``asyncio.sleep``.
+    ``legal-corpus-ingester/<version>`` User-Agent; every request carries
+    ``timeout_seconds`` for connect, read, write and pool.
+  * Rate limit: ONE limiter shared by every Cellar request in the process (all hops, all
+    ``fetch`` calls, all fetcher instances, across separate ``asyncio.run`` loops, which
+    is how the orchestrator calls ``fetch``). Each request starts at least
+    ``1 / rate_limit_rps`` seconds after the previous one, measured with
+    ``time.monotonic()`` (looked up on the ``time`` module at call time) and waited out
+    with ``asyncio.sleep``.
   * Redirects are handled by hand: exactly one 303 whose single ``Location`` is
     ``http(s)://publications.europa.eu/resource/cellar/<uuid>[.NNNN.NN]/zip``; the
     target is rewritten to https before it is fetched. Then one 200 with media type
@@ -52,6 +63,7 @@ import random
 import re
 import stat
 import struct
+import time
 import unicodedata
 import warnings
 import zipfile
@@ -81,6 +93,14 @@ _CAP_FIELDS: tuple[str, ...] = (
     "max_total_bytes",
     "max_ratio",
 )
+# Round 3 (lead ruling on 565e280): the two tunables that moved from code to config.
+_TUNABLE_FIELDS: tuple[str, ...] = ("timeout_seconds", "rate_limit_rps")
+# Validation policy, not config values (these bound what the config may say):
+# the ruling promises EUR-Lex at most 0.5 rps, so config may slow the fetcher down but
+# never speed it up; below 0.01 rps (100 s per request) or above a 120 s timeout a
+# typo would stall `refresh` for the five EU sources.
+_TIMEOUT_MAX_SECONDS = 120
+_RATE_MIN_RPS = 0.01
 
 # Ruling literals (2026-10-13, #96 section).
 CELEX_BASE = "https://publications.europa.eu/resource/celex/"
@@ -397,7 +417,7 @@ def _default_mapping() -> dict[str, Any]:
     return data
 
 
-def settings_with(tmp_path: Path, **overrides: int) -> Any:
+def settings_with(tmp_path: Path, **overrides: float) -> Any:
     """Load settings from a tmp copy of the default YAML with ``overrides`` applied."""
     path = tmp_path / f"cellar-{len(list(tmp_path.glob('cellar-*.yaml')))}.yaml"
     path.write_text(yaml.safe_dump({**_default_mapping(), **overrides}), encoding="utf-8")
@@ -417,7 +437,7 @@ def test_default_config_loads_with_positive_int_caps() -> None:
 def test_default_config_path_is_the_repo_file() -> None:
     cellar = _cellar()
     assert cellar.load_cellar_settings() == cellar.load_cellar_settings(_DEFAULT_CONFIG)
-    assert set(_default_mapping()) == set(_CAP_FIELDS)
+    assert set(_default_mapping()) == set(_CAP_FIELDS) | set(_TUNABLE_FIELDS)
 
 
 def test_settings_are_immutable() -> None:
@@ -436,6 +456,32 @@ _BAD_VALUES: tuple[tuple[str, object], ...] = (
 )
 
 
+def _tunable_bad_values() -> list[tuple[str, str, object]]:
+    """(field, label, value) for the two tunables: type, sign, non-finite and out-of-bound."""
+    common: list[tuple[str, object]] = [
+        ("zero", 0),
+        ("negative", -1),
+        ("negative-float", -0.5),
+        ("bool", True),
+        ("string", "1"),
+        ("null", None),
+        ("list", [1]),
+        ("nan", float("nan")),
+        ("inf", float("inf")),
+        ("negative-inf", float("-inf")),
+    ]
+    out = [(name, label, value) for name in _TUNABLE_FIELDS for label, value in common]
+    out += [
+        ("timeout_seconds", "above-max", _TIMEOUT_MAX_SECONDS + 1),
+        ("timeout_seconds", "absurd", 10**9),
+        ("rate_limit_rps", "above-ruling-rate", RATE_RPS + 0.01),
+        ("rate_limit_rps", "absurd", 1000),
+        ("rate_limit_rps", "below-min", _RATE_MIN_RPS * 0.99),
+        ("rate_limit_rps", "near-zero", 1e-12),
+    ]
+    return out
+
+
 def _config_vectors() -> list[tuple[str, str | None, Callable[[dict[str, Any]], str]]]:
     """(id, field it attacks or None, render(default mapping) -> YAML text)."""
     vectors: list[tuple[str, str | None, Callable[[dict[str, Any]], str]]] = []
@@ -444,6 +490,12 @@ def _config_vectors() -> list[tuple[str, str | None, Callable[[dict[str, Any]], 
             vectors.append(
                 (f"{name}-{label}", name, lambda d, n=name, v=value: yaml.safe_dump({**d, n: v}))
             )
+        vectors.append(
+            (f"{name}-missing", name, lambda d, n=name: yaml.safe_dump({k: v for k, v in d.items() if k != n}))
+        )
+    for name, label, value in _tunable_bad_values():
+        vectors.append((f"{name}-{label}", name, lambda d, n=name, v=value: yaml.safe_dump({**d, n: v})))
+    for name in _TUNABLE_FIELDS:
         vectors.append(
             (f"{name}-missing", name, lambda d, n=name: yaml.safe_dump({k: v for k, v in d.items() if k != n}))
         )
@@ -466,7 +518,7 @@ CONFIG_VECTORS = _config_vectors()
 
 def test_config_vectors_cover_every_field() -> None:
     attacked = {f for _id, f, _r in CONFIG_VECTORS if f is not None}
-    assert set(_CAP_FIELDS) <= attacked
+    assert set(_CAP_FIELDS) | set(_TUNABLE_FIELDS) <= attacked
     ids = [v[0] for v in CONFIG_VECTORS]
     assert len(ids) == len(set(ids))
 
@@ -493,6 +545,74 @@ def test_good_config_override_loads(tmp_path: Path) -> None:
 def test_missing_config_file_fails_closed(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         _cellar().load_cellar_settings(tmp_path / "absent.yaml")
+
+
+def _default_tunable(name: str) -> float:
+    data = _default_mapping()
+    assert name in data, f"config/fetchers/cellar.yaml has no {name} key (lead ruling: tunables are config)"
+    return data[name]
+
+
+def test_default_config_tunables_load_within_bounds() -> None:
+    settings = _cellar().load_cellar_settings()
+    for name in _TUNABLE_FIELDS:
+        assert getattr(settings, name) == _default_tunable(name), name
+    timeout, rate = settings.timeout_seconds, settings.rate_limit_rps
+    assert type(timeout) in (int, float) and 0 < timeout <= _TIMEOUT_MAX_SECONDS, timeout
+    assert type(rate) in (int, float) and _RATE_MIN_RPS <= rate <= RATE_RPS, rate
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("timeout_seconds", _TIMEOUT_MAX_SECONDS),
+        ("timeout_seconds", 7.5),
+        ("rate_limit_rps", RATE_RPS),
+        ("rate_limit_rps", _RATE_MIN_RPS),
+    ],
+    ids=["timeout-at-max", "timeout-float", "rate-at-ruling-max", "rate-at-min"],
+)
+def test_tunable_values_at_the_bounds_load(tmp_path: Path, name: str, value: float) -> None:
+    """Positive controls for the tunable vectors: the edges themselves are legal."""
+    _default_tunable(name)
+    assert getattr(settings_with(tmp_path, **{name: value}), name) == value
+
+
+# F3: the SSRF allowlist (host, CELEX base, redirect pattern) stays in code. Config is
+# operator-editable, so a key there would let a config edit widen where the fetcher goes.
+_SSRF_KEY_RE = re.compile(r"host|url|uri|base|location|redirect|pattern|domain|scheme|origin|allow|endpoint", re.I)
+_SSRF_KEYS: tuple[tuple[str, object], ...] = (
+    ("cellar_host", "evil.test"),
+    ("celex_base_url", "https://evil.test/resource/celex/"),
+    ("base_url", "http://169.254.169.254/"),
+    ("location_pattern", ".*"),
+    ("redirect_pattern", "https?://.*"),
+    ("allowed_hosts", ["evil.test"]),
+)
+
+
+def test_cellar_config_carries_no_host_url_or_redirect_keys() -> None:
+    data = _default_mapping()
+    assert [k for k in data if _SSRF_KEY_RE.search(str(k))] == []
+    # Every value is a plain number: no string can smuggle a host or a pattern in.
+    assert all(type(v) in (int, float) for v in data.values()), data
+
+
+def test_ssrf_key_regex_catches_every_listed_key() -> None:
+    """Contract for the static check above: each attack key below would trip it."""
+    assert all(_SSRF_KEY_RE.search(key) for key, _ in _SSRF_KEYS)
+    assert not any(_SSRF_KEY_RE.search(f) for f in (*_CAP_FIELDS, *_TUNABLE_FIELDS))
+
+
+@pytest.mark.parametrize(("key", "value"), _SSRF_KEYS, ids=[k for k, _ in _SSRF_KEYS])
+def test_config_cannot_widen_the_ssrf_allowlist(tmp_path: Path, key: str, value: object) -> None:
+    path = tmp_path / "cellar.yaml"
+    path.write_text(yaml.safe_dump({**_default_mapping(), key: value}), encoding="utf-8")
+    with pytest.raises(ValueError) as excinfo:
+        _cellar().load_cellar_settings(path)
+    msg = str(excinfo.value)
+    _assert_safe_message(msg, str(tmp_path))
+    assert key in msg, msg
 
 
 # ---------------------------------------------------------------------------
@@ -881,6 +1001,108 @@ def test_fetch_waits_for_the_rate_limit_between_hops(net: FakeNet) -> None:
     between = sum(delay for count, delay in net.sleeps if count == 1)
     # The fake sleep returns at once, so the wall time between hops is a few ms at most.
     assert between >= 1 / RATE_RPS - 0.25, net.sleeps
+
+
+# --- one rate limiter for every Cellar request in the process (lead ruling, 565e280) ---
+
+
+@dataclass
+class VirtualClock:
+    now: float
+    stamps: list[float] = field(default_factory=list)
+
+
+@pytest.fixture
+def vclock(net: FakeNet, monkeypatch: pytest.MonkeyPatch) -> VirtualClock:
+    """Virtual time: ``time.monotonic`` reads it and the fake ``asyncio.sleep`` advances
+    it, so spacing is measured exactly and no test really sleeps. It starts at the real
+    monotonic time, so limiter state from other tests is never far in the future."""
+    clock = VirtualClock(now=time.monotonic())
+
+    async def sleep(delay: float, *_a: object, **_k: object) -> None:
+        net.sleeps.append((len(net.requests), float(delay)))
+        if delay > 0:
+            clock.now += float(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    monkeypatch.setattr(time, "monotonic", lambda: clock.now)
+    return clock
+
+
+def _stamped(clock: VirtualClock, *routes: Route) -> list[Route]:
+    """Wrap each route so the virtual time of every request is recorded."""
+
+    def wrap(route: Route) -> Route:
+        def stamped(request: httpx.Request) -> httpx.Response:
+            clock.stamps.append(clock.now)
+            return route(request)
+
+        return stamped
+
+    return [wrap(r) for r in routes]
+
+
+def _assert_spaced(clock: VirtualClock, rps: float, count: int) -> None:
+    assert len(clock.stamps) == count, clock.stamps
+    gaps = [b - a for a, b in zip(clock.stamps, clock.stamps[1:])]
+    assert all(gap >= 1 / rps - 1e-9 for gap in gaps), f"gaps {gaps} under {1 / rps} s"
+
+
+def _two_fetches(clock: VirtualClock, net: FakeNet, make: Callable[[], EurLexFetcher]) -> None:
+    """Two fetches; ``make`` is called right before each one, so a second instance is
+    built after the first fetch (a limiter reset in ``__init__`` cannot hide)."""
+    body = ai_pkg().body()
+    net.routes = _stamped(clock, redirect(), zip_ok(body), redirect(), zip_ok(body))
+    for _ in range(2):
+        # One asyncio.run per fetch, as Orchestrator.run does for each source.
+        assert asyncio.run(make().fetch(AI_ACT_CELEX)).raw_bytes == body
+
+
+def test_rate_limit_holds_across_consecutive_fetches(net: FakeNet, vclock: VirtualClock) -> None:
+    fetcher = EurLexFetcher()
+    _two_fetches(vclock, net, lambda: fetcher)
+    _assert_spaced(vclock, _default_tunable("rate_limit_rps"), 4)
+
+
+def test_rate_limit_is_shared_by_a_second_fetcher_instance(net: FakeNet, vclock: VirtualClock) -> None:
+    _two_fetches(vclock, net, EurLexFetcher)
+    _assert_spaced(vclock, _default_tunable("rate_limit_rps"), 4)
+
+
+def test_configured_rate_sets_the_spacing(net: FakeNet, vclock: VirtualClock, tmp_path: Path) -> None:
+    default = _default_tunable("rate_limit_rps")
+    slower = max(default / 2, _RATE_MIN_RPS)
+    assert slower != default
+    settings = settings_with(tmp_path, rate_limit_rps=slower)
+    _two_fetches(vclock, net, lambda: EurLexFetcher(settings=settings))
+    _assert_spaced(vclock, slower, 4)
+
+
+def test_429_retry_goes_through_the_shared_limiter(net: FakeNet, vclock: VirtualClock, tmp_path: Path) -> None:
+    """A retry is a Cellar request too; with a slow configured rate the backoff alone is
+    not enough spacing."""
+    slower = max(_default_tunable("rate_limit_rps") / 4, _RATE_MIN_RPS)
+    settings = settings_with(tmp_path, rate_limit_rps=slower)
+    body = ai_pkg().body()
+    net.routes = _stamped(vclock, zip_ok(b"", content_type="text/plain", status=429), redirect(), zip_ok(body))
+    assert asyncio.run(EurLexFetcher(settings=settings).fetch(AI_ACT_CELEX)).raw_bytes == body
+    _assert_spaced(vclock, slower, 3)
+
+
+@pytest.mark.parametrize("override", [False, True], ids=["default-config", "tmp-config-halved"])
+def test_configured_timeout_reaches_every_request(net: FakeNet, tmp_path: Path, override: bool) -> None:
+    expected = _default_tunable("timeout_seconds")
+    settings = None
+    if override:
+        expected = expected / 2
+        settings = settings_with(tmp_path, timeout_seconds=expected)
+    net.routes = [redirect(), zip_ok(ai_pkg().body())]
+    _run(AI_ACT_CELEX, settings)
+    assert len(net.requests) == 2
+    for req in net.requests:
+        timeouts = req.extensions.get("timeout", {})
+        assert set(timeouts) == {"connect", "read", "write", "pool"}, timeouts
+        assert all(v == expected for v in timeouts.values()), (expected, timeouts)
 
 
 def _eurlex_sources() -> list[Any]:
