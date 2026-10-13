@@ -81,7 +81,8 @@ from legal_corpus_ingester.pipeline.approval_gate import (
 from legal_corpus_ingester.pipeline.manifest import MANIFEST_FILENAME, Manifest
 from legal_corpus_ingester.pipeline.orchestrator import Orchestrator as RealOrchestrator
 from legal_corpus_ingester.pipeline.state import STAGES, CheckpointState, CheckpointStore
-from legal_corpus_ingester.provenance.license_audit import DEFAULT_STATE_FILE as LICENSE_BASELINE_FILE
+from legal_corpus_ingester.provenance import license_audit
+from legal_corpus_ingester.provenance.license_audit import DEFAULT_STATE_FILE as AUDIT_BASELINE_FILE
 from legal_corpus_ingester.publishers.base import PublishReceipt
 from legal_corpus_ingester.sources.registry import load_all
 from tests.cli.helpers import PUBLIC_EXIT_CODES, strip_ansi
@@ -130,6 +131,14 @@ _SOURCE_FAILED = PUBLIC_EXIT_CODES["EXIT_SOURCE_FAILED"]
 _NOT_APPROVED_STAGE = "not_approved"
 
 _UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+
+
+def _refresh_baseline_name() -> str:
+    # Round 6 P: a named constant beside DEFAULT_STATE_FILE in provenance.license_audit, so the
+    # tests never restate the file name (F13). Missing today: that is the red.
+    constant = getattr(license_audit, "REFRESH_BASELINE_FILE", None)
+    assert constant is not None, "license_audit names no REFRESH_BASELINE_FILE constant (ruling P)"
+    return Path(constant).name
 
 
 def _repo_names() -> list[str]:
@@ -294,6 +303,8 @@ class _Net:
     attempts: list[str] = field(default_factory=list)
     served: list[httpx.Request] = field(default_factory=list)
     upstream: _Workspace | None = None
+    # URL -> body served to the sync client (audit-license's live licence fetch).
+    licence_pages: dict[str, bytes] = field(default_factory=dict)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         url = request.url
@@ -330,6 +341,9 @@ def net(monkeypatch: pytest.MonkeyPatch) -> Iterator[_Net]:
         return record.handle(request)
 
     def sync_send(client: httpx.Client, request: httpx.Request, *a: Any, **k: Any) -> httpx.Response:
+        if request.method == "GET" and str(request.url) in record.licence_pages:
+            record.served.append(request)
+            return httpx.Response(200, content=record.licence_pages[str(request.url)], request=request)
         record.attempts.append(f"sync {request.method} {request.url}")
         raise httpx.ConnectError("network blocked by test", request=request)
 
@@ -514,7 +528,8 @@ def test_orchestrator_dirs_come_from_settings(ws_all: _Workspace, spy: _Spy, net
         baseline = bound.arguments.get("license_state_file")
         assert baseline is not None, "refresh composes the Orchestrator without license_state_file"
         baselines.add(Path(baseline).resolve())
-    assert baselines == {ws.state.resolve() / LICENSE_BASELINE_FILE.name}, baselines
+    # Round 6 P: the gate's own file, never audit-license's license-hashes.json.
+    assert baselines == {ws.state.resolve() / _refresh_baseline_name()}, baselines
     assert _is_empty(ws.cwd)
 
 
@@ -567,29 +582,16 @@ def _baseline_hash(path: Path, name: str) -> str:
 
 def test_refresh_spdx_drift_blocks_publish_and_names_the_source(ws_all: _Workspace, net: _Net) -> None:
     # Round 5 J: the real pipeline, twice. Run 1 records each source's licence baseline in the
-    # configured state dir; audit-license reads that same file by default; an SPDX change on a
-    # signed source then blocks its publish, names it, and exits 8 while the others publish.
+    # configured state dir; an SPDX change on a signed source then blocks its publish, names it,
+    # checkpoints license_failed (round 6 Q) and exits 8 while the others publish.
     ws = ws_all
     net.upstream = ws
     first = _invoke(ws.argv("refresh", "--all"))
     assert first.exit_code == 0, _why(first)
-    baseline = ws.state / LICENSE_BASELINE_FILE.name
+    baseline = ws.state / _refresh_baseline_name()
     assert baseline.is_file(), "refresh recorded no licence baseline in INGESTER_STATE_DIR"
     recorded = json.loads(baseline.read_text(encoding="utf-8"))
     assert set(recorded) == set(_repo_names()), sorted(recorded)
-
-    # audit-license with no --state-file reads the refresh baseline, not a cwd-relative decoy.
-    decoy = ws.cwd / LICENSE_BASELINE_FILE
-    decoy.parent.mkdir(parents=True)
-    decoy_hash = "d" * 64
-    assert decoy_hash[:12] != _baseline_hash(baseline, "eurlex_gdpr")[:12]
-    decoy.write_text(json.dumps({"eurlex_gdpr": {"hash": decoy_hash, "spdx": "CC-BY-4.0"}}), encoding="utf-8")
-    audit = _invoke(ws.argv("audit-license", "eurlex_gdpr", "--offline"))
-    assert audit.exit_code == 0, _why(audit)
-    assert "BASELINE_ONLY" in audit.stdout, _why(audit)
-    assert _baseline_hash(baseline, "eurlex_gdpr")[:12] in audit.stdout, _why(audit)
-    assert decoy_hash[:12] not in audit.stdout, "audit-license read the cwd-relative default"
-    shutil.rmtree(ws.cwd / LICENSE_BASELINE_FILE.parts[0])
 
     # The stored SPDX differs from the one the fetcher reports: SPDX_DRIFT for eurlex_gdpr only.
     recorded["eurlex_gdpr"]["spdx"] = _HOSTILE_SPDX
@@ -601,14 +603,95 @@ def test_refresh_spdx_drift_blocks_publish_and_names_the_source(ws_all: _Workspa
     published = {path.parent.name for path in ws.out.rglob(MANIFEST_FILENAME)}
     assert "eurlex_gdpr" not in published, "a source with SPDX drift was published"
     assert published == set(_repo_names()) - {"eurlex_gdpr"}, published
+    # Round 6 Q (ruling 3): the blocked source checkpoints its own failure, with the reason.
     state = CheckpointStore(ws.state).load("eurlex_gdpr")
-    assert state is None or state.stage != "done", state
+    assert state is not None and state.stage == "license_failed", state
+    assert state.error.strip(), "the license_failed checkpoint carries no error"
     # The drifted baseline is kept for review, not overwritten by the blocked run.
     assert json.loads(baseline.read_text(encoding="utf-8"))["eurlex_gdpr"]["spdx"] == _HOSTILE_SPDX
     assert "::error::" not in _output(second), _why(second)
     _assert_safe_output(second, str(ws.root), str(ws.root.resolve()))
     assert net.attempts == [], net.attempts
     assert _is_empty(ws.cwd)
+
+
+# ---------------------------------------------------------------------------
+# Round 6 P: one state dir, two baseline files. audit-license hashes the licence page and the
+# refresh gate hashes the act's text; sharing a file would make each overwrite the other.
+# ---------------------------------------------------------------------------
+
+_LICENCE_PAGE = b"<html><body>Licence notice served to audit-license under test</body></html>"
+
+
+def _serve_licence_pages(ws: _Workspace, net: _Net) -> None:
+    net.upstream = ws
+    for cfg in load_all(ws.sources).values():
+        if cfg.license.url:
+            net.licence_pages[cfg.license.url] = _LICENCE_PAGE
+
+
+def test_baseline_files_are_two_named_constants() -> None:
+    # The ruled name, stated once here; every other test reads the constant.
+    assert _refresh_baseline_name() == "refresh-license-baseline.json"
+    assert _refresh_baseline_name() != AUDIT_BASELINE_FILE.name
+
+
+def test_refresh_and_audit_license_never_touch_each_others_baseline(ws_all: _Workspace, net: _Net) -> None:
+    ws = ws_all
+    _serve_licence_pages(ws, net)
+    audit_file = ws.state / AUDIT_BASELINE_FILE.name
+    refresh_file = ws.state / _refresh_baseline_name()
+    # audit-license records its own baseline first, by default under INGESTER_STATE_DIR.
+    first_audit = _invoke(ws.argv("audit-license", "eurlex_gdpr", "--update-baseline"))
+    assert first_audit.exit_code == 0, _why(first_audit)
+    assert audit_file.is_file(), "audit-license did not record under INGESTER_STATE_DIR"
+    audit_bytes = audit_file.read_bytes()
+
+    refresh = _invoke(ws.argv("refresh", "--all"))
+    assert refresh.exit_code == 0, _why(refresh)
+    assert audit_file.read_bytes() == audit_bytes, "refresh rewrote audit-license's baseline"
+    assert refresh_file.is_file(), "refresh recorded no baseline of its own"
+    refresh_bytes = refresh_file.read_bytes()
+
+    # Offline: the stored hash comes from the state-dir file, not a cwd-relative decoy.
+    stored = json.loads(audit_bytes)["eurlex_gdpr"]["hash"]
+    decoy = ws.cwd / AUDIT_BASELINE_FILE
+    decoy.parent.mkdir(parents=True)
+    decoy_hash = "d" * 64
+    assert decoy_hash[:12] != stored[:12]
+    decoy.write_text(json.dumps({"eurlex_gdpr": {"hash": decoy_hash, "spdx": "CC-BY-4.0"}}), encoding="utf-8")
+    offline = _invoke(ws.argv("audit-license", "eurlex_gdpr", "--offline"))
+    assert offline.exit_code == 0, _why(offline)
+    assert stored[:12] in offline.stdout and decoy_hash[:12] not in offline.stdout, _why(offline)
+    shutil.rmtree(ws.cwd / AUDIT_BASELINE_FILE.parts[0])
+
+    # A live audit that writes (a new source's baseline) leaves the refresh file untouched.
+    live = _invoke(ws.argv("audit-license", "eurlex_dsa", "--update-baseline"))
+    assert live.exit_code == 0, _why(live)
+    assert "eurlex_dsa" in json.loads(audit_file.read_text(encoding="utf-8"))
+    assert refresh_file.read_bytes() == refresh_bytes, "audit-license rewrote the refresh baseline"
+    assert net.attempts == [], net.attempts
+    assert _is_empty(ws.cwd)
+
+
+def test_unchanged_document_never_warns_text_drift_across_audit_runs(ws_all: _Workspace, net: _Net) -> None:
+    # The ping-pong regression: audit-license, refresh, audit-license, refresh, all on an
+    # unchanged document and licence page. With one shared file each tool reads the other's hash:
+    # refresh warns text drift and the next audit sees DRIFT, on every run.
+    ws = ws_all
+    _serve_licence_pages(ws, net)
+    results = []
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        for _ in range(2):
+            results.append(_invoke(ws.argv("audit-license", "eurlex_gdpr", "--update-baseline")))
+            results.append(_invoke(ws.argv("refresh", "--all")))
+    assert (ws.state / _refresh_baseline_name()).is_file(), "refresh recorded no baseline"
+    drift = [str(w.message) for w in caught if "License text changed" in str(w.message)]
+    assert drift == [], drift
+    for result in results:
+        assert result.exit_code == 0, _why(result)
+    assert net.attempts == [], net.attempts
 
 
 def test_refresh_dry_run_real_pipeline_stays_offline(ws: _Workspace, net: _Net) -> None:
