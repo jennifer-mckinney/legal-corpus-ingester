@@ -11,15 +11,27 @@ Lead rulings of 2026-10-13 that override the card text, each pinned below:
 5. Fail loudly: no source processed, or an orchestrator failure, exits non-zero and names the
    source. `--dry-run` makes no network call and writes nothing.
 
+Round 2 lead decisions (2026-10-13, after the coder's conflicts A and B):
+
+A. `fetch` of an unsigned source exits EXIT_NO_APPROVED_SOURCES (7) with no network call, and
+   its message names where the hash to sign comes from (the cassette sidecar manifest).
+B. In `refresh`, a requested source with no valid approval is a source FAILURE, not a skip: it
+   gets a `not_approved` checkpoint, the other sources still run, and the run exits
+   EXIT_SOURCE_FAILED (8) naming every failed source. Exit 7 only when no requested source is
+   signed. A partly signed run that exits 0 would be a silent partial success.
+   An approval file that cannot be parsed as a mapping fails the whole run (exit 1, ruling 4).
+
 The card's `--out <tmp>` is replaced by the `Settings.out_dir` env var (ruling 3).
 """
 
 from __future__ import annotations
 
 import hashlib
+import importlib
 import inspect
 import json
 import os
+import pkgutil
 import re
 import shutil
 import socket
@@ -54,6 +66,7 @@ from legal_corpus_ingester.pipeline.approval_gate import (
     _PLACEHOLDER_SHA,
     EXPIRY_WARNING_DAYS,
     check_approval,
+    load_approval,
 )
 from legal_corpus_ingester.pipeline.manifest import MANIFEST_FILENAME, Manifest
 from legal_corpus_ingester.pipeline.orchestrator import Orchestrator as RealOrchestrator
@@ -99,6 +112,11 @@ _DISHONEST_FAILURE_CODES = frozenset(
 )
 _NOT_WIRED = PUBLIC_EXIT_CODES["EXIT_NOT_WIRED"]
 _USAGE = PUBLIC_EXIT_CODES["EXIT_USAGE"]
+_LOAD_ERROR = PUBLIC_EXIT_CODES["EXIT_LOAD_ERROR"]
+_NO_APPROVED = PUBLIC_EXIT_CODES["EXIT_NO_APPROVED_SOURCES"]
+_SOURCE_FAILED = PUBLIC_EXIT_CODES["EXIT_SOURCE_FAILED"]
+# Lead decision B: the checkpoint stage a requested source without a valid approval records.
+_NOT_APPROVED_STAGE = "not_approved"
 
 _UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
 
@@ -215,6 +233,12 @@ def _make_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signed: tup
 @pytest.fixture
 def ws(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Workspace:
     return _make_workspace(tmp_path, monkeypatch, signed=_TIER1)
+
+
+@pytest.fixture
+def ws_all(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Workspace:
+    # Every repo source signed: under decision B the only workspace where `refresh --all` exits 0.
+    return _make_workspace(tmp_path, monkeypatch, signed=tuple(_repo_names()))
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +385,16 @@ def _documented(code: int) -> bool:
     return re.search(rf"(?<![\w.]){code} when |also exit {code}\b", text) is not None
 
 
+def _assert_not_approved_checkpoint(ws: _Workspace, name: str) -> None:
+    # Decision B: the unsigned source records its own failure under Settings.state_dir, so
+    # health and status see a failed run, and the checkpoint carries no untrusted bytes (F8).
+    state = CheckpointStore(ws.state).load(name)
+    assert state is not None, (name, "no checkpoint under INGESTER_STATE_DIR")
+    assert state.source_name == name and state.stage == _NOT_APPROVED_STAGE, state
+    assert _unsafe_chars(state.error) == [] and "::" not in state.error, state.error[:200]
+    assert str(ws.root) not in state.error and str(ws.root.resolve()) not in state.error
+
+
 def _assert_failed_loudly(result: Result) -> None:
     assert result.exit_code not in _DISHONEST_FAILURE_CODES, _why(result)
     assert isinstance(result.exception, SystemExit), _why(result)
@@ -384,18 +418,27 @@ def test_fetch_invokes_orchestrator(ws: _Workspace, spy: _Spy, net: _Net) -> Non
 
 def test_refresh_all_invokes_orchestrator_per_source(ws: _Workspace, spy: _Spy, net: _Net) -> None:
     # Ruling 1: three runs (the card said five), one per source with a valid approval.
+    # Decision B: the two unsigned sources are failures, so the partly signed run exits 8,
+    # names each as failed with the approval reason, and checkpoints it as not_approved.
     result = _invoke(ws.argv("refresh", "--all"))
-    assert result.exit_code == 0, _why(result)
+    assert result.exit_code == _SOURCE_FAILED, _why(result)
     assert sorted(spy.run_names()) == sorted(_TIER1), _why(result)
+    for name in _TIER1:
+        assert name in result.stdout, (name, _why(result))
     for name in _unsigned():
         assert name not in spy.run_names()
         assert _named_with(_output(result), name, "approv"), (name, _why(result))
+        assert _named_with(result.stderr, name, "fail"), (name, _why(result))
+        _assert_not_approved_checkpoint(ws, name)
     assert net.attempts == []
+    assert _is_empty(ws.cwd)
 
 
 def test_refresh_all_dry_run_lists_without_writing(ws: _Workspace, spy: _Spy, net: _Net) -> None:
+    # Decision B: the dry run exits with the code the real run would (8 here), so a partly
+    # signed pre-flight is never green, and it still writes nothing (no not_approved checkpoint).
     result = _invoke(ws.argv("refresh", "--all", "--dry-run"))
-    assert result.exit_code == 0, _why(result)
+    assert result.exit_code == _SOURCE_FAILED, _why(result)
     for name in _TIER1:
         assert name in result.stdout, (name, _why(result))
     for name in _unsigned():
@@ -411,20 +454,25 @@ def test_refresh_all_dry_run_lists_without_writing(ws: _Workspace, spy: _Spy, ne
 
 
 @pytest.mark.parametrize("argv", [("fetch", "eurlex_gdpr"), ("refresh", "--all")], ids=["fetch", "refresh"])
-def test_cli_never_passes_embedder_model(ws: _Workspace, spy: _Spy, net: _Net, argv: tuple[str, ...]) -> None:
+def test_cli_never_passes_embedder_model(
+    ws_all: _Workspace, spy: _Spy, net: _Net, argv: tuple[str, ...]
+) -> None:
     # Ruling 2: terms-analysis#98 owns the embedder model; the CLI leaves the parameter alone.
-    result = _invoke(ws.argv(*argv))
+    # Every source signed (decision B), so exit 0 means every run was composed and succeeded.
+    result = _invoke(ws_all.argv(*argv))
     assert result.exit_code == 0, _why(result)
     assert spy.constructed, _why(result)
     for bound in spy.constructed:
         assert "embedder_model" not in bound.arguments, bound.arguments.get("embedder_model")
 
 
-def test_orchestrator_dirs_come_from_settings(ws: _Workspace, spy: _Spy, net: _Net) -> None:
+def test_orchestrator_dirs_come_from_settings(ws_all: _Workspace, spy: _Spy, net: _Net) -> None:
     # Ruling 3 / F13: the publish target and state dir are the env-configured ones.
+    # Every source signed (decision B), so all five runs are composed and the run exits 0.
+    ws = ws_all
     result = _invoke(ws.argv("refresh", "--all"))
     assert result.exit_code == 0, _why(result)
-    assert spy.constructed, _why(result)
+    assert len(spy.constructed) == len(_repo_names()), _why(result)
     for bound in spy.constructed:
         target = Path(bound.arguments["publish_target"].path).resolve()
         state = Path(bound.arguments["state_dir"]).resolve()
@@ -455,9 +503,10 @@ def test_fetch_end_to_end_uses_settings_for_localai_and_dirs(ws: _Workspace, net
 
 
 def test_refresh_all_end_to_end_fetches_only_approved_sources(ws: _Workspace, net: _Net) -> None:
+    # Decision B: the signed sources publish, the unsigned ones fail with not_approved, exit 8.
     net.upstream = ws
     result = _invoke(ws.argv("refresh", "--all"))
-    assert result.exit_code == 0, _why(result)
+    assert result.exit_code == _SOURCE_FAILED, _why(result)
     assert net.attempts == [], net.attempts
     registry = load_all(ws.sources)
     expected = {registry[name].pipeline.celex_id for name in _TIER1}
@@ -467,14 +516,16 @@ def test_refresh_all_end_to_end_fetches_only_approved_sources(ws: _Workspace, ne
         state = store.load(name)
         assert state is not None and state.stage == "done", (name, state)
     for name in _unsigned():
-        assert store.load(name) is None, name
+        _assert_not_approved_checkpoint(ws, name)
+        assert _named_with(result.stderr, name, "fail"), (name, _why(result))
     assert _is_empty(ws.cwd)
 
 
 def test_refresh_dry_run_real_pipeline_stays_offline(ws: _Workspace, net: _Net) -> None:
     # No spy: the real composition must not reach the network or create a dir on --dry-run.
+    # Decision B: the dry run reports the exit code the real run would give (8: two unsigned).
     result = _invoke(ws.argv("refresh", "--all", "--dry-run"))
-    assert result.exit_code == 0, _why(result)
+    assert result.exit_code == _SOURCE_FAILED, _why(result)
     assert net.attempts == [], net.attempts
     for name in _TIER1:
         assert name in result.stdout, (name, _why(result))
@@ -514,6 +565,8 @@ def test_refresh_with_no_valid_approval_fails_loudly(
             assert _named_with(_output(result), name, "approv"), (name, _why(result))
         _assert_safe_output(result, str(ws.root))
     assert dry.exit_code == real.exit_code, (_why(dry), _why(real))
+    # Decision B: exit 7 only when no requested source is signed.
+    assert real.exit_code == _NO_APPROVED, _why(real)
     assert spy.constructed == [] and spy.runs == []
     assert net.attempts == []
     assert _is_empty(ws.out) and _is_empty(ws.cwd)
@@ -524,6 +577,7 @@ def test_fetch_of_unsigned_source_refuses(ws: _Workspace, spy: _Spy, net: _Net) 
     name = _unsigned()[0]
     result = _invoke(ws.argv("fetch", name))
     _assert_failed_loudly(result)
+    assert result.exit_code == _NO_APPROVED, _why(result)  # decision A
     assert name not in spy.run_names()
     assert _named_with(_output(result), name, "approv"), _why(result)
     assert net.attempts == []
@@ -571,6 +625,7 @@ def test_orchestrator_failure_exits_non_zero_naming_the_source(
     spy.fail_with["eurlex_gdpr"] = exc
     result = _invoke(ws.argv("refresh", "--all"))
     _assert_failed_loudly(result)
+    assert result.exit_code == _SOURCE_FAILED, _why(result)
     assert "eurlex_gdpr" in spy.run_names(), _why(result)
     assert "eurlex_gdpr" in _output(result), _why(result)
     _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
@@ -619,21 +674,26 @@ def _state(ws: _Workspace, name: str, key: str) -> str | None:
     return texts[key]()
 
 
-_APPROVAL_VALID: dict[str, bool] = {
-    "signed": True,
-    "placeholder": False,
-    "sha-empty": False,
-    "sha-not-hex": False,
-    "expired-yesterday": False,
-    "expires-today": False,
-    "expiry-missing": False,
-    "expiry-hostile": False,
-    "source-id-other": False,
-    "source-id-hostile": False,
-    "missing-file": False,
-    "empty-file": False,
-    "not-a-mapping": False,
-    "invalid-yaml": False,
+# Decision B: what `refresh --all` does with one source's approval in each state.
+_RUNS = "runs"  # valid approval: the source runs
+_SOURCE_FAILURE = "source-failure"  # no valid approval: not_approved checkpoint, others run, exit 8
+_RUN_LOAD_ERROR = "load-error"  # file unreadable as a mapping: the whole run fails, exit 1 (ruling 4)
+
+_APPROVAL_OUTCOME: dict[str, str] = {
+    "signed": _RUNS,
+    "placeholder": _SOURCE_FAILURE,
+    "sha-empty": _SOURCE_FAILURE,
+    "sha-not-hex": _SOURCE_FAILURE,
+    "expired-yesterday": _SOURCE_FAILURE,
+    "expires-today": _SOURCE_FAILURE,
+    "expiry-missing": _SOURCE_FAILURE,
+    "expiry-hostile": _SOURCE_FAILURE,
+    "source-id-other": _SOURCE_FAILURE,
+    "source-id-hostile": _SOURCE_FAILURE,
+    "missing-file": _SOURCE_FAILURE,
+    "empty-file": _RUN_LOAD_ERROR,
+    "not-a-mapping": _RUN_LOAD_ERROR,
+    "invalid-yaml": _RUN_LOAD_ERROR,
 }
 
 
@@ -648,33 +708,81 @@ def _write_state(ws: _Workspace, name: str, key: str) -> Path:
 
 
 def test_approval_table_matches_the_real_gate(ws: _Workspace) -> None:
-    # Contract (green today): each row is valid or invalid exactly as check_approval judges it
-    # against the served artifact, and the table has both a positive and a negative row.
-    assert True in _APPROVAL_VALID.values() and False in _APPROVAL_VALID.values()
-    for key, valid in _APPROVAL_VALID.items():
+    # Contract (green today): each row's outcome is the one the real gate gives against the
+    # served artifact, and every outcome has at least one row.
+    assert set(_APPROVAL_OUTCOME.values()) == {_RUNS, _SOURCE_FAILURE, _RUN_LOAD_ERROR}
+    for key, outcome in _APPROVAL_OUTCOME.items():
         path = _write_state(ws, "eurlex_gdpr", key)
         with warnings.catch_warnings():
             warnings.simplefilter("error")
-            if valid:
+            if outcome == _RUNS:
                 check_approval(path, "eurlex_gdpr", ws.body_sha, today=ws.today)
-            else:
+            elif outcome == _RUN_LOAD_ERROR:
+                assert path.exists(), key
                 with pytest.raises((LegalReviewGateError, yaml.YAMLError)):
+                    load_approval(path)
+            elif path.exists():
+                load_approval(path)  # parses as a mapping: the failure is this source's alone
+                with pytest.raises(LegalReviewGateError):
                     check_approval(path, "eurlex_gdpr", ws.body_sha, today=ws.today)
 
 
-@pytest.mark.parametrize("key", list(_APPROVAL_VALID))
+@pytest.mark.parametrize("key", list(_APPROVAL_OUTCOME))
 def test_refresh_runs_a_source_only_with_a_valid_approval(
+    ws_all: _Workspace, spy: _Spy, net: _Net, key: str
+) -> None:
+    # Decision B, one source varied with the other four signed.
+    ws = ws_all
+    _write_state(ws, "eurlex_gdpr", key)
+    others = [name for name in _repo_names() if name != "eurlex_gdpr"]
+    result = _invoke(ws.argv("refresh", "--all"))
+    outcome = _APPROVAL_OUTCOME[key]
+    if outcome == _RUNS:
+        assert result.exit_code == 0, _why(result)
+        assert sorted(spy.run_names()) == sorted(_repo_names()), _why(result)
+    elif outcome == _SOURCE_FAILURE:
+        assert result.exit_code == _SOURCE_FAILED, _why(result)
+        assert sorted(spy.run_names()) == sorted(others), _why(result)
+        assert _named_with(_output(result), "eurlex_gdpr", "approv"), _why(result)
+        assert _named_with(result.stderr, "eurlex_gdpr", "fail"), _why(result)
+        _assert_not_approved_checkpoint(ws, "eurlex_gdpr")
+    else:
+        assert result.exit_code == _LOAD_ERROR, _why(result)
+        assert spy.constructed == [] and spy.runs == [], _why(result)
+        assert _named_with(_output(result), "eurlex_gdpr", "approv"), _why(result)
+    _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
+    assert net.attempts == []
+
+
+@pytest.mark.parametrize("key", ["placeholder", "missing-file"])
+def test_fetch_of_unsigned_source_names_where_the_hash_comes_from(
     ws: _Workspace, spy: _Spy, net: _Net, key: str
 ) -> None:
+    # Decision A: `fetch` of an unsigned source exits 7 with no network call, and the operator
+    # is told where the hash to sign comes from: the cassette sidecar manifest (#96).
     _write_state(ws, "eurlex_gdpr", key)
+    result = _invoke(ws.argv("fetch", "eurlex_gdpr"))
+    assert result.exit_code == _NO_APPROVED, _why(result)
+    assert spy.constructed == [] and spy.runs == []
+    assert any(
+        "cassette" in line.lower() and "sha256" in line.lower() for line in _output(result).splitlines()
+    ), _why(result)
+    _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
+    assert net.attempts == []
+
+
+def test_refresh_continues_past_failed_sources_and_names_each(ws: _Workspace, spy: _Spy, net: _Net) -> None:
+    # Mutant M12 (stop at the first failed source). Two signed sources fail, so whichever runs
+    # first, a loop that stops there misses the other signed runs; every failure is named.
+    failing = _TIER1[1:]
+    for name in failing:
+        spy.fail_with[name] = RuntimeError(f"{name} upstream down")
     result = _invoke(ws.argv("refresh", "--all"))
-    assert result.exit_code not in (_NOT_WIRED, _USAGE), _why(result)
-    if _APPROVAL_VALID[key]:
-        assert result.exit_code == 0, _why(result)
-        assert "eurlex_gdpr" in spy.run_names(), _why(result)
-    else:
-        assert "eurlex_gdpr" not in spy.run_names(), _why(result)
-        assert _named_with(_output(result), "eurlex_gdpr", "approv"), _why(result)
+    assert result.exit_code == _SOURCE_FAILED, _why(result)
+    assert sorted(spy.run_names()) == sorted(_TIER1), _why(result)
+    for name in (*failing, *_unsigned()):
+        assert _named_with(result.stderr, name, "fail"), (name, _why(result))
+    assert _TIER1[0] in result.stdout and _TIER1[0] not in result.stderr, _why(result)
     _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
     assert net.attempts == []
 
@@ -718,6 +826,76 @@ def test_config_class_path_cannot_import_outside_the_package(
     assert "eurlex_canary" not in spy.run_names()
     _assert_failed_loudly(result)
     assert "eurlex_canary" in _output(result), _why(result)
+    _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
+    assert net.attempts == []
+
+
+_PKG = "legal_corpus_ingester"
+_STAGES = ("fetcher", "cleaner", "chunker")
+
+
+def _stage_rows() -> list[Any]:
+    """Wrong-stage and imported-not-defined class paths, built from the repo config (F13).
+
+    Each stage's subpackage is the first part of its configured class path. Families:
+    M13a, a real class from another stage's subpackage; M13b, the stage's own module and class
+    under another stage's prefix (the module exists only in the stage's own subpackage); M14,
+    a class a stage module only imports (its __module__ is elsewhere).
+    """
+    pipeline = yaml.safe_load((_REPO_SOURCES / "eurlex_gdpr.yaml").read_text(encoding="utf-8"))["pipeline"]
+    configured = {stage: str(pipeline[stage]) for stage in _STAGES}
+    subpackage = {stage: configured[stage].split(".")[0] for stage in _STAGES}
+    rows: list[Any] = []
+    for stage in _STAGES:
+        _, module, cls = configured[stage].split(".")
+        for other in _STAGES:
+            if other == stage:
+                continue
+            rows.append(pytest.param(stage, configured[other], id=f"m13a-{stage}-{configured[other]}"))
+            wrong_prefix = f"{subpackage[other]}.{module}.{cls}"
+            rows.append(pytest.param(stage, wrong_prefix, id=f"m13b-{stage}-{wrong_prefix}"))
+        package = importlib.import_module(f"{_PKG}.{subpackage[stage]}")
+        for info in pkgutil.iter_modules(package.__path__):
+            module_name = f"{_PKG}.{subpackage[stage]}.{info.name}"
+            mod = importlib.import_module(module_name)
+            for attr, value in sorted(vars(mod).items()):
+                if (
+                    isinstance(value, type)
+                    and value.__module__ != module_name
+                    and re.fullmatch(r"[A-Z][a-zA-Z0-9]+", attr)
+                ):
+                    dotted = f"{subpackage[stage]}.{info.name}.{attr}"
+                    rows.append(pytest.param(stage, dotted, id=f"m14-{stage}-{dotted}"))
+    return rows
+
+
+_STAGE_ROWS = _stage_rows()
+
+
+def test_stage_rows_cover_every_family_for_every_stage() -> None:
+    # Contract: each stage has at least one row per mutant family, so no family is silently empty.
+    for stage in _STAGES:
+        families = {row.id.split("-")[0] for row in _STAGE_ROWS if row.values[0] == stage}
+        assert {"m13a", "m13b", "m14"} <= families, (stage, families)
+
+
+@pytest.mark.parametrize(("stage", "dotted"), _STAGE_ROWS)
+def test_config_class_path_must_name_a_class_defined_in_its_own_stage(
+    ws_all: _Workspace, spy: _Spy, net: _Net, stage: str, dotted: str
+) -> None:
+    # Mutants M13 (a class from another stage's subpackage) and M14 (a class only imported into
+    # the named module). The schema admits each path; the CLI must refuse the run before any
+    # Orchestrator is composed, naming the source, with exit 1 (StageClassError).
+    ws = ws_all
+    path = ws.sources / "eurlex_gdpr.yaml"
+    data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    data["pipeline"][stage] = dotted
+    path.write_text(yaml.safe_dump(data), encoding="utf-8")
+    assert load_all(ws.sources)["eurlex_gdpr"].pipeline.model_dump()[stage] == dotted
+    result = _invoke(ws.argv("refresh", "--all"))
+    assert result.exit_code == _LOAD_ERROR, _why(result)
+    assert spy.constructed == [] and spy.runs == [], _why(result)
+    assert "eurlex_gdpr" in _output(result), _why(result)
     _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
     assert net.attempts == []
 
