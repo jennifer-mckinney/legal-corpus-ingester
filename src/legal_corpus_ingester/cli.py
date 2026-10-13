@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import errno
 import hashlib
 import importlib
@@ -30,7 +31,11 @@ from legal_corpus_ingester.pipeline.manifest import MANIFEST_FILENAME, Manifest
 from legal_corpus_ingester.pipeline.orchestrator import Fetcher, Orchestrator
 from legal_corpus_ingester.pipeline.retention import CALVER_RE, next_version
 from legal_corpus_ingester.publishers.base import PublishReceipt, PublishTarget
-from legal_corpus_ingester.publishers.filesystem import CHECKSUMS_FILENAME, FilesystemPublisher
+from legal_corpus_ingester.publishers.filesystem import (
+    CHECKSUMS_FILENAME,
+    FilesystemPublisher,
+    bundle_fingerprint,
+)
 from legal_corpus_ingester.publishers.terms_analysis import CURRENT_LINK, TermsAnalysisPublisher
 from legal_corpus_ingester.sources.registry import (
     STAGE_PACKAGES,
@@ -414,7 +419,8 @@ def _run_sources(
     approvals_dir: Path,
     today: date,
     unsigned: dict[str, str],
-) -> tuple[str, dict[str, tuple[Corpus, Manifest] | None]]:
+    version: str,
+) -> dict[str, tuple[Corpus, Manifest] | None]:
     """Run the Orchestrator for each source in *names*; exit EXIT_SOURCE_FAILED if any failed.
 
     One failing source does not stop the rest (lead ruling 3): each checkpoints its own failure
@@ -423,12 +429,10 @@ def _run_sources(
     Dirs, the LocalAI URL and model all come from Settings (F13); embedder_model is left to the
     Orchestrator's default (terms-analysis#98 owns it).
 
-    Returns the run's bundle version and each source's staged corpus and manifest (None when
-    its run published nothing), in run order, only when every source succeeded.
+    Every checkpoint and staged manifest names *version*, the one version the run would
+    publish new content under (ruling 8b). Returns each source's staged corpus and manifest
+    (None when its run published nothing), in run order, only when every source succeeded.
     """
-    # One version for the whole run, from the injected date and the bundles on disk (ruling
-    # 8b), so every checkpoint and staged manifest names the version this run would publish.
-    version = next_version(settings.out_dir, today)
     staged: dict[str, tuple[Corpus, Manifest] | None] = {}
     failed: list[str] = list(unsigned)
     for name in names:
@@ -466,7 +470,7 @@ def _run_sources(
             err=True,
         )
         raise typer.Exit(code=EXIT_SOURCE_FAILED)
-    return version, staged
+    return staged
 
 
 def _combined_bundle(
@@ -518,17 +522,15 @@ def _current_version(out_dir: Path) -> str | None:
     return target
 
 
-def _content_digests(bundle: Path) -> dict[str, str]:
-    """sha256 of every bundle file but the MANIFEST and the checksums list (ruling 8b, 4a).
+def _file_digests(bundle: Path, skip: frozenset[str] = frozenset()) -> dict[str, str]:
+    """sha256 of every file under *bundle* but those named in *skip* (relative posix paths).
 
-    What is left is the bundle's content (corpus/ texts and index/): the MANIFEST names the
-    version, so it differs between any two bundles, and the checksums list covers it. A
-    symlink is listed by its target, so it never compares equal to a real file.
+    A symlink is listed by its target, so it never compares equal to a real file.
     """
     digests: dict[str, str] = {}
     for path in sorted(bundle.rglob("*")):
         rel = path.relative_to(bundle).as_posix()
-        if rel in (MANIFEST_FILENAME, CHECKSUMS_FILENAME):
+        if rel in skip:
             continue
         if path.is_symlink():
             digests[rel] = "symlink:" + os.readlink(path)
@@ -537,15 +539,106 @@ def _content_digests(bundle: Path) -> dict[str, str]:
     return digests
 
 
-def _publish_bundle(
-    settings: Settings, version: str, staged: dict[str, tuple[Corpus, Manifest] | None]
-) -> None:
-    """Publish the run's one bundle as out/<version>/ and repoint out/current (ruling 8).
+# Not content (ruling 8b, 4a): the MANIFEST names the version, so it differs between any two
+# bundles, and the checksums list covers it. What is left is corpus/ texts and index/.
+_NOT_CONTENT = frozenset({MANIFEST_FILENAME, CHECKSUMS_FILENAME})
 
-    Only called after every source succeeded. When the content equals the bundle out/current
-    already points at, nothing is published or repointed (ruling 8b, 4a): detect then reports
-    no change, instead of a weekly "new bundle" alert. Any error exits 1 with its type only;
-    out/current is repointed last by TermsAnalysisPublisher, so a failure leaves it as it was.
+# The producer version record (terms-analysis#93 Round 10b): the version refresh last published
+# and detect's fingerprint of that bundle. It lives under Settings.state_dir, which refresh.yml
+# caches, because out/ is not cached: without it an emptied out/ restarts the patch at .0 and
+# can reuse a name for new content. Its own file: detect's last-published-bundle.json belongs
+# to the workflow's record step.
+VERSION_RECORD_FILE = "producer-version-record.json"
+
+
+class VersionRecordError(ValueError):
+    """The producer version record exists but is not a record this cli wrote."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _VersionRecord:
+    version: str
+    digest: str
+
+
+def _read_version_record(state_dir: Path) -> _VersionRecord | None:
+    """The producer version record, or None when there is none (first run, cache eviction).
+
+    Anything else that is not a regular file holding ``{"version": <calver>, "digest":
+    <sha256 hex>}`` raises (item 6): read as "no record", it would restart the patch and could
+    reuse a name. A link is refused even when its target is valid (O_NOFOLLOW), a dir names
+    IsADirectoryError, and an unreadable file its own OSError. Callers echo the type only.
+    """
+    path = state_dir / VERSION_RECORD_FILE
+    if not os.path.lexists(path):
+        return None
+    # O_NONBLOCK: a FIFO planted at the path must not hang the run before fstat refuses it.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        mode = os.fstat(fd).st_mode
+        if stat.S_ISDIR(mode):
+            raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR))
+        if not stat.S_ISREG(mode):
+            raise VersionRecordError("the version record is not a regular file")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw = handle.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise VersionRecordError("the version record is not a JSON object")
+    version, digest = data.get("version"), data.get("digest")
+    if not isinstance(version, str) or not _is_calver(version):
+        raise VersionRecordError("the version record names no bundle version")
+    if not isinstance(digest, str) or not _SHA256_HEX_RE.fullmatch(digest):
+        raise VersionRecordError("the version record holds no sha256 digest")
+    return _VersionRecord(version=version, digest=digest)
+
+
+def _is_calver(name: str) -> bool:
+    """A bundle name retention reads (ASCII YYYY.M.N) whose month is a real month."""
+    match = CALVER_RE.fullmatch(name)
+    return match is not None and 1 <= int(match.group(2)) <= 12
+
+
+def _write_version_record(state_dir: Path, record: _VersionRecord) -> None:
+    """Write the record atomically: a temp file in the state dir, then os.replace."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    body = json.dumps({"version": record.version, "digest": record.digest}, sort_keys=True)
+    fd, tmp = tempfile.mkstemp(prefix=".version-record-", dir=state_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(body + "\n")
+        os.replace(tmp, state_dir / VERSION_RECORD_FILE)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _is_bundle_dir(path: Path) -> bool:
+    return not path.is_symlink() and path.is_dir()
+
+
+def _publish_bundle(
+    settings: Settings,
+    fresh: str,
+    staged: dict[str, tuple[Corpus, Manifest] | None],
+    record: _VersionRecord | None,
+) -> None:
+    """Publish the run's one bundle and repoint out/current (ruling 8, Round 10b).
+
+    Only called after every source succeeded. The version, by content:
+    - equal to the bundle a valid out/current names: nothing is published or repointed
+      (ruling 8b, 4a), so detect reports no change;
+    - equal to the producer *record*'s digest: the recorded version, so an emptied out/ (the
+      hosted runner) or a new month brings no alert. Already on disk byte for byte, it is only
+      repointed; on disk in any other form, it is never rewritten and *fresh* is used;
+    - otherwise *fresh*, the next patch past out/ and the record (Round 10b item 4).
+    The record is rewritten only after a full publish. Any error exits 1 with its type only;
+    out/current is repointed last, so a failure leaves it (and the record) as they were.
     """
     out_dir = settings.out_dir
     kept = {name: pair for name, pair in staged.items() if pair is not None}
@@ -553,39 +646,70 @@ def _publish_bundle(
         # Every source ran without error yet none staged a corpus. Exit 0 here could not be
         # told from "content unchanged" (detect: changed=false), so it fails closed (ruling 9).
         typer.echo(
-            f"Bundle {version} was not published (no source staged a corpus:"
+            f"Bundle {fresh} was not published (no source staged a corpus:"
             f" {', '.join(staged)}); {CURRENT_LINK} was not repointed by this run.",
             err=True,
         )
         raise typer.Exit(code=1)
+    version = fresh
     try:
         if len(kept) != len(staged):
             # Some sources staged and some did not: the bundle would silently miss sources.
             raise ValueError("not every source staged a corpus; the bundle would be partial")
-        corpus, manifest = _combined_bundle(version, kept)
+        # The candidate carries the recorded version's MANIFEST, so it is byte-comparable with
+        # that bundle on disk; content comparisons skip the MANIFEST and checksums anyway.
+        corpus, manifest = _combined_bundle(record.version if record else fresh, kept)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Written by the same FilesystemPublisher layout as the real bundle, into a dot-named
+        # dir that is never a bundle name, and always removed.
+        candidate = Path(tempfile.mkdtemp(prefix=".candidate-", dir=out_dir))
+        try:
+            FilesystemPublisher().publish(
+                corpus, PublishTarget(kind="filesystem", path=candidate), manifest
+            )
+            content = _file_digests(candidate, _NOT_CONTENT)
+            whole = _file_digests(candidate)
+            fingerprint = bundle_fingerprint(candidate)
+        finally:
+            shutil.rmtree(candidate, ignore_errors=True)
         current = _current_version(out_dir)
-        if current is not None:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            # The candidate is written by the same FilesystemPublisher layout as the real bundle,
-            # into a dot-named dir that is never a bundle name, and always removed.
-            candidate = Path(tempfile.mkdtemp(prefix=".candidate-", dir=out_dir))
-            try:
-                FilesystemPublisher().publish(
-                    corpus, PublishTarget(kind="filesystem", path=candidate), manifest
-                )
-                unchanged = _content_digests(candidate) == _content_digests(out_dir / current)
-            finally:
-                shutil.rmtree(candidate, ignore_errors=True)
-            if unchanged:
-                typer.echo(f"Bundle unchanged: {CURRENT_LINK} stays at {current}.")
-                return
-        TermsAnalysisPublisher().publish(
-            corpus, PublishTarget(kind="terms_analysis", path=out_dir), manifest
-        )
+        if current is not None and _file_digests(out_dir / current, _NOT_CONTENT) == content:
+            typer.echo(f"Bundle unchanged: {CURRENT_LINK} stays at {current}.")
+            return
+        publisher = TermsAnalysisPublisher()
+        on_disk = False
+        if record is not None and record.digest == fingerprint:
+            recorded = out_dir / record.version
+            if not os.path.lexists(recorded):
+                version = record.version
+            elif _is_bundle_dir(recorded) and _file_digests(recorded) == whole:
+                version, on_disk = record.version, True
+        if on_disk:
+            publisher.repoint(out_dir, version)
+        else:
+            publisher.publish(
+                corpus,
+                PublishTarget(kind="terms_analysis", path=out_dir),
+                dataclasses.replace(manifest, corpus_version=version),
+            )
     except (OSError, ValueError) as exc:
         typer.echo(
             f"Bundle {version} was not published ({_type_name(exc)}); {CURRENT_LINK} was not"
             " repointed by this run.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    try:
+        _write_version_record(
+            settings.state_dir,
+            _VersionRecord(version=version, digest=bundle_fingerprint(out_dir / version)),
+        )
+    except (OSError, ValueError) as exc:
+        # current already names the new bundle; without the record the next run on an emptied
+        # out/ could reuse this name, so the run must not end green.
+        typer.echo(
+            f"Bundle {version} was published and {CURRENT_LINK} -> {version}, but the version"
+            f" record was not written ({_type_name(exc)}).",
             err=True,
         )
         raise typer.Exit(code=1)
@@ -816,7 +940,10 @@ def fetch(
         typer.echo(f"DRY RUN: would fetch {source!r} from {cfg.base_url}")
         return
 
-    _run_sources(settings, registry, approved, classes, approvals_dir, today, {})
+    # fetch publishes no bundle, so it neither reads nor writes the producer version record.
+    _run_sources(
+        settings, registry, approved, classes, approvals_dir, today, {}, next_version(settings.out_dir, today)
+    )
 
 
 @app.command(
@@ -825,8 +952,11 @@ def fetch(
         " hash, clean, chunk, embed and stage each under INGESTER_OUT_DIR/<source>, then publish"
         " one combined bundle as INGESTER_OUT_DIR/<YYYY.M.patch> and repoint the relative link"
         " INGESTER_OUT_DIR/current at it. A bundle whose content equals the one current points"
-        " at is not published again; a run with a failed source publishes no bundle and leaves"
-        " current as it was; a bundle that cannot be published exits 1. A source without a"
+        " at is not published again, and content equal to the producer version record's"
+        " (INGESTER_STATE_DIR) keeps the recorded version; new content takes the next patch past"
+        " the record and the bundles on disk. A malformed record exits 1. A run with a failed"
+        " source publishes no bundle and leaves current as it was; a bundle that cannot be"
+        " published exits 1. A source without a"
         " valid approval is not run and counts as failed: it is named on stderr and checkpointed"
         " as not_approved. A source whose licence SPDX changed since its recorded baseline is"
         " checkpointed as license_failed and not published. A source whose checkpoint cannot be"
@@ -886,6 +1016,16 @@ def refresh(
     classes = _stage_classes(registry, list(registry))
     approvals_dir = _approvals_dir(settings)
     today = date.today()
+    try:
+        record = _read_version_record(settings.state_dir)
+    except (OSError, ValueError) as exc:
+        # Never read as "no record" (Round 10b item 6), and never echoed: type only.
+        typer.echo(
+            f"The producer version record in INGESTER_STATE_DIR is unusable ({_type_name(exc)});"
+            f" nothing was run and {CURRENT_LINK} was not repointed.",
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_LOAD_ERROR)
     approved, unsigned = _approved_sources(list(registry), approvals_dir, today)
     if not approved:
         _exit_no_approved_sources(settings, unsigned, dry_run)
@@ -907,8 +1047,13 @@ def refresh(
     # Only after every offline check passed: a load error (exit 1) writes nothing.
     _record_not_approved(settings, unsigned)
     # Exits EXIT_SOURCE_FAILED if any source failed, so a partial run never reaches the bundle.
-    version, staged = _run_sources(settings, registry, approved, classes, approvals_dir, today, unsigned)
-    _publish_bundle(settings, version, staged)
+    # One version for new content, from the injected date, the bundles on disk and the record
+    # (ruling 8b, Round 10b item 4); every checkpoint names it.
+    fresh = next_version(settings.out_dir, today, after=record.version if record else None)
+    staged = _run_sources(
+        settings, registry, approved, classes, approvals_dir, today, unsigned, fresh
+    )
+    _publish_bundle(settings, fresh, staged, record)
 
 
 @app.command(

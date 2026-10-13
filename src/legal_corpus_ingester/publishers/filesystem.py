@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
+from legal_corpus_ingester.pipeline.manifest import MANIFEST_FILENAME
 from legal_corpus_ingester.publishers.base import PublishReceipt, PublishTarget
 
 if TYPE_CHECKING:
@@ -54,6 +55,28 @@ def _atomic_save_npy(array: np.ndarray[Any, np.dtype[np.float32]], final_path: P
 
 # The per-file sha256 list every bundle carries; the refresh bundle step reads the name too.
 CHECKSUMS_FILENAME = "checksums.txt"
+
+
+def bundle_fingerprint(bundle_dir: Path) -> str:
+    """The content fingerprint of *bundle_dir*, as scripts/detect_bundle_change.py computes it.
+
+    sha256 of the sorted, stripped ``checksums.txt`` lines, without the MANIFEST's line (it
+    names the version, which is not content). refresh records it beside the version it
+    published (terms-analysis#93 Round 10b item 2) and detect compares it, so the two must be
+    the same function: detect is a standalone script and keeps its own copy, and the cli
+    tests pin this one to detect's ``read_bundle`` output for every published bundle.
+    """
+    lines = []
+    for raw in (bundle_dir / CHECKSUMS_FILENAME).read_text(encoding="utf-8").splitlines():
+        if not raw.strip():
+            continue
+        _sha, _, rel = raw.partition("  ")
+        if rel.strip() == MANIFEST_FILENAME:
+            continue
+        lines.append(raw.strip())
+    if not lines:
+        raise ValueError("the bundle's checksums list no content files")
+    return hashlib.sha256("\n".join(sorted(lines)).encode("utf-8")).hexdigest()
 
 
 class FilesystemPublisher:

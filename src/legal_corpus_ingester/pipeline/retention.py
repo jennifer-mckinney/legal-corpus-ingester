@@ -7,7 +7,9 @@ from pathlib import Path
 
 # YYYY.MM.PATCH calver pattern. Public: next_version and the refresh bundle step read bundle
 # names with this one pattern, so naming and retention cannot drift (terms-analysis#93 ruling 8b).
-CALVER_RE = re.compile(r"^(\d{4})\.(\d{1,2})\.(\d+)$")
+# ASCII digits only: the names this tool writes are ASCII, and the refresh step also reads a
+# version back from its state-dir record, where a fullwidth digit must not pass as a version.
+CALVER_RE = re.compile(r"^(\d{4})\.(\d{1,2})\.(\d+)$", re.ASCII)
 
 
 def _parse_calver(name: str) -> date | None:
@@ -22,15 +24,21 @@ def _parse_calver(name: str) -> date | None:
         return None
 
 
-def next_version(out_dir: Path, today: date) -> str:
+def next_version(out_dir: Path, today: date, after: str | None = None) -> str:
     """Return the next bundle version for *today*: ``YYYY.M.N``.
 
     Year and month come from *today*, which the caller injects (never the wall clock here).
     N is one more than the highest patch of any real bundle dir under *out_dir* in the same
     year and month (0 when there is none). It reads the dirs on disk, not ``out/current``, so
     a lost link never makes a run reuse an existing version (terms-analysis#93 ruling 8b).
+    *after*, a version already used elsewhere (the producer record), counts as one more such
+    name when it falls in the same year and month, so an emptied out/ never reuses it (Round
+    10b item 4).
     """
     patches = [-1]
+    m = CALVER_RE.fullmatch(after) if after is not None else None
+    if m is not None and (int(m.group(1)), int(m.group(2))) == (today.year, today.month):
+        patches.append(int(m.group(3)))
     if out_dir.is_dir():
         for child in out_dir.iterdir():
             m = CALVER_RE.fullmatch(child.name)

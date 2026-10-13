@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import signal
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from legal_corpus_ingester.publishers.base import PublishReceipt, PublishTarget
@@ -71,6 +72,22 @@ class TermsAnalysisPublisher:
         bundle_target = PublishTarget(kind="filesystem", path=bundle_dir)
         receipt = FilesystemPublisher().publish(corpus, bundle_target, manifest)
 
+        # --- 2 and 3. Root copies, then the 'current' repoint ---
+        self.repoint(out_dir, bundle_name)
+
+        # --- 4. Optionally signal the live server to reload ---
+        if pid > 0:
+            reload_signal(pid)
+
+        return receipt
+
+    def repoint(self, out_dir: Path, bundle_name: str) -> None:
+        """Make the existing bundle ``out_dir/bundle_name`` the live one.
+
+        publish calls it after writing a bundle; refresh calls it alone to go back to a
+        bundle already on disk (terms-analysis#93 Round 10b: the recorded version, intact).
+        """
+        bundle_dir = out_dir / bundle_name
         # --- 2. Copy hot-reload safety files into out_dir root ---
         shutil.copy2(
             bundle_dir / "index" / "legal_kb.npy",
@@ -86,9 +103,3 @@ class TermsAnalysisPublisher:
         # ruling 9b): a caller that reports "current unchanged" on an error is then telling
         # the truth.
         atomic_symlink(bundle_name, out_dir / CURRENT_LINK)
-
-        # --- 4. Optionally signal the live server to reload ---
-        if pid > 0:
-            reload_signal(pid)
-
-        return receipt

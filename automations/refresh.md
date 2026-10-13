@@ -49,10 +49,20 @@ issue steps get `GH_TOKEN` (terms-analysis#90).
    partly signed run is red, never a silent partial success. `--dry-run` exits with
    the same code and writes nothing. The full list is in `ingester --help`.
    When every source succeeds, refresh publishes one combined bundle
-   `out/<YYYY.M.patch>/` (patch = highest that month on disk + 1) and repoints the
-   relative link `out/current` at it. A run with a failed source publishes no bundle
-   and leaves `out/current` alone. A run whose content equals the bundle `out/current`
-   already points at publishes nothing (exit 0), so step 3 reports no change.
+   `out/<YYYY.M.patch>/` and repoints the relative link `out/current` at it. A run with
+   a failed source publishes no bundle and leaves `out/current` alone. A run whose
+   content equals the bundle `out/current` already points at publishes nothing (exit
+   0), so step 3 reports no change. `out/` is not cached, so on a hosted runner there
+   is no `out/current` at run start: refresh also keeps a producer version record,
+   `$INGESTER_STATE_DIR/producer-version-record.json` (the version it last published
+   and that bundle's step 3 fingerprint), written only after a full publish. Content
+   equal to the record's is republished under the recorded version, even in a later
+   month, so step 3 reports no change. New content takes the next patch after the
+   highest of the record's version and the bundle dirs in `out/` that month (`.0` in a
+   new month), so a version name is never reused for different content. A missing
+   record (first run or cache eviction) falls back to the dirs in `out/` alone; a
+   malformed, unreadable or linked record exits 1 with its type only and runs nothing.
+   The file is separate from step 3's `last-published-bundle.json`.
    `out/<source>/` is per-source staging; nothing reads it.
 
 3. **Detect bundle change.** Runs `scripts/detect_bundle_change.py detect`. It reads
