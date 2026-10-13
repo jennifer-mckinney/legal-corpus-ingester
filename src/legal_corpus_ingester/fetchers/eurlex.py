@@ -92,13 +92,19 @@ class _RateLimiter:
             self._last_slot = None
 
     async def wait(self, interval: float) -> None:
-        """Return once this request may start: ``interval`` after the previous slot."""
+        """Return once this request may start: ``interval`` after the previous slot, never
+        before it."""
         with self._guard:
             now = self._clock()
             slot = now if self._last_slot is None else max(now, self._last_slot + interval)
             self._last_slot = slot
-        if slot > now:
-            await self._sleep(slot - now)
+        # The reservation stays inside the lock, the sleep outside it. A sleep can wake
+        # early (asyncio rounds to its clock resolution), so re-read the clock and wait
+        # again until the slot has really arrived.
+        remaining = slot - now
+        while remaining > 0:
+            await self._sleep(remaining)
+            remaining = slot - self._clock()
 
 
 # The one limiter for every Cellar request in this process.

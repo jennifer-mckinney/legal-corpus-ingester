@@ -36,6 +36,13 @@ DEFAULT_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "fetchers
 _CELEX_RE = re.compile(r"([0-9])([0-9]{4})([A-Z]{1,2})([0-9]{4})(?:-([0-9]{8}))?")
 _ASCII_DIGITS_RE = re.compile(r"[0-9]+")
 
+# CELEX document-type letter -> the Formex value of the DOC manifest's single
+# FMX/DOC.MAIN.PUB/LEGAL.VALUE (F5: a Regulation is never accepted for a Directive or
+# Decision with the same year and number). Domain constants of the CELEX and Formex
+# standards, not tunables. Any other letter is refused before a request is made.
+_LEGAL_VALUE_FOR_KIND: dict[str, str] = {"R": "REG", "L": "DIR", "D": "DEC"}
+_LEGAL_VALUE_PATH = "FMX/DOC.MAIN.PUB/LEGAL.VALUE"
+
 # Member names (security design F8): a flat ASCII file name ending in ``.xml``.
 _MEMBER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\.xml")
 
@@ -181,6 +188,10 @@ def parse_celex(celex: object) -> Celex:
     if match is None:
         raise ValueError(f"malformed CELEX id {_safe(celex)}")
     sector, year, kind, number, date = match.groups()
+    if kind not in _LEGAL_VALUE_FOR_KIND:
+        raise ValueError(
+            f"CELEX {celex} has document type {kind}, expected one of {', '.join(_LEGAL_VALUE_FOR_KIND)}"
+        )
     return Celex(celex, sector, year, kind, number, date)
 
 
@@ -347,8 +358,8 @@ def _ref_files(manifest: Any, path: str) -> list[str]:
     return [str(el.get("FILE", "")) for el in manifest.iterfind(path)]
 
 
-def _select(roots: dict[str, tuple[str, Any]]) -> tuple[str, list[str]]:
-    """Pick the act and annexes from the single ``DOC`` manifest's ``REF.PHYS`` list."""
+def _select(roots: dict[str, tuple[str, Any]]) -> tuple[Any, str, list[str]]:
+    """Pick the manifest, the act and the annexes (the manifest's ``REF.PHYS`` list)."""
     manifests = [name for name, (root, _el) in roots.items() if root == _MANIFEST_ROOT]
     if len(manifests) != 1:
         raise _drift(f"Cellar zip must hold exactly one DOC manifest, found {len(manifests)}")
@@ -374,7 +385,7 @@ def _select(roots: dict[str, tuple[str, Any]]) -> tuple[str, list[str]]:
     for name, (root, _el) in roots.items():
         if name not in listed and root != _TOC_ROOT:
             raise _drift(f"Cellar zip member {name} is unlisted in the manifest")
-    return act, annexes
+    return manifest, act, annexes
 
 
 def _ascii_digits(value: str | None) -> str | None:
@@ -383,11 +394,28 @@ def _ascii_digits(value: str | None) -> str | None:
     return value
 
 
-def _check_identity(act_root: str, act: Any, celex: Celex) -> None:
+def _check_legal_value(manifest: Any, celex: Celex) -> None:
+    """The manifest's one ``FMX/DOC.MAIN.PUB/LEGAL.VALUE`` must name the CELEX type.
+
+    Exactly one ``LEGAL.VALUE`` anywhere in the manifest, at that path, with no child
+    nodes and text equal to the expected value: no strip, no case-fold, no normalisation.
+    """
+    expected = _LEGAL_VALUE_FOR_KIND[celex.kind]
+    if len(manifest.findall(".//LEGAL.VALUE")) != 1:
+        raise _drift(f"Cellar manifest must carry exactly one LEGAL.VALUE for CELEX {celex.text}")
+    found = manifest.findall(_LEGAL_VALUE_PATH)
+    if len(found) != 1 or len(found[0]) != 0:
+        raise _drift(f"Cellar manifest LEGAL.VALUE is not a plain {_LEGAL_VALUE_PATH} for CELEX {celex.text}")
+    if found[0].text != expected:
+        raise _drift(f"Cellar document type {_safe(found[0].text)} does not match the requested CELEX {celex.text}")
+
+
+def _check_identity(act_root: str, act: Any, manifest: Any, celex: Celex) -> None:
     """The act's own identifier must name the requested CELEX (F5)."""
     if celex.date is None:
         if celex.sector != "3" or act_root != _BASE_ACT_ROOT:
             raise _drift(f"Cellar act root {act_root} does not fit base CELEX {celex.text}")
+        _check_legal_value(manifest, celex)
         no_doc = act.find("BIB.INSTANCE/NO.DOC")
         year = _ascii_digits(no_doc.findtext("YEAR") if no_doc is not None else None)
         number = _ascii_digits(no_doc.findtext("NO.CURRENT") if no_doc is not None else None)
@@ -422,6 +450,6 @@ def read_formex_zip(body: bytes, celex_id: str, settings: CellarSettings) -> tup
         _check_declared(infos, settings)
         data = _read_members(archive, infos, settings)
     roots = {name: _root_of(name, member) for name, member in data.items()}
-    act, annexes = _select(roots)
-    _check_identity(roots[act][0], roots[act][1], celex)
+    manifest, act, annexes = _select(roots)
+    _check_identity(roots[act][0], roots[act][1], manifest, celex)
     return tuple(FormexPart(name, roots[name][0], data[name]) for name in (act, *annexes))

@@ -1598,3 +1598,22 @@ def test_malformed_celex_is_refused_before_any_request(net: FakeNet, celex: str)
     net.routes = [redirect(), zip_ok(ai_pkg().body())]
     _refused(celex, ValueError)
     assert net.requests == []
+
+
+@pytest.mark.parametrize(
+    ("celex", "letter"),
+    [
+        ("32024E1689", "E"),
+        ("32024C1689", "C"),
+        ("32024PC1689", "PC"),
+        ("02024X1689-20240101", "X"),
+    ],
+    ids=["base-E", "base-C", "base-two-letters-PC", "consolidated-X"],
+)
+def test_unknown_celex_type_letter_is_refused_before_any_request(net: FakeNet, celex: str, letter: str) -> None:
+    """Ruling Q1 on d717e35 (coder r4): a type letter outside R, L and D has no Formex
+    LEGAL.VALUE to check, so it fails closed before any request, naming the letter."""
+    net.routes = [redirect(), zip_ok(ai_pkg().body())]
+    msg = _refused(celex, ValueError)
+    assert net.requests == []
+    assert f"document type {letter}," in msg, msg
