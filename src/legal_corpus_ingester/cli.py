@@ -10,12 +10,14 @@ import re
 import shutil
 import stat
 import sys
+import tempfile
 import warnings
 from datetime import date
 from pathlib import Path
 from typing import NoReturn
 
 import httpx
+import numpy as np
 import typer
 import yaml
 from pydantic import ValidationError
@@ -24,9 +26,12 @@ from legal_corpus_ingester.config import Settings
 from legal_corpus_ingester.embedders.localai import LocalAIEmbedder
 from legal_corpus_ingester.errors import LegalReviewGateError
 from legal_corpus_ingester.pipeline.approval_gate import _PLACEHOLDER_SHA, check_approval, load_approval
+from legal_corpus_ingester.pipeline.manifest import MANIFEST_FILENAME, Manifest
 from legal_corpus_ingester.pipeline.orchestrator import Fetcher, Orchestrator
-from legal_corpus_ingester.publishers.base import PublishTarget
-from legal_corpus_ingester.publishers.filesystem import FilesystemPublisher
+from legal_corpus_ingester.pipeline.retention import CALVER_RE, next_version
+from legal_corpus_ingester.publishers.base import PublishReceipt, PublishTarget
+from legal_corpus_ingester.publishers.filesystem import CHECKSUMS_FILENAME, FilesystemPublisher
+from legal_corpus_ingester.publishers.terms_analysis import CURRENT_LINK, TermsAnalysisPublisher
 from legal_corpus_ingester.sources.registry import (
     STAGE_PACKAGES,
     RegistryLoadError,
@@ -36,7 +41,7 @@ from legal_corpus_ingester.sources.registry import (
 )
 from legal_corpus_ingester.sources.schema import SourceConfig
 from legal_corpus_ingester.pipeline.state import STAGE_NOT_APPROVED, CheckpointState, CheckpointStore
-from legal_corpus_ingester.types import FetchResult
+from legal_corpus_ingester.types import Corpus, FetchResult
 from legal_corpus_ingester.provenance.license_audit import (
     DEFAULT_STATE_FILE,
     REFRESH_BASELINE_FILE,
@@ -383,6 +388,24 @@ def _stage_classes(registry: dict[str, SourceConfig], names: list[str]) -> dict[
     return resolved
 
 
+class _StagingPublisher:
+    """Publishes one source to its staging dir, out/<source>/, and keeps it for the run's bundle.
+
+    Staging, not a consumer output (terms-analysis#93 ruling 8): nothing reads out/<source>/.
+    It stays because `fetch` of one source must not repoint out/current at a one-source bundle,
+    so fetch's output is this dir, and the Orchestrator's ALERTS.md lands beside it, never at
+    the out/ root that consumers read. refresh builds its one bundle from the kept corpora.
+    """
+
+    def __init__(self) -> None:
+        self.staged: tuple[Corpus, Manifest] | None = None
+
+    def publish(self, corpus: Corpus, target: PublishTarget, manifest: Manifest) -> PublishReceipt:
+        receipt = FilesystemPublisher().publish(corpus, target, manifest)
+        self.staged = (corpus, manifest)
+        return receipt
+
+
 def _run_sources(
     settings: Settings,
     registry: dict[str, SourceConfig],
@@ -391,7 +414,7 @@ def _run_sources(
     approvals_dir: Path,
     today: date,
     unsigned: dict[str, str],
-) -> None:
+) -> tuple[str, dict[str, tuple[Corpus, Manifest] | None]]:
     """Run the Orchestrator for each source in *names*; exit EXIT_SOURCE_FAILED if any failed.
 
     One failing source does not stop the rest (lead ruling 3): each checkpoints its own failure
@@ -399,10 +422,18 @@ def _run_sources(
     The *unsigned* sources were never run and count as failed (decision B).
     Dirs, the LocalAI URL and model all come from Settings (F13); embedder_model is left to the
     Orchestrator's default (terms-analysis#98 owns it).
+
+    Returns the run's bundle version and each source's staged corpus and manifest (None when
+    its run published nothing), in run order, only when every source succeeded.
     """
+    # One version for the whole run, from the injected date and the bundles on disk (ruling
+    # 8b), so every checkpoint and staged manifest names the version this run would publish.
+    version = next_version(settings.out_dir, today)
+    staged: dict[str, tuple[Corpus, Manifest] | None] = {}
     failed: list[str] = list(unsigned)
     for name in names:
         stage = classes[name]
+        publisher = _StagingPublisher()
         try:
             orchestrator = Orchestrator(
                 fetcher=_ApprovalGatedFetcher(
@@ -411,9 +442,10 @@ def _run_sources(
                 cleaner=stage["cleaner"](),
                 chunker=stage["chunker"](),
                 embedder=LocalAIEmbedder(settings.localai_url, settings.localai_model),
-                publisher=FilesystemPublisher(),
+                publisher=publisher,
                 publish_target=PublishTarget(kind="filesystem", path=settings.out_dir / name),
                 state_dir=settings.state_dir,
+                corpus_version=version,
                 # The licence-drift gate, in its own baseline file under the configured state
                 # dir (terms-analysis#93 rulings J and P): never None, never cwd-relative.
                 license_state_file=settings.state_dir / REFRESH_BASELINE_FILE,
@@ -423,6 +455,7 @@ def _run_sources(
             failed.append(name)
             typer.echo(f"{name}: failed ({_type_name(exc)}).", err=True)
             continue
+        staged[name] = publisher.staged
         typer.echo(f"{name}: published {receipt.chunk_count} chunk(s).")
     if failed:
         typer.echo(
@@ -433,6 +466,126 @@ def _run_sources(
             err=True,
         )
         raise typer.Exit(code=EXIT_SOURCE_FAILED)
+    return version, staged
+
+
+def _combined_bundle(
+    version: str, staged: dict[str, tuple[Corpus, Manifest]]
+) -> tuple[Corpus, Manifest]:
+    """One Corpus and Manifest for every staged source, in run order (ruling 8, item 2).
+
+    The Manifest keeps its schema (no new field). The chunker and embedder fields must agree
+    across sources: one bundle has one index, so a mismatch raises instead of picking one.
+    """
+    corpora = [corpus for corpus, _ in staged.values()]
+    manifests = [manifest for _, manifest in staged.values()]
+    models = {(m.chunker_version, m.embedder_model, m.embedder_revision) for m in manifests}
+    if len(models) != 1:
+        raise ValueError("staged sources disagree on chunker or embedder; no single index")
+    chunker_version, embedder_model, embedder_revision = models.pop()
+    corpus = Corpus(
+        chunks=[chunk for c in corpora for chunk in c.chunks],
+        embeddings=np.vstack([c.embeddings for c in corpora]),
+        corpus_files=[name for c in corpora for name in c.corpus_files],
+    )
+    manifest = Manifest(
+        corpus_version=version,
+        chunker_version=chunker_version,
+        embedder_model=embedder_model,
+        embedder_revision=embedder_revision,
+        sources=list(staged),
+        chunk_count=len(corpus.chunks),
+    )
+    return corpus, manifest
+
+
+def _current_version(out_dir: Path) -> str | None:
+    """The version out/current points at, or None when there is no valid current bundle.
+
+    Valid means a relative link whose target is one bundle name (the retention pattern) naming
+    a real dir under out/. Anything else (missing, absolute, a dir, a dangling name) is not a
+    bundle to compare against, so the run publishes a fresh one (ruling 8c).
+    """
+    link = out_dir / CURRENT_LINK
+    if not link.is_symlink():
+        return None
+    target = os.readlink(link)
+    if not CALVER_RE.fullmatch(target):
+        return None
+    bundle = out_dir / target
+    if bundle.is_symlink() or not bundle.is_dir():
+        return None
+    return target
+
+
+def _content_digests(bundle: Path) -> dict[str, str]:
+    """sha256 of every bundle file but the MANIFEST and the checksums list (ruling 8b, 4a).
+
+    What is left is the bundle's content (corpus/ texts and index/): the MANIFEST names the
+    version, so it differs between any two bundles, and the checksums list covers it. A
+    symlink is listed by its target, so it never compares equal to a real file.
+    """
+    digests: dict[str, str] = {}
+    for path in sorted(bundle.rglob("*")):
+        rel = path.relative_to(bundle).as_posix()
+        if rel in (MANIFEST_FILENAME, CHECKSUMS_FILENAME):
+            continue
+        if path.is_symlink():
+            digests[rel] = "symlink:" + os.readlink(path)
+        elif path.is_file():
+            digests[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digests
+
+
+def _publish_bundle(
+    settings: Settings, version: str, staged: dict[str, tuple[Corpus, Manifest] | None]
+) -> None:
+    """Publish the run's one bundle as out/<version>/ and repoint out/current (ruling 8).
+
+    Only called after every source succeeded. When the content equals the bundle out/current
+    already points at, nothing is published or repointed (ruling 8b, 4a): detect then reports
+    no change, instead of a weekly "new bundle" alert. Any error exits 1 with its type only;
+    out/current is repointed last by TermsAnalysisPublisher, so a failure leaves it as it was.
+    """
+    out_dir = settings.out_dir
+    kept = {name: pair for name, pair in staged.items() if pair is not None}
+    if not kept:
+        # The real Orchestrator always publishes on success, so this is only an Orchestrator
+        # that published nothing: said on stdout, and nothing is published or repointed.
+        typer.echo(f"No source staged a corpus; no bundle published, {CURRENT_LINK} unchanged.")
+        return
+    try:
+        if len(kept) != len(staged):
+            # Some sources staged and some did not: the bundle would silently miss sources.
+            raise ValueError("not every source staged a corpus; the bundle would be partial")
+        corpus, manifest = _combined_bundle(version, kept)
+        current = _current_version(out_dir)
+        if current is not None:
+            out_dir.mkdir(parents=True, exist_ok=True)
+            # The candidate is written by the same FilesystemPublisher layout as the real bundle,
+            # into a dot-named dir that is never a bundle name, and always removed.
+            candidate = Path(tempfile.mkdtemp(prefix=".candidate-", dir=out_dir))
+            try:
+                FilesystemPublisher().publish(
+                    corpus, PublishTarget(kind="filesystem", path=candidate), manifest
+                )
+                unchanged = _content_digests(candidate) == _content_digests(out_dir / current)
+            finally:
+                shutil.rmtree(candidate, ignore_errors=True)
+            if unchanged:
+                typer.echo(f"Bundle unchanged: {CURRENT_LINK} stays at {current}.")
+                return
+        TermsAnalysisPublisher().publish(
+            corpus, PublishTarget(kind="terms_analysis", path=out_dir), manifest
+        )
+    except (OSError, ValueError) as exc:
+        typer.echo(
+            f"Bundle {version} was not published ({_type_name(exc)}); {CURRENT_LINK} was not"
+            " repointed by this run.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(f"Published bundle {version}; {CURRENT_LINK} -> {version}.")
 
 
 def _exit_no_approved_sources(
@@ -665,14 +818,18 @@ def fetch(
 @app.command(
     help=(
         "Refresh every configured source whose approval is valid: fetch, check the approved"
-        " hash, clean, chunk, embed and publish each under INGESTER_OUT_DIR. A source without a"
+        " hash, clean, chunk, embed and stage each under INGESTER_OUT_DIR/<source>, then publish"
+        " one combined bundle as INGESTER_OUT_DIR/<YYYY.M.patch> and repoint the relative link"
+        " INGESTER_OUT_DIR/current at it. A bundle whose content equals the one current points"
+        " at is not published again; a run with a failed source publishes no bundle and leaves"
+        " current as it was; a bundle that cannot be published exits 1. A source without a"
         " valid approval is not run and counts as failed: it is named on stderr and checkpointed"
         " as not_approved. A source whose licence SPDX changed since its recorded baseline is"
         " checkpointed as license_failed and not published. A source whose checkpoint cannot be"
         " written counts as failed. Checkpoints and the licence baseline live under"
         " INGESTER_STATE_DIR. A failing source does not stop the rest.\n\n"
-        "Exit codes: 0 when every configured source is approved and published, or --dry-run"
-        " finds every source approved; "
+        "Exit codes: 0 when every configured source is approved and published (or the bundle"
+        " is unchanged), or --dry-run finds every source approved; "
         + _exit_code_clauses(
             (
                 EXIT_NO_APPROVED_SOURCES,
@@ -745,7 +902,9 @@ def refresh(
 
     # Only after every offline check passed: a load error (exit 1) writes nothing.
     _record_not_approved(settings, unsigned)
-    _run_sources(settings, registry, approved, classes, approvals_dir, today, unsigned)
+    # Exits EXIT_SOURCE_FAILED if any source failed, so a partial run never reaches the bundle.
+    version, staged = _run_sources(settings, registry, approved, classes, approvals_dir, today, unsigned)
+    _publish_bundle(settings, version, staged)
 
 
 @app.command(

@@ -5,13 +5,14 @@ import re
 from datetime import date
 from pathlib import Path
 
-# YYYY.MM.PATCH calver pattern
-_CALVER_RE = re.compile(r"^(\d{4})\.(\d{1,2})\.(\d+)$")
+# YYYY.MM.PATCH calver pattern. Public: next_version and the refresh bundle step read bundle
+# names with this one pattern, so naming and retention cannot drift (terms-analysis#93 ruling 8b).
+CALVER_RE = re.compile(r"^(\d{4})\.(\d{1,2})\.(\d+)$")
 
 
 def _parse_calver(name: str) -> date | None:
     """Parse YYYY.MM.PATCH bundle name -> date(year, month, 1), or None."""
-    m = _CALVER_RE.fullmatch(name)
+    m = CALVER_RE.fullmatch(name)
     if not m:
         return None
     year, month, _patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
@@ -19,6 +20,25 @@ def _parse_calver(name: str) -> date | None:
         return date(year, month, 1)
     except ValueError:
         return None
+
+
+def next_version(out_dir: Path, today: date) -> str:
+    """Return the next bundle version for *today*: ``YYYY.M.N``.
+
+    Year and month come from *today*, which the caller injects (never the wall clock here).
+    N is one more than the highest patch of any real bundle dir under *out_dir* in the same
+    year and month (0 when there is none). It reads the dirs on disk, not ``out/current``, so
+    a lost link never makes a run reuse an existing version (terms-analysis#93 ruling 8b).
+    """
+    patches = [-1]
+    if out_dir.is_dir():
+        for child in out_dir.iterdir():
+            m = CALVER_RE.fullmatch(child.name)
+            if m is None or child.is_symlink() or not child.is_dir():
+                continue
+            if (int(m.group(1)), int(m.group(2))) == (today.year, today.month):
+                patches.append(int(m.group(3)))
+    return f"{today.year}.{today.month}.{max(patches) + 1}"
 
 
 def _quarter(d: date) -> tuple[int, int]:
@@ -61,7 +81,7 @@ def plan(
         if d is None:
             # Ignore non-calver dirs (current, health, etc.)
             continue
-        m = _CALVER_RE.fullmatch(child.name)
+        m = CALVER_RE.fullmatch(child.name)
         # m is guaranteed non-None since _parse_calver returned non-None
         patch = int(m.group(3))  # type: ignore[union-attr]
         entries.append((child, d, patch))

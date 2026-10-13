@@ -48,6 +48,12 @@ issue steps get `GH_TOKEN` (terms-analysis#90).
    not run, it is named on stderr and it is checkpointed as `not_approved`, so a
    partly signed run is red, never a silent partial success. `--dry-run` exits with
    the same code and writes nothing. The full list is in `ingester --help`.
+   When every source succeeds, refresh publishes one combined bundle
+   `out/<YYYY.M.patch>/` (patch = highest that month on disk + 1) and repoints the
+   relative link `out/current` at it. A run with a failed source publishes no bundle
+   and leaves `out/current` alone. A run whose content equals the bundle `out/current`
+   already points at publishes nothing (exit 0), so step 3 reports no change.
+   `out/<source>/` is per-source staging; nothing reads it.
 
 3. **Detect bundle change.** Runs `scripts/detect_bundle_change.py detect`. It reads
    the bundle `out/current` points at and fingerprints it (SHA256 of its

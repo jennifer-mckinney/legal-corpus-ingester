@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from legal_corpus_ingester.pipeline.manifest import Manifest
     from legal_corpus_ingester.types import Corpus
 
+# The name of the relative link under out/ that consumers and detect read for the live bundle.
+CURRENT_LINK = "current"
+
 
 def reload_signal(pid: int) -> None:
     """Send SIGHUP to *pid* to trigger a live reload of the embedding index."""
@@ -69,7 +72,7 @@ class TermsAnalysisPublisher:
         receipt = FilesystemPublisher().publish(corpus, bundle_target, manifest)
 
         # --- 2. Atomically repoint the 'current' symlink ---
-        atomic_symlink(bundle_name, out_dir / "current")
+        atomic_symlink(bundle_name, out_dir / CURRENT_LINK)
 
         # --- 3. Copy hot-reload safety files into out_dir root ---
         shutil.copy2(

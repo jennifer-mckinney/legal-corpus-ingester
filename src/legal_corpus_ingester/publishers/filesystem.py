@@ -52,6 +52,10 @@ def _atomic_save_npy(array: np.ndarray[Any, np.dtype[np.float32]], final_path: P
         raise
 
 
+# The per-file sha256 list every bundle carries; the refresh bundle step reads the name too.
+CHECKSUMS_FILENAME = "checksums.txt"
+
+
 class FilesystemPublisher:
     """Writes a Corpus to a structured directory layout."""
 
@@ -140,7 +144,7 @@ class FilesystemPublisher:
             rel = fpath.relative_to(root)
             checksum_lines.append(f"{sha}  {rel}")
 
-        checksums_path = root / "checksums.txt"
+        checksums_path = root / CHECKSUMS_FILENAME
         checksums_path.write_text("\n".join(checksum_lines) + "\n", encoding="utf-8")
 
         # --- 6. Build and return receipt ---
