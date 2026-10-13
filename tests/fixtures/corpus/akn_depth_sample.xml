@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Hand-written Akoma Ntoso 3.0 fixture for card #95 (AKN cleaner depth).
+  It uses the "akn:" prefix on purpose: the cleaner must match on the
+  namespace URI, not on a prefix (EUR-Lex serves the default namespace;
+  gdpr_akn_sample.xml covers that form).
+  Shapes covered:
+    - an akn:p with an inline akn:ref and tail text inside an akn:section;
+    - an akn:article OUTSIDE any akn:section, with a list intro, point (a)
+      holding nested points (i) and (ii), point (b), and a list wrapUp;
+    - an akn:attachment annex carrying the annex sentinel.
+  Every sentinel string below is unique and none is a substring of another.
+  No sentinel appears in this comment, so a comment leak cannot fake a hit.
+-->
+<akn:akomaNtoso xmlns:akn="http://docs.oasis-open.org/legaldocml/ns/akn/3.0">
+  <akn:act name="regulation">
+    <akn:meta>
+      <akn:identification source="#EU">
+        <akn:FRBRWork><akn:FRBRthis value="CELEX:32016R0679"/></akn:FRBRWork>
+      </akn:identification>
+    </akn:meta>
+    <akn:body>
+      <akn:section eId="sec_1">
+        <akn:heading>Article 6 — Lawfulness of processing</akn:heading>
+        <akn:content>
+          <akn:p>Data under <akn:ref href="#art_6">Art. 6</akn:ref> lawful basis</akn:p>
+        </akn:content>
+      </akn:section>
+      <akn:article eId="art_9">
+        <akn:num>Article 9</akn:num>
+        <akn:heading>Processing of special categories of personal data</akn:heading>
+        <akn:paragraph eId="art_9__para_1">
+          <akn:num>1.</akn:num>
+          <akn:list eId="art_9__para_1__list_1">
+            <akn:intro>
+              <akn:p>list-intro-sentinel applies where one of the following holds:</akn:p>
+            </akn:intro>
+            <akn:point eId="art_9__para_1__list_1__point_a">
+              <akn:num>(a)</akn:num>
+              <akn:intro>
+                <akn:p>alpha-point-sentinel the data subject has given consent, either:</akn:p>
+              </akn:intro>
+              <akn:point eId="art_9__para_1__list_1__point_a__point_i">
+                <akn:num>(i)</akn:num>
+                <akn:content>
+                  <akn:p>alpha-one-subpoint-sentinel for one or more specified purposes;</akn:p>
+                </akn:content>
+              </akn:point>
+              <akn:point eId="art_9__para_1__list_1__point_a__point_ii">
+                <akn:num>(ii)</akn:num>
+                <akn:content>
+                  <akn:p>alpha-two-subpoint-sentinel where Union law so provides;</akn:p>
+                </akn:content>
+              </akn:point>
+            </akn:point>
+            <akn:point eId="art_9__para_1__list_1__point_b">
+              <akn:num>(b)</akn:num>
+              <akn:content>
+                <akn:p>bravo-point-sentinel processing is necessary for employment law;</akn:p>
+              </akn:content>
+            </akn:point>
+            <akn:wrapUp>
+              <akn:p>list-wrapup-sentinel closes the list.</akn:p>
+            </akn:wrapUp>
+          </akn:list>
+        </akn:paragraph>
+      </akn:article>
+    </akn:body>
+    <akn:attachments>
+      <akn:attachment eId="att_1">
+        <akn:doc name="annex">
+          <akn:mainBody>
+            <akn:p>ANNEX I sentinel</akn:p>
+          </akn:mainBody>
+        </akn:doc>
+      </akn:attachment>
+    </akn:attachments>
+  </akn:act>
+</akn:akomaNtoso>
