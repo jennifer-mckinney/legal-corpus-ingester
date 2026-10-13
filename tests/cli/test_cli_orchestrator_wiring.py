@@ -30,6 +30,11 @@ without running one. G. a checkpoint write that fails is a loud source failure, 
 H. a stage-class or approval load error exits 1 before any checkpoint is written (mutant C10).
 I. `fetch --dry-run` of an unsigned source exits 7, offline, as the real fetch does.
 
+Round 8 (2026-10-13, grumpy HIGH at cli.py:415): `refresh` publishes ONE combined calver bundle
+per run through TermsAnalysisPublisher: `out/current` is a relative symlink to a `YYYY.M.N` dir
+that `scripts/detect_bundle_change.py` accepts. Any failed source means no new bundle and no
+repoint; a later successful run makes a new version that detect reports as changed.
+
 The card's `--out <tmp>` is replaced by the `Settings.out_dir` env var (ruling 3).
 """
 
@@ -38,6 +43,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import importlib
+import importlib.util
 import inspect
 import json
 import os
@@ -45,6 +51,7 @@ import pkgutil
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import unicodedata
 import warnings
@@ -52,10 +59,12 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
+import numpy as np
 import pydantic
 import pytest
 import yaml
@@ -305,6 +314,8 @@ class _Net:
     upstream: _Workspace | None = None
     # URL -> body served to the sync client (audit-license's live licence fetch).
     licence_pages: dict[str, bytes] = field(default_factory=dict)
+    # CELEX ids EUR-Lex answers 404 for: one source's fetch fails, the others are served.
+    missing_celex: set[str] = field(default_factory=set)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         url = request.url
@@ -312,6 +323,8 @@ class _Net:
         if ws is not None:
             if url.host == _EURLEX_HOST and "/XML/" in url.path and request.method == "GET":
                 self.served.append(request)
+                if str(url.params.get("uri", "")).removeprefix("CELEX:") in self.missing_celex:
+                    return httpx.Response(404, request=request)
                 return httpx.Response(200, content=ws.body, request=request)
             if request.method == "POST" and str(url) == ws.localai_url.rstrip("/") + "/embeddings":
                 self.served.append(request)
@@ -570,6 +583,9 @@ def test_refresh_all_end_to_end_fetches_only_approved_sources(ws: _Workspace, ne
     for name in _unsigned():
         _assert_not_approved_checkpoint(ws, name)
         assert _named_with(result.stderr, name, "fail"), (name, _why(result))
+    # Round 8 item 3: a partly failed run publishes no bundle and makes no out/current.
+    assert _bundle_versions(ws.out) == set(), _bundle_versions(ws.out)
+    assert not os.path.lexists(ws.out / _CURRENT), "a partly failed run created out/current"
     assert _is_empty(ws.cwd)
 
 
@@ -596,13 +612,13 @@ def test_refresh_spdx_drift_blocks_publish_and_names_the_source(ws_all: _Workspa
     # The stored SPDX differs from the one the fetcher reports: SPDX_DRIFT for eurlex_gdpr only.
     recorded["eurlex_gdpr"]["spdx"] = _HOSTILE_SPDX
     baseline.write_text(json.dumps(recorded), encoding="utf-8")
-    shutil.rmtree(ws.out)
+    # Round 8 item 3: run 1's bundle is the one consumers see; the blocked run must leave it be.
+    _assert_current_bundle(ws, _repo_names())
+    before = _published_state(ws.out)
     second = _invoke(ws.argv("refresh", "--all"))
     assert second.exit_code == _SOURCE_FAILED, _why(second)
     assert _named_with(second.stderr, "eurlex_gdpr", "fail"), _why(second)
-    published = {path.parent.name for path in ws.out.rglob(MANIFEST_FILENAME)}
-    assert "eurlex_gdpr" not in published, "a source with SPDX drift was published"
-    assert published == set(_repo_names()) - {"eurlex_gdpr"}, published
+    assert _published_state(ws.out) == before, "a run with SPDX drift published or repointed a bundle"
     # Round 6 Q (ruling 3): the blocked source checkpoints its own failure, with the reason.
     state = CheckpointStore(ws.state).load("eurlex_gdpr")
     assert state is not None and state.stage == "license_failed", state
@@ -613,6 +629,280 @@ def test_refresh_spdx_drift_blocks_publish_and_names_the_source(ws_all: _Workspa
     _assert_safe_output(second, str(ws.root), str(ws.root.resolve()))
     assert net.attempts == [], net.attempts
     assert _is_empty(ws.cwd)
+
+
+# ---------------------------------------------------------------------------
+# Round 8: one combined calver bundle per run, the contract refresh.yml's detect and record
+# steps read (grumpy HIGH at cli.py:415). The real Orchestrator and publisher run; only EUR-Lex
+# and LocalAI are faked, at the HTTP boundary. detect runs as its own process, as in the workflow.
+# ---------------------------------------------------------------------------
+
+_DETECT_SCRIPT = _REPO / "scripts" / "detect_bundle_change.py"
+# The link name refresh.yml passes to detect and record (`--bundle-link out/current`), and the
+# name TermsAnalysisPublisher repoints.
+_CURRENT = "current"
+
+
+def _load_detect() -> ModuleType:
+    # The script is not a package; load it by path so the tests read its VERSION_RE, not a copy.
+    spec = importlib.util.spec_from_file_location("detect_bundle_change_under_test", _DETECT_SCRIPT)
+    assert spec is not None and spec.loader is not None, _DETECT_SCRIPT
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_DETECT = _load_detect()
+
+
+def _bundle_versions(out: Path) -> set[str]:
+    # Real dirs directly under out/ whose name detect accepts as a bundle version.
+    if not out.is_dir():
+        return set()
+    return {
+        child.name
+        for child in out.iterdir()
+        if child.is_dir() and not child.is_symlink() and _DETECT.VERSION_RE.fullmatch(child.name)
+    }
+
+
+def _tree_digest(root: Path) -> str:
+    # Every path and byte under root, so an in-place rewrite of a bundle shows up.
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*")):
+        digest.update(str(path.relative_to(root)).encode("utf-8", "surrogateescape"))
+        if path.is_symlink():
+            digest.update(b"->" + os.readlink(path).encode("utf-8", "surrogateescape"))
+        elif path.is_file():
+            digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def _published_state(out: Path) -> dict[str, str]:
+    # What a consumer can see: the current link, each version dir, and the files at the out root
+    # (the hot-reload copies). Non-version dirs (per-source staging, if the coder keeps it) are left
+    # out on purpose: the ruling lets the coder choose staging or no per-source output.
+    state: dict[str, str] = {}
+    link = out / _CURRENT
+    if os.path.lexists(link):
+        state[_CURRENT] = os.readlink(link) if link.is_symlink() else "<not a symlink>"
+    for version in _bundle_versions(out):
+        state[version] = _tree_digest(out / version)
+    for child in out.iterdir() if out.is_dir() else ():
+        if child.is_file() and not child.is_symlink():
+            state[child.name] = hashlib.sha256(child.read_bytes()).hexdigest()
+    return state
+
+
+def _embedded_texts(net: _Net) -> int:
+    # Every text the run sent to LocalAI: an independent count of the chunks the run produced.
+    return sum(len(json.loads(request.content)["input"]) for request in net.embed_requests())
+
+
+def _assert_current_bundle(
+    ws: _Workspace, expected_sources: list[str], embedded: int | None = None
+) -> str:
+    """Round 8 item 2. Returns the version out/current points at."""
+    link = ws.out / _CURRENT
+    listing = sorted(p.name for p in ws.out.iterdir()) if ws.out.is_dir() else []
+    assert link.is_symlink(), f"refresh made no out/{_CURRENT} symlink; out/ holds {listing}"
+    target = os.readlink(link)
+    assert not os.path.isabs(target), "out/current is an absolute link; it must survive a moved out/"
+    # One plain version name: no slash, no '..', nothing detect would refuse.
+    assert _DETECT.VERSION_RE.fullmatch(target), f"out/current -> {target!r} is not a version name"
+    bundle = ws.out / target
+    assert bundle.is_dir() and not bundle.is_symlink(), f"out/current -> {target!r} is not a dir"
+    assert bundle.resolve().parent == ws.out.resolve()
+    checksums = bundle / "checksums.txt"
+    assert (bundle / MANIFEST_FILENAME).is_file() and checksums.is_file(), sorted(
+        p.name for p in bundle.iterdir()
+    )
+    assert (bundle / "index").is_dir(), sorted(p.name for p in bundle.iterdir())
+    # The checksums describe this bundle's own bytes, every listed file inside the bundle.
+    lines = [line for line in checksums.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert lines, "checksums.txt lists nothing"
+    for line in lines:
+        sha, _, rel = line.partition("  ")
+        listed = (bundle / rel).resolve()
+        assert listed.is_relative_to(bundle.resolve()) and listed.is_file(), line
+        assert hashlib.sha256(listed.read_bytes()).hexdigest() == sha, f"stale checksum: {line}"
+    manifest = Manifest.load(bundle)
+    assert manifest.corpus_version == target, (manifest.corpus_version, target)
+    assert sorted(manifest.sources) == sorted(expected_sources), manifest.sources
+    # The index holds one row per chunk the MANIFEST counts; with *embedded* (every text the run
+    # embedded), that is every source's chunks, not one source's corpus under every name.
+    rows = np.load(bundle / "index" / "legal_kb.npy", allow_pickle=False).shape[0]
+    assert rows == manifest.chunk_count, (rows, manifest.chunk_count)
+    if embedded is not None:
+        assert manifest.chunk_count == embedded, (manifest.chunk_count, embedded)
+    return target
+
+
+def _bundle_script(
+    ws: _Workspace, command: str, *extra: str
+) -> tuple[subprocess.CompletedProcess[str], dict[str, str]]:
+    """Run detect_bundle_change.py as refresh.yml does: its own process, out/current, a state file."""
+    work = ws.root / "detect-work"
+    work.mkdir(exist_ok=True)
+    github_output = work / "github-output"
+    github_output.unlink(missing_ok=True)
+    args = [
+        sys.executable,
+        str(_DETECT_SCRIPT),
+        command,
+        "--bundle-link",
+        str(ws.out / _CURRENT),
+        "--state-file",
+        str(work / "last-published-bundle.json"),
+        *extra,
+    ]
+    if command == "detect":
+        args += ["--github-output", str(github_output)]
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith(_ENV_PREFIX.upper())}
+    # Never the real state dir, even if --state-file handling regresses.
+    env["XDG_STATE_HOME"] = str(work / "xdg-state")
+    proc = subprocess.run(
+        args, cwd=ws.cwd, env=env, capture_output=True, text=True, timeout=120, check=False
+    )
+    outputs: dict[str, str] = {}
+    if github_output.is_file():
+        for line in github_output.read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.partition("=")
+            if sep:
+                outputs[key] = value
+    return proc, outputs
+
+
+def _calver_key(version: str) -> tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def test_refresh_all_publishes_one_bundle_that_detect_accepts(ws_all: _Workspace, net: _Net) -> None:
+    # Round 8 items 1 and 2: the workflow's own sequence (refresh, seed record, detect).
+    ws = ws_all
+    net.upstream = ws
+    result = _invoke(ws.argv("refresh", "--all"))
+    assert result.exit_code == 0, _why(result)
+    assert net.attempts == [], net.attempts
+    # The consumer first, as the workflow runs it: no record yet, so the first bundle is news
+    # (detect without --require-state). Exit 1 here is the grumpy HIGH: no bundle to read.
+    first, outputs = _bundle_script(ws, "detect")
+    assert first.returncode == 0, f"detect exit {first.returncode}: {first.stderr.strip()}"
+    version = _assert_current_bundle(ws, _repo_names(), embedded=_embedded_texts(net))
+    assert _bundle_versions(ws.out) == {version}, _bundle_versions(ws.out)
+    assert outputs == {"changed": "true", "new_target": version}, outputs
+    seed, _ = _bundle_script(ws, "record")
+    assert seed.returncode == 0, seed.stderr
+    # refresh.yml's detect step: --require-state, record present, same bundle, no news.
+    again, outputs = _bundle_script(ws, "detect", "--require-state")
+    assert again.returncode == 0, again.stderr
+    assert outputs == {"changed": "false", "new_target": version}, outputs
+    assert _is_empty(ws.cwd)
+
+
+# Round 8 item 3: one source fails, by a different stage per row, first or last in the run.
+_PARTIAL_FAILURES = {
+    "not-approved-first": ("unsign", 0),
+    "fetch-404-last": ("missing", -1),
+}
+
+
+@pytest.mark.parametrize("failure", sorted(_PARTIAL_FAILURES))
+def test_failed_source_publishes_nothing_and_keeps_current(
+    ws_all: _Workspace, net: _Net, failure: str
+) -> None:
+    ws = ws_all
+    net.upstream = ws
+    first = _invoke(ws.argv("refresh", "--all"))
+    assert first.exit_code == 0, _why(first)
+    version = _assert_current_bundle(ws, _repo_names())
+    seed, _ = _bundle_script(ws, "record")
+    assert seed.returncode == 0, seed.stderr
+    before = _published_state(ws.out)
+
+    how, position = _PARTIAL_FAILURES[failure]
+    victim = _repo_names()[position]
+    if how == "unsign":
+        ws.unsign(victim)
+    else:
+        net.missing_celex.add(load_all(ws.sources)[victim].pipeline.celex_id)
+    second = _invoke(ws.argv("refresh", "--all"))
+    assert second.exit_code == _SOURCE_FAILED, _why(second)
+    assert _named_with(second.stderr, victim, "fail"), _why(second)
+    # No new version dir, no rewrite of the old one, no repoint, no new hot-reload copies.
+    assert _published_state(ws.out) == before, (sorted(before), sorted(_published_state(ws.out)))
+    assert os.readlink(ws.out / _CURRENT) == version
+    # The workflow's detect after the failed run sees the announced bundle, unchanged.
+    detect, outputs = _bundle_script(ws, "detect", "--require-state")
+    assert detect.returncode == 0, detect.stderr
+    assert outputs == {"changed": "false", "new_target": version}, outputs
+    assert net.attempts == [], net.attempts
+    assert _is_empty(ws.cwd)
+
+
+def test_partial_failure_table_has_a_row_per_failure_stage_and_both_ends() -> None:
+    hows = {how for how, _ in _PARTIAL_FAILURES.values()}
+    positions = {position for _, position in _PARTIAL_FAILURES.values()}
+    assert hows == {"unsign", "missing"} and positions == {0, -1}, _PARTIAL_FAILURES
+
+
+@pytest.mark.parametrize("between_runs", ["keep-current", "current-removed"])
+def test_second_refresh_publishes_a_new_version_detect_reports_changed(
+    ws_all: _Workspace, net: _Net, between_runs: str
+) -> None:
+    # Round 8 item 4. "current-removed": a lost link must not make run 2 reuse run 1's version
+    # dir (the calver comes from what is on disk, not from the link alone).
+    ws = ws_all
+    net.upstream = ws
+    first = _invoke(ws.argv("refresh", "--all"))
+    assert first.exit_code == 0, _why(first)
+    v1 = _assert_current_bundle(ws, _repo_names())
+    v1_digest = _tree_digest(ws.out / v1)
+    seed, _ = _bundle_script(ws, "record")
+    assert seed.returncode == 0, seed.stderr
+    if between_runs == "current-removed":
+        (ws.out / _CURRENT).unlink()
+
+    second = _invoke(ws.argv("refresh", "--all"))
+    assert second.exit_code == 0, _why(second)
+    v2 = _assert_current_bundle(ws, _repo_names())
+    assert v2 != v1, f"run 2 republished version {v1}"
+    # Newer sorts later, as retention orders bundles by (year, month, patch).
+    assert _calver_key(v2) > _calver_key(v1), (v1, v2)
+    assert _bundle_versions(ws.out) == {v1, v2}, _bundle_versions(ws.out)
+    assert _tree_digest(ws.out / v1) == v1_digest, f"run 2 rewrote bundle {v1}"
+
+    detect, outputs = _bundle_script(ws, "detect", "--require-state")
+    assert detect.returncode == 0, detect.stderr
+    assert outputs == {"changed": "true", "new_target": v2}, outputs
+    record, _ = _bundle_script(ws, "record")
+    assert record.returncode == 0, record.stderr
+    settled, outputs = _bundle_script(ws, "detect", "--require-state")
+    assert settled.returncode == 0, settled.stderr
+    assert outputs == {"changed": "false", "new_target": v2}, outputs
+    assert net.attempts == [], net.attempts
+    assert _is_empty(ws.cwd)
+
+
+def test_refresh_replaces_a_planted_absolute_current_link(ws_all: _Workspace, net: _Net) -> None:
+    # Indirection: out/current left pointing outside out/ (absolute) by an old tool or an
+    # attacker. A successful run repoints it to its own relative version; the outside dir is
+    # never written through the link.
+    ws = ws_all
+    net.upstream = ws
+    outside = ws.root / "outside-out"
+    outside.mkdir()
+    (outside / "checksums.txt").write_text("planted\n", encoding="utf-8")
+    planted = _tree_digest(outside)
+    ws.out.mkdir(parents=True)
+    (ws.out / _CURRENT).symlink_to(outside.resolve())
+    result = _invoke(ws.argv("refresh", "--all"))
+    assert result.exit_code == 0, _why(result)
+    _assert_current_bundle(ws, _repo_names())
+    assert _tree_digest(outside) == planted, "refresh wrote through the planted current link"
+    detect, outputs = _bundle_script(ws, "detect")
+    assert detect.returncode == 0, detect.stderr
+    assert outputs["changed"] == "true", outputs
 
 
 # ---------------------------------------------------------------------------
