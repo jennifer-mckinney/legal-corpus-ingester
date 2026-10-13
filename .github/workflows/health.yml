@@ -4,6 +4,15 @@ on:
     - cron: '0 3 * * *'   # 3 AM UTC daily
   workflow_dispatch:
 
+# One state dir for checkpoints, both licence baselines and the bundle record, declared with the
+# same value in refresh.yml and health.yml (terms-analysis#93 ruling K) and persisted between
+# hosted runners by actions/cache (ruling L, ingester #71). It sits outside the checkout, which
+# checkout's clean wipes. Not runner.temp: the runner context is not available in workflow or
+# job env (GitHub contexts reference, context availability; actionlint rejects it), so the dir
+# is the parent of the workspace, the job's own work dir for this repo on a hosted runner.
+env:
+  INGESTER_STATE_DIR: ${{ github.workspace }}/../legal-corpus-ingester-state
+
 # Explicit pipefail: GitHub's default `bash -e` lets `cmd | tail` hide cmd's failure (terms-analysis#90).
 defaults:
   run:
@@ -28,9 +37,19 @@ jobs:
           source .venv/bin/activate
           pip install -e '.[dev]' 2>&1 | tail -5
 
-      # Checkpoints are read from outside the checkout: checkout's `git clean -ffdx` wipes the
-      # gitignored state/ first, so reading ./state always saw every source as never-run.
-      # Refresh must write its checkpoints to this same directory once it is wired (terms-analysis#90).
+      # Restores the newest state refresh.yml saved (ingester #71). Health never saves: it only
+      # reads. A miss (no refresh yet, or the cache evicted) leaves the dir empty, and the health
+      # check then fails every source as never-run: loud, not green.
+      - name: Restore ingester state
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ env.INGESTER_STATE_DIR }}
+          key: ingester-state-${{ runner.os }}-health-${{ github.run_id }}
+          restore-keys: |
+            ingester-state-${{ runner.os }}-
+
+      # Checkpoints are read from the declared INGESTER_STATE_DIR, outside the checkout, which
+      # checkout's clean wipes (terms-analysis#90).
       #
       # Order matters: the health check runs BEFORE `ingester status`. On a malformed checkpoint
       # the health check reports it as exit 4 (invalid checkpoint, #17) and fails the job, so the
@@ -41,7 +60,7 @@ jobs:
           source .venv/bin/activate
           rc=0
           python scripts/health_check.py \
-            --state-dir "${XDG_STATE_HOME:-$HOME/.local/state}/legal-corpus-ingester/state" || rc=$?
+            --state-dir "$INGESTER_STATE_DIR" || rc=$?
           # Only exit 3 (cli.EXIT_NOT_WIRED: refresh is not wired, so no source can have run) is
           # excused, as a warning. Refresh is wired since terms-analysis#93, so health_check.py no
           # longer exits 3; the row stays for the reserved code. Every other non-zero code fails
@@ -63,7 +82,7 @@ jobs:
           # none has run yet. No sources configured, or a sources dir that will not load, exits
           # non-zero with the codes `ingester status --help` lists (terms-analysis#190). No masking
           # (terms-analysis#90).
-          ingester status --state-dir "${XDG_STATE_HOME:-$HOME/.local/state}/legal-corpus-ingester/state"
+          ingester status --state-dir "$INGESTER_STATE_DIR"
 
       - name: Upload health report
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1

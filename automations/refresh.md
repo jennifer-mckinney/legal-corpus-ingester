@@ -12,7 +12,9 @@ terms-analysis consumer.
 The workflow (`.github/workflows/refresh.yml`) fires on:
 
 - Cron schedule: `0 3 * * 0` (Sunday 3 AM UTC)
-- `workflow_dispatch` (manual trigger from the Actions UI or `gh workflow run`)
+- `workflow_dispatch` (manual trigger from the Actions UI or `gh workflow run`). Its one
+  input, `seed_bundle_record` (boolean, default `false`), seeds the first bundle record;
+  see "State between runs" below.
 
 Only one refresh job can run at a time. `cancel-in-progress: false` ensures a
 running refresh is never cancelled mid-bundle -- a partial write would produce an
@@ -28,6 +30,10 @@ issue steps get `GH_TOKEN` (terms-analysis#90).
    no `gh` CLI or the `corpus-refresh` issue label cannot be read, and names the
    fix (`gh label create corpus-refresh`). The label is set once, as the job's
    `ISSUE_LABEL`, and step 4 files under it.
+
+   **Restore ingester state.** `actions/cache/restore` restores `INGESTER_STATE_DIR`
+   from the newest earlier run's save (see "State between runs"). A miss does not fail
+   this step; step 3 makes it a red run.
 
 2. **Run refresh.** Calls `ingester refresh --all` inside the virtualenv, under the
    workflow-level `bash -eo pipefail` shell. Any non-zero exit fails the job, including
@@ -47,9 +53,10 @@ issue steps get `GH_TOKEN` (terms-analysis#90).
    the bundle `out/current` points at and fingerprints it (SHA256 of its
    `checksums.txt` lines, leaving out run-metadata `MANIFEST.yaml`). It compares the
    version and fingerprint with the record of the last announced bundle, kept in
-   `$XDG_STATE_HOME/legal-corpus-ingester/last-published-bundle.json` (default
-   `~/.local/state/...`) on the runner. Sets `changed=true` on a first publish, a new
-   version or new content. The record lives outside the checkout because
+   `$INGESTER_STATE_DIR/last-published-bundle.json`. Sets `changed=true` on a new
+   version or new content. `--require-state` turns a missing record (the first run
+   was not seeded, or the cache was evicted) into exit 2, a red run that announces
+   nothing. The record lives outside the checkout because
    `actions/checkout`'s clean deletes the gitignored `out/`. That is why the old
    "readlink before refresh" comparison always saw an empty value and reported every
    run as a change. If refresh succeeded but `out/current` is missing, or the version
@@ -66,6 +73,10 @@ issue steps get `GH_TOKEN` (terms-analysis#90).
 
 5. **Record announced bundle.** Runs `scripts/detect_bundle_change.py record` only
    after the issue step succeeded. A failed alert is therefore retried on the next run.
+
+   **Save ingester state.** `actions/cache/save` saves `INGESTER_STATE_DIR` with
+   `if: always()`, so the failure checkpoints and licence baseline of a red run persist
+   too, under a key unique to the run and attempt (a cache key is immutable).
 
 6. **Upload health report.** Uploads `out/health/` as a GitHub Actions artifact named
    `health-report-<run_id>`. This step runs with `if: always()` so the artifact is
@@ -126,10 +137,28 @@ all weekly runs.
 ## Where it runs
 
 The `refresh` job runs on GitHub-hosted `ubuntu-latest` (ADR-016). The runner
-filesystem is discarded after each run, so `out/` and the
-`last-published-bundle.json` record in step 3 do not survive between runs.
-Persistence must be designed before refresh is wired; it is tracked as a
-decision card under ADR-016.
+filesystem is discarded after each run, so `out/` does not survive between runs.
+
+## State between runs
+
+Checkpoints, the refresh licence baseline (`refresh-license-baseline.json`), the
+`audit-license` baseline (`license-hashes.json`) and the bundle record
+(`last-published-bundle.json`) all live in one directory, `INGESTER_STATE_DIR`.
+`refresh.yml` and `health.yml` declare it with the same value in their workflow
+`env`: the parent of the workspace, outside the checkout (the `runner` context is not
+available in workflow or job `env`, so `runner.temp` cannot be used there). It
+persists between hosted runners through the `actions/cache/restore` and
+`actions/cache/save` pair (ingester #71, option 1): refresh restores the newest save
+by the `ingester-state-<os>-` prefix and saves under
+`ingester-state-<os>-<run_id>-<run_attempt>`; health restores the same path and never
+saves.
+
+The first run has no record, so detect exits 2. Seed it once: run the workflow by hand
+with `seed_bundle_record` ticked (`gh workflow run refresh.yml -f seed_bundle_record=true`).
+The seed step records the bundle that run published as already announced, before
+detect reads it, so that run announces nothing and later runs compare against it. A
+cache unused for 7 days is evicted; the next refresh is then red (exit 2) until it is
+seeded again, never a silent re-baseline.
 
 ## How to run manually
 

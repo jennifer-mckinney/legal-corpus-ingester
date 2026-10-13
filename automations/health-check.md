@@ -38,13 +38,14 @@ The `health` job runs two checks in this order. Neither step has `if:` or
    (terms-analysis#190). It is not masked; a crash fails the job
    (terms-analysis#90).
 
-Both steps pass `--state-dir "${XDG_STATE_HOME:-$HOME/.local/state}/legal-corpus-ingester/state"`,
-outside the checkout. `actions/checkout` cleans ignored files, which wipes the
-gitignored `state/`, so reading `./state` would always report every source as
-never-run. On a GitHub-hosted runner the whole filesystem is new each run, so
-this directory is empty too until state persistence is designed (ADR-016). When
-refresh is wired it must write its checkpoints to this same directory and
-persist them across runs.
+Both steps pass `--state-dir "$INGESTER_STATE_DIR"`, the directory refresh writes,
+declared with the same value in the workflow `env` of `health.yml` and `refresh.yml`
+and outside the checkout (`actions/checkout` cleans ignored files, which wipes the
+gitignored `state/`). Before them, `actions/cache/restore` restores the state the newest
+refresh run saved (ingester #71); health never saves. On a miss (no refresh has run
+yet, or the cache was evicted after 7 days unused) the directory is empty and the
+health check fails every source as never-run: a red run, not a green one. See
+`automations/refresh.md`, "State between runs".
 
 ## What it produces
 

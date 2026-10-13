@@ -12,6 +12,9 @@ SUCCESS_STAGE = STAGES[-1]
 # Error state written by the CLI for a requested source with no valid approval: it was never
 # fetched (terms-analysis#93, lead rulings B and D).
 STAGE_NOT_APPROVED = "not_approved"
+# Error state written by the Orchestrator when the licence-drift gate blocks a publish
+# (SPDX changed; terms-analysis#93 ruling Q).
+STAGE_LICENSE_FAILED = "license_failed"
 
 
 @dataclass

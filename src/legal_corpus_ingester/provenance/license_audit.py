@@ -5,7 +5,12 @@ import re
 from enum import Enum
 from pathlib import Path
 
+# audit-license's baseline: a hash of the licence PAGE. Resolved by name under
+# Settings.state_dir by the CLI (terms-analysis#93 ruling P).
 DEFAULT_STATE_FILE = Path("state/license-hashes.json")
+# The refresh licence-drift gate's baseline: a hash of the act's TEXT, in its own file under
+# the same state dir, so neither tool overwrites the other's hash (ruling P).
+REFRESH_BASELINE_FILE = "refresh-license-baseline.json"
 
 
 class DriftStatus(str, Enum):

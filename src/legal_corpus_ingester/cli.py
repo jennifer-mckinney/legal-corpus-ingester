@@ -38,6 +38,8 @@ from legal_corpus_ingester.sources.schema import SourceConfig
 from legal_corpus_ingester.pipeline.state import STAGE_NOT_APPROVED, CheckpointState, CheckpointStore
 from legal_corpus_ingester.types import FetchResult
 from legal_corpus_ingester.provenance.license_audit import (
+    DEFAULT_STATE_FILE,
+    REFRESH_BASELINE_FILE,
     hash_content,
     check_license_drift,
     record_license_baseline,
@@ -313,8 +315,11 @@ def _approved_sources(
             approved.append(name)
         else:
             unsigned[name] = problem
-            # Source names passed SourceConfig's name_is_safe allowlist, so echoing them is safe.
-            typer.echo(f"{name}: failed, not run, {problem}.", err=True)
+    # Verdicts are reported only once every approval file has loaded, so a load error (exit 1)
+    # is never preceded by a "failed" verdict (lead ruling 4, round 4 H).
+    for name, problem in unsigned.items():
+        # Source names passed SourceConfig's name_is_safe allowlist, so echoing them is safe.
+        typer.echo(f"{name}: failed, not run, {problem}.", err=True)
     return approved, unsigned
 
 
@@ -409,6 +414,9 @@ def _run_sources(
                 publisher=FilesystemPublisher(),
                 publish_target=PublishTarget(kind="filesystem", path=settings.out_dir / name),
                 state_dir=settings.state_dir,
+                # The licence-drift gate, in its own baseline file under the configured state
+                # dir (terms-analysis#93 rulings J and P): never None, never cwd-relative.
+                license_state_file=settings.state_dir / REFRESH_BASELINE_FILE,
             )
             receipt = orchestrator.run(name, registry[name])
         except Exception as exc:
@@ -418,8 +426,10 @@ def _run_sources(
         typer.echo(f"{name}: published {receipt.chunk_count} chunk(s).")
     if failed:
         typer.echo(
-            f"{len(failed)} source(s) failed: {', '.join(failed)}. Checkpoints in INGESTER_STATE_DIR"
-            " record each failure.",
+            # No claim that every failure is checkpointed: a checkpoint write can itself fail,
+            # and that is named on its own line above (round 4 G).
+            f"{len(failed)} source(s) failed: {', '.join(failed)}. See INGESTER_STATE_DIR for"
+            " their checkpoints.",
             err=True,
         )
         raise typer.Exit(code=EXIT_SOURCE_FAILED)
@@ -583,7 +593,8 @@ def status(
         "Fetch one source and run it through the pipeline: fetch, check the approved hash,"
         " clean, chunk, embed and publish under INGESTER_OUT_DIR (use --dry-run to preview"
         " without writing).\n\n"
-        "Exit codes: 0 when the source is published, or --dry-run prints what would be fetched; "
+        "Exit codes: 0 when the source is published, or --dry-run finds the source approved and"
+        " prints what would be fetched; "
         + _exit_code_clauses(
             (
                 EXIT_NO_APPROVED_SOURCES,
@@ -594,7 +605,8 @@ def status(
             )
         )
         + ". An unknown source in a sources dir that holds sources, invalid INGESTER_* settings,"
-        " an unreadable approvals dir or a malformed approval file also exit 1."
+        " an unreadable approvals dir, a malformed approval file or a pipeline class outside the"
+        " package also exit 1, before any approval verdict, on --dry-run too."
     )
 )
 def fetch(
@@ -631,19 +643,22 @@ def fetch(
 
     cfg = registry[source]
 
-    if dry_run:
-        typer.echo(f"DRY RUN: would fetch {source!r} from {cfg.base_url}")
-        return
-
     # fetch applies the same legal gate as refresh: an unsigned source is refused before any
-    # network call and checkpointed as not_approved (#93 lead decisions A and D).
+    # network call and checkpointed as not_approved (#93 lead decisions A and D). Load errors
+    # exit 1 before any verdict (ruling 4), and --dry-run runs every one of these offline checks
+    # so it exits as the real fetch would, writing nothing (round 4 I).
     settings = _load_settings()
+    classes = _stage_classes(registry, [source])
     approvals_dir = _approvals_dir(settings)
     today = date.today()
     approved, unsigned = _approved_sources([source], approvals_dir, today)
     if not approved:
-        _exit_no_approved_sources(settings, unsigned, dry_run=False)
-    classes = _stage_classes(registry, approved)
+        _exit_no_approved_sources(settings, unsigned, dry_run)
+
+    if dry_run:
+        typer.echo(f"DRY RUN: would fetch {source!r} from {cfg.base_url}")
+        return
+
     _run_sources(settings, registry, approved, classes, approvals_dir, today, {})
 
 
@@ -652,7 +667,10 @@ def fetch(
         "Refresh every configured source whose approval is valid: fetch, check the approved"
         " hash, clean, chunk, embed and publish each under INGESTER_OUT_DIR. A source without a"
         " valid approval is not run and counts as failed: it is named on stderr and checkpointed"
-        " as not_approved. A failing source does not stop the rest.\n\n"
+        " as not_approved. A source whose licence SPDX changed since its recorded baseline is"
+        " checkpointed as license_failed and not published. A source whose checkpoint cannot be"
+        " written counts as failed. Checkpoints and the licence baseline live under"
+        " INGESTER_STATE_DIR. A failing source does not stop the rest.\n\n"
         "Exit codes: 0 when every configured source is approved and published, or --dry-run"
         " finds every source approved; "
         + _exit_code_clauses(
@@ -665,7 +683,8 @@ def fetch(
             )
         )
         + ". Invalid INGESTER_* settings, an unreadable approvals dir, a malformed approval file"
-        " or a pipeline class outside the package also exit 1."
+        " or a pipeline class outside the package also exit 1, before any approval verdict or"
+        " checkpoint, on --dry-run too."
     )
 )
 def refresh(
@@ -700,13 +719,15 @@ def refresh(
 
     # Every check that needs no network runs before the first fetch, and on --dry-run too, so
     # a dry run exits with the code the real run would (lead ruling 5).
+    # Load errors (settings, every source's stage classes, approval files) exit 1 before any
+    # approval verdict or checkpoint (lead ruling 4, round 4 H and the round 5 gap).
     settings = _load_settings()
+    classes = _stage_classes(registry, list(registry))
     approvals_dir = _approvals_dir(settings)
     today = date.today()
     approved, unsigned = _approved_sources(list(registry), approvals_dir, today)
     if not approved:
         _exit_no_approved_sources(settings, unsigned, dry_run)
-    classes = _stage_classes(registry, approved)
 
     if dry_run:
         for name in approved:
@@ -747,10 +768,13 @@ def audit_license(
         "--sources-dir",
         help="Directory containing *.yaml source configs.",
     ),
-    state_file: Path = typer.Option(
-        Path("state/license-hashes.json"),
+    state_file: Path | None = typer.Option(
+        None,
         "--state-file",
-        help="Path to license-hashes.json baseline state file.",
+        help=(
+            f"Baseline state file. Default: {DEFAULT_STATE_FILE.name} under INGESTER_STATE_DIR,"
+            " the state dir refresh uses (never the current directory)."
+        ),
     ),
     update_baseline: bool = typer.Option(
         False,
@@ -783,6 +807,11 @@ def audit_license(
             err=True,
         )
         raise typer.Exit(code=1)
+
+    # One configured state dir for every tool (terms-analysis#93 rulings K and P); audit-license
+    # keeps its own file there, separate from the refresh gate's REFRESH_BASELINE_FILE.
+    if state_file is None:
+        state_file = _load_settings().state_dir / DEFAULT_STATE_FILE.name
 
     cfg = registry[source]
     license_url: str = cfg.license.url
