@@ -84,12 +84,24 @@ jobs:
           restore-keys: |
             ingester-state-${{ runner.os }}-
 
+      # Refresh runs on every trigger; only a ticked seed dispatch adds the licence-baseline seed
+      # flag (cli.REFRESH_SEED_FLAG). A schedule renders the input as '' and a plain dispatch as
+      # 'false', so neither seeds: after a cache miss they exit 9 instead of silently recording
+      # today's licence as the baseline (terms-analysis#93 Round 11). The input reaches bash only
+      # through env and is compared, never pasted into the script.
       - name: Run refresh
+        env:
+          SEED_LICENSE_BASELINE: ${{ inputs.seed_bundle_record }}
         run: |
           source .venv/bin/activate
+          seed=()
+          if [ "$SEED_LICENSE_BASELINE" = "true" ]; then
+            seed=(--seed-license-baseline)
+          fi
           # Any non-zero fails the job. Refresh runs the pipeline (terms-analysis#93): it exits 7 until
-          # the owner signs real approval hashes under config/approvals/, and 8 if a source fails.
-          ingester refresh --all
+          # the owner signs real approval hashes under config/approvals/, 8 if a source fails, and 9
+          # if the licence baseline is missing and this run does not seed it.
+          ingester refresh --all "${seed[@]}"
 
       # Seeds the first bundle record (#71) only when the dispatch input is ticked. The input is
       # read in `if:` only, never pasted into the script. Runs after refresh published, before

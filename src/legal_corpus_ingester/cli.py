@@ -99,6 +99,17 @@ EXIT_NO_APPROVED_SOURCES: int = 7
 # refresh continues with the remaining sources and names every failed one on stderr with the
 # exception type only (terms-analysis#93, lead rulings 1 and 3).
 EXIT_SOURCE_FAILED: int = 8
+# refresh found no licence baseline file (REFRESH_BASELINE_FILE under INGESTER_STATE_DIR is
+# missing, a dangling link or not a regular file) and was not told to seed one, so nothing ran
+# and nothing was written. Without the file every source reads as NEW to the licence-drift gate
+# and the run would silently record today's SPDX as the baseline: after a cache miss that is a
+# re-baseline of a legal control (terms-analysis#93 Round 11, rthoB). A file holding no entry
+# for a source is not missing: that source is NEW and allowed (Round 11 item 3).
+EXIT_LICENSE_BASELINE_MISSING: int = 9
+# The one opt-in past EXIT_LICENSE_BASELINE_MISSING (Round 11 item 2). It accepts the licence
+# each source declares today as the baseline, so the person seeding confirms each licence first.
+# It never overrides SPDX drift against a baseline file that exists.
+REFRESH_SEED_FLAG = "--seed-license-baseline"
 # Help text for each public exit code, rendered as "<code> when <meaning>" clauses by
 # _exit_code_clauses into the top-level epilog and the status help. A meaning must not contain
 # ";" (the clause separator) or square brackets (rich markup).
@@ -128,6 +139,10 @@ _EXIT_MEANINGS: dict[int, str] = {
         "at least one source failed: it was not approved while another was, or it failed to"
         " fetch, match its approved hash, clean, chunk, embed or publish (fetch, refresh), and"
         " each failed source is named on stderr"
+    ),
+    EXIT_LICENSE_BASELINE_MISSING: (
+        "the licence baseline file in the state dir is missing and the run does not seed it"
+        f" with {REFRESH_SEED_FLAG}, so nothing ran and nothing was written (refresh)"
     ),
 }
 # os.stat errno values meaning "this path names no directory": a component is missing or not a
@@ -716,6 +731,36 @@ def _publish_bundle(
     typer.echo(f"Published bundle {version}; {CURRENT_LINK} -> {version}.")
 
 
+def _refresh_baseline_present(state_dir: Path) -> bool:
+    """True only when the refresh licence baseline is a regular file the drift gate can read.
+
+    os.stat follows a link, so a dangling link (ENOENT) is missing; so is a directory, FIFO or
+    other non-regular file in its place. Any other error reading it (EACCES, ELOOP) also counts
+    as missing: the gate fails closed rather than letting the drift check read every source as
+    NEW (terms-analysis#93 Round 11 item 1).
+    """
+    try:
+        mode = os.stat(state_dir / REFRESH_BASELINE_FILE).st_mode
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISREG(mode)
+
+
+def _exit_license_baseline_missing() -> NoReturn:
+    """Exit EXIT_LICENSE_BASELINE_MISSING before any source runs, writing nothing (Round 11).
+
+    The reason only: no path, and no source name, since no source failed.
+    """
+    typer.echo(
+        "The refresh licence baseline in INGESTER_STATE_DIR is missing or not a regular file;"
+        f" nothing ran and {CURRENT_LINK} was not repointed. Restore the state, or confirm each"
+        f" source's current licence (SPDX) and run with {REFRESH_SEED_FLAG} to accept it as the"
+        " baseline.",
+        err=True,
+    )
+    raise typer.Exit(code=EXIT_LICENSE_BASELINE_MISSING)
+
+
 def _exit_no_approved_sources(
     settings: Settings, unsigned: dict[str, str], dry_run: bool
 ) -> NoReturn:
@@ -961,12 +1006,14 @@ def fetch(
         " as not_approved. A source whose licence SPDX changed since its recorded baseline is"
         " checkpointed as license_failed and not published. A source whose checkpoint cannot be"
         " written counts as failed. Checkpoints and the licence baseline live under"
-        " INGESTER_STATE_DIR. A failing source does not stop the rest.\n\n"
+        " INGESTER_STATE_DIR. A failing source does not stop the rest. A missing licence"
+        f" baseline file stops the run before any source unless {REFRESH_SEED_FLAG} is given.\n\n"
         "Exit codes: 0 when every configured source is approved and published (or the bundle"
         " is unchanged), or --dry-run finds every source approved; "
         + _exit_code_clauses(
             (
                 EXIT_NO_APPROVED_SOURCES,
+                EXIT_LICENSE_BASELINE_MISSING,
                 EXIT_SOURCE_FAILED,
                 EXIT_NO_SOURCES,
                 EXIT_SOURCES_DIR_MISSING,
@@ -988,6 +1035,15 @@ def refresh(
         False,
         "--dry-run",
         help="List the sources that would run, without fetching or writing anything.",
+    ),
+    seed_license_baseline: bool = typer.Option(
+        False,
+        REFRESH_SEED_FLAG,
+        help=(
+            "Run even though the licence baseline file is missing, and record the licence"
+            " (SPDX) each source declares today as the baseline. Confirm each licence first."
+            " Never overrides a licence change against an existing baseline."
+        ),
     ),
     # A plain str, not Path: typer's Path type stats the argument itself and fails on NUL or a
     # lone surrogate before _require_sources_dir can classify it (#108).
@@ -1029,6 +1085,11 @@ def refresh(
     approved, unsigned = _approved_sources(list(registry), approvals_dir, today)
     if not approved:
         _exit_no_approved_sources(settings, unsigned, dry_run)
+    # Exit 7 above stays first (ruling 11b-b): with nothing approved nothing can publish, so the
+    # licence gate has nothing to guard. Otherwise a missing baseline stops the run here, before
+    # any checkpoint, fetch or record, on --dry-run too, unless the run explicitly seeds it.
+    if not seed_license_baseline and not _refresh_baseline_present(settings.state_dir):
+        _exit_license_baseline_missing()
 
     if dry_run:
         for name in approved:

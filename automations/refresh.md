@@ -41,9 +41,13 @@ issue steps get `GH_TOKEN` (terms-analysis#90).
    broken checkout), 6 (`EXIT_SOURCES_DIR_MISSING`: `config/sources/` does not exist
    or is not a directory, also a broken checkout; #108), 7 (`EXIT_NO_APPROVED_SOURCES`:
    no source holds a valid approval, so nothing ran; every repo approval is a
-   placeholder until the owner signs real hashes, so the run is red until then) and
+   placeholder until the owner signs real hashes, so the run is red until then),
    8 (`EXIT_SOURCE_FAILED`: at least one source failed; each is named on stderr and
-   checkpointed, and the remaining sources still run; terms-analysis#93). A source
+   checkpointed, and the remaining sources still run; terms-analysis#93) and 9
+   (`EXIT_LICENSE_BASELINE_MISSING`: the licence baseline file is missing and the run
+   does not seed it, so nothing ran and nothing was written; see "State between runs").
+   The step passes `--seed-license-baseline` only on a dispatch with
+   `seed_bundle_record` ticked; a scheduled run never seeds. A source
    without a valid approval, while another source has one, is such a failure: it is
    not run, it is named on stderr and it is checkpointed as `not_approved`, so a
    partly signed run is red, never a silent partial success. `--dry-run` exits with
@@ -169,18 +173,33 @@ by the `ingester-state-<os>-` prefix and saves under
 `ingester-state-<os>-<run_id>-<run_attempt>`; health restores the same path and never
 saves.
 
-The first run has no record, so detect exits 2. Seed it once: run the workflow by hand
-with `seed_bundle_record` ticked (`gh workflow run refresh.yml -f seed_bundle_record=true`).
-The seed step records the bundle that run published as already announced, before
-detect reads it, so that run announces nothing and later runs compare against it. A
-cache unused for 7 days is evicted; the next refresh is then red (exit 2) until it is
-seeded again, never a silent re-baseline.
+The first run has neither the bundle record nor the refresh licence baseline
+(`refresh-license-baseline.json`), so an unseeded refresh exits 9 before any source runs
+and writes nothing. Seed both once: run the workflow by hand with `seed_bundle_record`
+ticked (`gh workflow run refresh.yml -f seed_bundle_record=true`). That run passes
+`--seed-license-baseline` to refresh, which records the licence (SPDX) each source
+declares today in `refresh-license-baseline.json`: seeding accepts the current SPDX as
+the baseline, with no drift check against an earlier one, so confirm each source's
+current licence before you tick the box. The seed step then records the bundle that
+run published as already announced, before detect reads it, so that run announces
+nothing and later runs compare against it.
+
+A cache unused for 7 days is evicted. The next scheduled run then finds no
+`refresh-license-baseline.json` and exits 9 (and, were the baseline present, a missing
+bundle record still exits 2 in detect), red until it is seeded again: never a silent
+re-baseline of the licence baseline or the bundle record. The seed flag only replaces a
+missing `refresh-license-baseline.json`; a source whose SPDX changed against an existing
+baseline is still blocked as `license_failed`, seed or not. A baseline file with no
+entry for a newly approved source is not missing: that source is new and runs.
 
 ## How to run manually
 
 ```bash
 source .venv/bin/activate
 ingester refresh --all
+# First run, or the state dir was lost: confirm each source's licence, then seed the
+# licence baseline (otherwise refresh exits 9 and writes nothing).
+ingester refresh --all --seed-license-baseline
 # The consumer check imports backend.app.services.legal_kb from terms-analysis.
 # Point PYTHONPATH at its src/ directory, or the command exits 4 (EXIT_CONSUMER_SKIPPED).
 PYTHONPATH=<terms-analysis>/src ingester validate-round-trip out/current
