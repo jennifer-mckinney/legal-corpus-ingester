@@ -35,6 +35,10 @@ per run through TermsAnalysisPublisher: `out/current` is a relative symlink to a
 that `scripts/detect_bundle_change.py` accepts. Any failed source means no new bundle and no
 repoint. Round 8b: a second run with identical content publishes nothing new (detect: unchanged);
 one with changed content makes a newer version that detect reports as changed.
+Round 9: a run where every source succeeded yet none staged a corpus exits 1 naming them; the
+spy Orchestrator stages through the publisher it is given, as the real one does. A current that
+is not a relative link to a real version dir counts as missing (republish); bundle errors exit 1
+with the exception type only and leave current as it was.
 
 The card's `--out <tmp>` is replaced by the `Settings.out_dir` env var (ruling 3).
 """
@@ -89,12 +93,14 @@ from legal_corpus_ingester.pipeline.approval_gate import (
     load_approval,
 )
 from legal_corpus_ingester.pipeline.manifest import MANIFEST_FILENAME, Manifest
+from legal_corpus_ingester.pipeline.retention import next_version
 from legal_corpus_ingester.pipeline.orchestrator import Orchestrator as RealOrchestrator
 from legal_corpus_ingester.pipeline.state import STAGES, CheckpointState, CheckpointStore
 from legal_corpus_ingester.provenance import license_audit
 from legal_corpus_ingester.provenance.license_audit import DEFAULT_STATE_FILE as AUDIT_BASELINE_FILE
 from legal_corpus_ingester.publishers.base import PublishReceipt
 from legal_corpus_ingester.sources.registry import load_all
+from legal_corpus_ingester.types import Chunk, Corpus, ProvenanceRecord
 from tests.cli.helpers import PUBLIC_EXIT_CODES, strip_ansi
 
 runner = CliRunner()
@@ -276,14 +282,79 @@ def ws_all(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Workspace:
 # ---------------------------------------------------------------------------
 
 
+# The chunker and embedder fields every spy-staged Manifest carries unless a test overrides one
+# source's (the combined bundle has one index, so they must agree across sources).
+_SPY_MODELS = ("chunker-under-test", "embedder-under-test", "revision-under-test")
+
+
 @dataclass
 class _Spy:
     constructed: list[inspect.BoundArguments] = field(default_factory=list)
     runs: list[tuple[str, Any]] = field(default_factory=list)
     fail_with: dict[str, BaseException] = field(default_factory=dict)
+    # Round 9: a successful spy run stages a one-chunk corpus through the publisher it was given,
+    # as the real Orchestrator does. *unstaged* names the sources whose run succeeds yet stages
+    # nothing; *models* overrides one source's (chunker_version, embedder_model, embedder_revision).
+    unstaged: set[str] = field(default_factory=set)
+    models: dict[str, tuple[str, str, str]] = field(default_factory=dict)
+    # Sources whose staged text carries one more sentence: the bundle content changes.
+    amended: set[str] = field(default_factory=set)
 
     def run_names(self) -> list[str]:
         return [name for name, _ in self.runs]
+
+    def stage(self, bound: inspect.BoundArguments, source_name: str) -> PublishReceipt | None:
+        if source_name in self.unstaged:
+            return None
+        args = _with_defaults(bound)
+        chunker_version, embedder_model, embedder_revision = self.models.get(source_name, _SPY_MODELS)
+        text = f"{source_name} text staged by the spy"
+        if source_name in self.amended:
+            text += " Amended under test."
+        provenance = ProvenanceRecord(
+            source_url=f"https://{_EURLEX_HOST}/spy/{source_name}",
+            fetch_timestamp=_SPY_FETCHED_AT,
+            license="CC-BY-4.0",
+            upstream_version=None,
+            content_sha256=hashlib.sha256(text.encode()).hexdigest(),
+            source_name=source_name,
+            fetcher_class="tests.cli.SpyFetcher",
+        )
+        chunk = Chunk(
+            text=text,
+            section="Article 1",
+            metadata={"chunk_index": 0},
+            provenance=provenance,
+            offset_start=0,
+            offset_end=len(text),
+        )
+        # One deterministic unit row per source, so two identical runs stage identical bytes.
+        row = np.random.default_rng(int(provenance.content_sha256[:8], 16)).random((1, _SPY_DIM))
+        embeddings = (row / np.linalg.norm(row, axis=1, keepdims=True)).astype(np.float32)
+        corpus = Corpus(chunks=[chunk], embeddings=embeddings, corpus_files=[f"{source_name}.xml"])
+        manifest = Manifest(
+            corpus_version=args["corpus_version"],
+            chunker_version=chunker_version,
+            embedder_model=embedder_model,
+            embedder_revision=embedder_revision,
+            sources=[source_name],
+            chunk_count=1,
+        )
+        receipt: PublishReceipt = args["publisher"].publish(corpus, args["publish_target"], manifest)
+        return receipt
+
+
+# The embedding width the real publisher and terms-analysis index expect.
+_SPY_DIM = 1024
+# One fixed fetch time, so two spy runs of the same source stage the same bytes.
+_SPY_FETCHED_AT = "2026-01-01T00:00:00Z"
+
+
+def _with_defaults(bound: inspect.BoundArguments) -> dict[str, Any]:
+    # A copy with the constructor's defaults filled in: what the Orchestrator would actually use.
+    full = inspect.BoundArguments(bound.signature, bound.arguments.copy())
+    full.apply_defaults()
+    return dict(full.arguments)
 
 
 @pytest.fixture
@@ -294,12 +365,16 @@ def spy(monkeypatch: pytest.MonkeyPatch) -> _Spy:
 
     class SpyOrchestrator:
         def __init__(self, *args: Any, **kwargs: Any) -> None:
-            record.constructed.append(signature.bind(*args, **kwargs))
+            self.bound = signature.bind(*args, **kwargs)
+            record.constructed.append(self.bound)
 
         def run(self, source_name: str, source_config: object) -> PublishReceipt:
             record.runs.append((source_name, source_config))
             if source_name in record.fail_with:
                 raise record.fail_with[source_name]
+            receipt = record.stage(self.bound, source_name)
+            if receipt is not None:
+                return receipt
             digest = hashlib.sha256(source_name.encode()).hexdigest()
             return PublishReceipt(chunk_count=1, matrix_sha256=digest, metadata_sha256=digest)
 
@@ -547,6 +622,11 @@ def test_orchestrator_dirs_come_from_settings(ws_all: _Workspace, spy: _Spy, net
         baselines.add(Path(baseline).resolve())
     # Round 6 P: the gate's own file, never audit-license's license-hashes.json.
     assert baselines == {ws.state.resolve() / _refresh_baseline_name()}, baselines
+    # Round 9 M8: every Orchestrator gets the run's one version, the one the bundle is published
+    # under, so checkpoints and staged manifests never name a default or a different version.
+    published = _assert_current_bundle(ws, _repo_names())
+    versions = {_with_defaults(bound)["corpus_version"] for bound in spy.constructed}
+    assert versions == {published}, (versions, published)
     assert _is_empty(ws.cwd)
 
 
@@ -795,6 +875,12 @@ def test_refresh_all_publishes_one_bundle_that_detect_accepts(ws_all: _Workspace
     version = _assert_current_bundle(ws, _repo_names(), embedded=_embedded_texts(net))
     assert _bundle_versions(ws.out) == {version}, _bundle_versions(ws.out)
     assert outputs == {"changed": "true", "new_target": version}, outputs
+    # Round 9 M8, with the real Orchestrator: each source's last checkpoint names the version
+    # the run published (health and status read these), never the Orchestrator's default.
+    for name in _repo_names():
+        checkpoint = CheckpointStore(ws.state).load(name)
+        assert checkpoint is not None, name
+        assert checkpoint.corpus_version == version, (name, checkpoint.corpus_version, version)
     seed, _ = _bundle_script(ws, "record")
     assert seed.returncode == 0, seed.stderr
     # refresh.yml's detect step: --require-state, record present, same bundle, no news.
@@ -943,6 +1029,224 @@ def test_refresh_replaces_a_planted_absolute_current_link(ws_all: _Workspace, ne
     detect, outputs = _bundle_script(ws, "detect")
     assert detect.returncode == 0, detect.stderr
     assert outputs["changed"] == "true", outputs
+
+
+# ---------------------------------------------------------------------------
+# Round 9 (2026-10-13). MEDIUM: a run where every source succeeded yet none staged a corpus
+# fails closed (exit 1, naming the sources), never a green run that published nothing. And the
+# coder's surviving mutants: M5 (any current target accepted), M8 (the run version not passed
+# to the Orchestrator), M10 (a missing current read as "unchanged"), plus the bundle error paths.
+# ---------------------------------------------------------------------------
+
+
+def _spy_first_run(ws: _Workspace, spy: _Spy) -> str:
+    """A clean spy run that publishes; returns the version out/current points at."""
+    first = _invoke(ws.argv("refresh", "--all"))
+    assert first.exit_code == 0, _why(first)
+    assert spy.run_names() == _repo_names(), _why(first)
+    return _assert_current_bundle(ws, _repo_names())
+
+
+@pytest.mark.parametrize("before", ["current-exists", "no-current"])
+def test_refresh_where_no_source_staged_fails_closed_naming_them(
+    ws_all: _Workspace, spy: _Spy, net: _Net, before: str
+) -> None:
+    # Every requested source ran without error and none staged a corpus. Exit 0 here would be
+    # indistinguishable from "content unchanged" (detect: changed=false): the silent success
+    # the owner rules highest-risk. Ruling: exit 1, a message naming the sources, out/ as it was.
+    ws = ws_all
+    if before == "current-exists":
+        _spy_first_run(ws, spy)
+        spy.runs.clear()
+    state = _published_state(ws.out) if ws.out.is_dir() else {}
+    spy.unstaged = set(_repo_names())
+    result = _invoke(ws.argv("refresh", "--all"))
+    assert result.exit_code == 1, _why(result)
+    assert spy.run_names() == _repo_names(), _why(result)
+    for name in _repo_names():
+        assert name in result.stderr, (name, _why(result))
+    assert (_published_state(ws.out) if ws.out.is_dir() else {}) == state
+    _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
+    assert net.attempts == []
+    assert _is_empty(ws.cwd)
+
+
+def _repoint(ws: _Workspace, target: str) -> None:
+    link = ws.out / _CURRENT
+    link.unlink()
+    link.symlink_to(target)
+
+
+def _other_month_calver(ws: _Workspace) -> str:
+    # A well-formed version name the run's own next_version never picks (another year).
+    return f"{ws.today.year - 1}.{ws.today.month}.0"
+
+
+def _current_missing(ws: _Workspace, v1: str) -> None:
+    (ws.out / _CURRENT).unlink()
+
+
+def _current_to_non_calver_copy(ws: _Workspace, v1: str) -> None:
+    shutil.copytree(ws.out / v1, ws.out / "latest", symlinks=True)
+    _repoint(ws, "latest")
+
+
+def _current_to_calver_file(ws: _Workspace, v1: str) -> None:
+    (ws.out / _other_month_calver(ws)).write_bytes(b"not a bundle\n")
+    _repoint(ws, _other_month_calver(ws))
+
+
+def _current_to_calver_symlink(ws: _Workspace, v1: str) -> None:
+    # A version-named link to the real bundle: the name passes, but it is no bundle dir.
+    (ws.out / _other_month_calver(ws)).symlink_to(v1)
+    _repoint(ws, _other_month_calver(ws))
+
+
+def _symlink_inside_bundle(ws: _Workspace, v1: str) -> None:
+    # One corpus file swapped for a link to an identical copy outside out/: the bytes a reader
+    # gets are the same, but the bundle no longer holds its own content.
+    victim = sorted(p for p in (ws.out / v1 / "corpus").rglob("*") if p.is_file())[0]
+    outside = ws.root / "outside-copy.txt"
+    shutil.copyfile(victim, outside)
+    victim.unlink()
+    victim.symlink_to(outside)
+
+
+# How out/ is left between two runs whose staged content is identical -> what run 2 must do.
+# "unchanged": publish nothing (4a). "republish": a new, higher version and current -> it.
+_CURRENT_BETWEEN_RUNS: dict[str, tuple[Callable[[_Workspace, str], None], str]] = {
+    "valid-current": (lambda ws, v1: None, "unchanged"),
+    "missing (M10, ruling 8c)": (_current_missing, "republish"),
+    "non-calver-copy (M5)": (_current_to_non_calver_copy, "republish"),
+    "dot-slash (M5)": (lambda ws, v1: _repoint(ws, f"./{v1}"), "republish"),
+    "trailing-slash (M5)": (lambda ws, v1: _repoint(ws, f"{v1}/"), "republish"),
+    "parent-hop (M5)": (lambda ws, v1: _repoint(ws, f"../{ws.out.name}/{v1}"), "republish"),
+    "calver-file": (_current_to_calver_file, "republish"),
+    "calver-symlink": (_current_to_calver_symlink, "republish"),
+    "symlink-inside-bundle": (_symlink_inside_bundle, "republish"),
+}
+
+
+def test_current_between_runs_table_has_both_outcomes() -> None:
+    # Contract: the positive control (a valid current, nothing published) sits beside the
+    # republish rows, so a run that always or never publishes fails at least one row.
+    outcomes = [outcome for _, outcome in _CURRENT_BETWEEN_RUNS.values()]
+    assert set(outcomes) == {"unchanged", "republish"}, outcomes
+    assert outcomes.count("unchanged") == 1
+
+
+@pytest.mark.parametrize("between", list(_CURRENT_BETWEEN_RUNS))
+def test_identical_refresh_republishes_unless_current_is_a_real_bundle(
+    ws_all: _Workspace, spy: _Spy, net: _Net, between: str
+) -> None:
+    # Round 9 M5 and M10, and the cli.py:517 and :534 paths. Only a relative link whose target
+    # is one version name naming a real, symlink-free bundle dir is compared against; any other
+    # current is treated as missing, so run 2 publishes a fresh version and repoints current.
+    ws = ws_all
+    v1 = _spy_first_run(ws, spy)
+    setup, outcome = _CURRENT_BETWEEN_RUNS[between]
+    setup(ws, v1)
+    kept = {name: _tree_digest(ws.out / name) for name in _bundle_versions(ws.out)}
+    state = _published_state(ws.out)
+    outside = {p: p.read_bytes() for p in ws.root.glob("outside-*")}
+
+    second = _invoke(ws.argv("refresh", "--all"))
+    assert second.exit_code == 0, _why(second)
+    if outcome == "unchanged":
+        assert _published_state(ws.out) == state, (sorted(state), sorted(_published_state(ws.out)))
+        return
+    v2 = _assert_current_bundle(ws, _repo_names())
+    assert v2 not in kept, f"run 2 reused version {v2}"
+    assert _calver_key(v2) > _calver_key(v1), (v1, v2)
+    assert not any(p.is_symlink() for p in (ws.out / v2).rglob("*")), "the new bundle holds a link"
+    assert {name: _tree_digest(ws.out / name) for name in kept} == kept, "run 2 rewrote an old bundle"
+    assert {p: p.read_bytes() for p in outside} == outside, "run 2 wrote through a planted link"
+    detect, outputs = _bundle_script(ws, "detect")
+    assert detect.returncode == 0, detect.stderr
+    assert outputs["new_target"] == v2, outputs
+    _assert_safe_output(second, str(ws.root), str(ws.root.resolve()))
+    assert net.attempts == []
+
+
+def _mismatch(field_index: int) -> Callable[[_Workspace, _Spy, str], None]:
+    def setup(ws: _Workspace, spy: _Spy, v1: str) -> None:
+        models = list(_SPY_MODELS)
+        # A forged workflow command in the odd value: it must never reach the output.
+        models[field_index] = f"{models[field_index]}-other\n::error::forged"
+        spy.models[_repo_names()[-1]] = (models[0], models[1], models[2])
+        spy.amended = set(_repo_names())
+
+    return setup
+
+
+def _unstaged(index: int) -> Callable[[_Workspace, _Spy, str], None]:
+    def setup(ws: _Workspace, spy: _Spy, v1: str) -> None:
+        spy.unstaged = {_repo_names()[index]}
+        spy.amended = set(_repo_names())
+
+    return setup
+
+
+def _file_at_next_version(ws: _Workspace, spy: _Spy, v1: str) -> None:
+    # A stray regular file holds the name this run would publish under, and current points at
+    # it: not a bundle (cli.py:517), and the bundle write cannot create the dir.
+    stray = next_version(ws.out, ws.today)
+    (ws.out / stray).write_bytes(b"not a bundle\n")
+    _repoint(ws, stray)
+
+
+def _out_read_only(ws: _Workspace, spy: _Spy, v1: str) -> None:
+    spy.amended = set(_repo_names())
+    ws.out.chmod(0o555)
+
+
+def _root_copy_blocked(ws: _Workspace, spy: _Spy, v1: str) -> None:
+    # The hot-reload copy at the out/ root cannot be replaced (a dir holding a dir of the same
+    # name sits there). The run must fail before it repoints current, not after.
+    spy.amended = set(_repo_names())
+    root_copy = ws.out / "legal_kb.npy"
+    root_copy.unlink()
+    (root_copy / root_copy.name).mkdir(parents=True)
+
+
+# Round 9 error paths -> (setup, the exception type the run names). Every row: exit 1, the
+# type on stderr, no raw message or path, out/current and every published byte as they were.
+_BUNDLE_ERRORS: dict[str, tuple[Callable[[_Workspace, _Spy, str], None], type[BaseException]]] = {
+    "chunker-mismatch": (_mismatch(0), ValueError),
+    "embedder-mismatch": (_mismatch(1), ValueError),
+    "revision-mismatch": (_mismatch(2), ValueError),
+    "partial-staging-first": (_unstaged(0), ValueError),
+    "partial-staging-last": (_unstaged(-1), ValueError),
+    "current-to-file-at-next-version": (_file_at_next_version, FileExistsError),
+    "out-read-only": (_out_read_only, PermissionError),
+    "root-copy-blocked": (_root_copy_blocked, IsADirectoryError),
+}
+
+
+@pytest.mark.parametrize("case", list(_BUNDLE_ERRORS))
+def test_bundle_error_exits_one_with_the_type_only_and_keeps_current(
+    ws_all: _Workspace, spy: _Spy, net: _Net, case: str
+) -> None:
+    ws = ws_all
+    if case == "out-read-only" and os.geteuid() == 0:
+        pytest.fail("root ignores the read-only out/ dir; run the suite as a normal user")
+    v1 = _spy_first_run(ws, spy)
+    setup, error = _BUNDLE_ERRORS[case]
+    try:
+        setup(ws, spy, v1)
+        state = _published_state(ws.out)
+        result = _invoke(ws.argv("refresh", "--all"))
+    finally:
+        ws.out.chmod(0o755)
+    assert result.exit_code == 1, _why(result)
+    assert error.__name__ in result.stderr, _why(result)
+    assert "Traceback" not in _output(result) and "forged" not in _output(result), _why(result)
+    # current, every bundle that was there and the root copies are as they were. A new version
+    # dir left behind is not pinned: nothing points at it and the next run numbers past it.
+    after = _published_state(ws.out)
+    assert {key: after.get(key) for key in state} == state, (sorted(state), sorted(after))
+    _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
+    assert net.attempts == []
 
 
 # ---------------------------------------------------------------------------
