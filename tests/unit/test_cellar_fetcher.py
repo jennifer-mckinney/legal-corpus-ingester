@@ -1141,6 +1141,37 @@ def test_download_at_the_cap_is_accepted(net: FakeNet, tmp_path: Path) -> None:
 
 # --- the CELEX argument is validated before any request --------------------------
 
+
+def _non_ascii_digit_celex() -> list[tuple[str, str]]:
+    """One CELEX per Unicode decimal-digit script (category Nd, generated), e.g. fullwidth,
+    Arabic-Indic and Devanagari. Python's ``\\d`` matches all of them unless ``re.ASCII`` is set.
+
+    Each script yields two ids: every digit swapped, and one swapped digit in an otherwise
+    ASCII id (a check that only looks at the first character is not enough).
+    """
+    out: list[tuple[str, str]] = []
+    for cp in range(0x110000):
+        ch = chr(cp)
+        if cp == 0x30 or unicodedata.category(ch) != "Nd" or unicodedata.digit(ch) != 0:
+            continue
+        table = str.maketrans("0123456789", "".join(chr(cp + i) for i in range(10)))
+        out.append((f"digits-U+{cp:04X}-all", "32024R1689".translate(table)))
+        out.append((f"digits-U+{cp:04X}-one", "32024R168" + "9".translate(table)))
+    return out
+
+
+def test_non_ascii_digit_vectors_cover_named_scripts() -> None:
+    """Contract: the generated table includes the scripts the lead named, and every entry
+    really is a `\\d` match that `re.ASCII` refuses (so the vectors test what they claim)."""
+    names = {v[0] for v in _BAD_CELEX}
+    for zero in (0xFF10, 0x0660, 0x0966):  # fullwidth, Arabic-Indic, Devanagari
+        assert f"digits-U+{zero:04X}-all" in names and f"digits-U+{zero:04X}-one" in names
+    unicode_re = re.compile(r"\d{5}[A-Z]\d{4}")
+    ascii_re = re.compile(r"\d{5}[A-Z]\d{4}", re.ASCII)
+    for name, celex in _BAD_CELEX:
+        if name.startswith("digits-U+"):
+            assert unicode_re.fullmatch(celex) and not ascii_re.fullmatch(celex), name
+
 _BAD_CELEX: list[tuple[str, str]] = [
     ("empty", ""),
     ("slash", "32024R1689/x"),
@@ -1151,7 +1182,11 @@ _BAD_CELEX: list[tuple[str, str]] = [
     ("space", "32024R 1689"),
     ("trailing-space", "32024R1689 "),
     ("url", "https://evil.test/x"),
-] + [(f"char-U+{ord(ch):04X}", f"32024R{ch}1689") for ch in _break_chars()]
+    ("lone-surrogate", "32024R\ud8001689"),
+    ("lone-low-surrogate-tail", "32024R1689\udc00"),
+    # str.isdigit() accepts superscripts (category No) although `\d` does not.
+    ("superscript-digits", "³²⁰²⁴R¹⁶⁸⁹"),
+] + [(f"char-U+{ord(ch):04X}", f"32024R{ch}1689") for ch in _break_chars()] + _non_ascii_digit_celex()
 
 
 @pytest.mark.parametrize("celex", [v[1] for v in _BAD_CELEX], ids=[v[0] for v in _BAD_CELEX])
