@@ -39,6 +39,12 @@ Round 9: a run where every source succeeded yet none staged a corpus exits 1 nam
 spy Orchestrator stages through the publisher it is given, as the real one does. A current that
 is not a relative link to a real version dir counts as missing (republish); bundle errors exit 1
 with the exception type only and leave current as it was.
+Round 10b (owner, option 2): hosted runners cache INGESTER_STATE_DIR but not out/, so out/current
+never exists at run start. After each full publish the cli writes a producer version record
+(`cli.VERSION_RECORD_FILE` under the state dir, not detect's file): the version and detect's
+fingerprint. Identical content republishes under the recorded version (detect: unchanged, also
+across a month boundary); changed content takes the next patch past both the record and the
+calver dirs in out/, or `.0` in a new month. A missing record falls back; a bad one exits 1.
 
 The card's `--out <tmp>` is replaced by the `Settings.out_dir` env var (ruling 3).
 """
@@ -778,6 +784,17 @@ def _published_state(out: Path) -> dict[str, str]:
     return state
 
 
+def _record_snapshot(ws: _Workspace) -> bytes | None:
+    # Round 10b item 7, for the tests that predate the record: the producer version record's
+    # bytes, or None while there is none (or no constant names it yet). A failed run must leave
+    # it byte-for-byte as it was.
+    constant = getattr(cli, "VERSION_RECORD_FILE", None)
+    if constant is None:
+        return None
+    path = ws.state / Path(constant)
+    return path.read_bytes() if path.is_file() else None
+
+
 def _embedded_texts(net: _Net) -> int:
     # Every text the run sent to LocalAI: an independent count of the chunks the run produced.
     return sum(len(json.loads(request.content)["input"]) for request in net.embed_requests())
@@ -909,6 +926,7 @@ def test_failed_source_publishes_nothing_and_keeps_current(
     seed, _ = _bundle_script(ws, "record")
     assert seed.returncode == 0, seed.stderr
     before = _published_state(ws.out)
+    record = _record_snapshot(ws)
 
     how, position = _PARTIAL_FAILURES[failure]
     victim = _repo_names()[position]
@@ -922,6 +940,8 @@ def test_failed_source_publishes_nothing_and_keeps_current(
     # No new version dir, no rewrite of the old one, no repoint, no new hot-reload copies.
     assert _published_state(ws.out) == before, (sorted(before), sorted(_published_state(ws.out)))
     assert os.readlink(ws.out / _CURRENT) == version
+    # Round 10b item 7: a run that published nothing leaves the producer version record as it was.
+    assert _record_snapshot(ws) == record, "a failed run rewrote the version record"
     # The workflow's detect after the failed run sees the announced bundle, unchanged.
     detect, outputs = _bundle_script(ws, "detect", "--require-state")
     assert detect.returncode == 0, detect.stderr
@@ -1059,6 +1079,7 @@ def test_refresh_where_no_source_staged_fails_closed_naming_them(
         _spy_first_run(ws, spy)
         spy.runs.clear()
     state = _published_state(ws.out) if ws.out.is_dir() else {}
+    record = _record_snapshot(ws)
     spy.unstaged = set(_repo_names())
     result = _invoke(ws.argv("refresh", "--all"))
     assert result.exit_code == 1, _why(result)
@@ -1066,6 +1087,7 @@ def test_refresh_where_no_source_staged_fails_closed_naming_them(
     for name in _repo_names():
         assert name in result.stderr, (name, _why(result))
     assert (_published_state(ws.out) if ws.out.is_dir() else {}) == state
+    assert _record_snapshot(ws) == record, "a run that staged nothing wrote the version record"
     _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
     assert net.attempts == []
     assert _is_empty(ws.cwd)
@@ -1141,7 +1163,8 @@ def test_identical_refresh_republishes_unless_current_is_a_real_bundle(
 ) -> None:
     # Round 9 M5 and M10, and the cli.py:517 and :534 paths. Only a relative link whose target
     # is one version name naming a real, symlink-free bundle dir is compared against; any other
-    # current is treated as missing, so run 2 publishes a fresh version and repoints current.
+    # current is treated as missing, so run 2 repoints current at a real bundle (Round 10b: the
+    # recorded v1 if intact, else a fresh version).
     ws = ws_all
     v1 = _spy_first_run(ws, spy)
     setup, outcome = _CURRENT_BETWEEN_RUNS[between]
@@ -1156,9 +1179,14 @@ def test_identical_refresh_republishes_unless_current_is_a_real_bundle(
         assert _published_state(ws.out) == state, (sorted(state), sorted(_published_state(ws.out)))
         return
     v2 = _assert_current_bundle(ws, _repo_names())
-    assert v2 not in kept, f"run 2 reused version {v2}"
-    assert _calver_key(v2) > _calver_key(v1), (v1, v2)
-    assert not any(p.is_symlink() for p in (ws.out / v2).rglob("*")), "the new bundle holds a link"
+    # Round 10b item 3: run 1's producer record names v1 with this same content, so current may
+    # end on v1 itself (no alert) when that bundle is intact and link-free; otherwise run 2
+    # takes a new, higher version. It never points at a tampered bundle or rewrites one.
+    if v2 in kept:
+        assert v2 == v1, f"run 2 pointed current at {v2}, not the recorded {v1}"
+    else:
+        assert _calver_key(v2) > _calver_key(v1), (v1, v2)
+    assert not any(p.is_symlink() for p in (ws.out / v2).rglob("*")), "current's bundle holds a link"
     assert {name: _tree_digest(ws.out / name) for name in kept} == kept, "run 2 rewrote an old bundle"
     assert {p: p.read_bytes() for p in outside} == outside, "run 2 wrote through a planted link"
     detect, outputs = _bundle_script(ws, "detect")
@@ -1189,7 +1217,9 @@ def _unstaged(index: int) -> Callable[[_Workspace, _Spy, str], None]:
 
 def _file_at_next_version(ws: _Workspace, spy: _Spy, v1: str) -> None:
     # A stray regular file holds the name this run would publish under, and current points at
-    # it: not a bundle (cli.py:517), and the bundle write cannot create the dir.
+    # it: not a bundle (cli.py:517), and the bundle write cannot create the dir. Round 10b: the
+    # content changes, so the run must take a new version (identical content may now keep v1).
+    spy.amended = set(_repo_names())
     stray = next_version(ws.out, ws.today)
     (ws.out / stray).write_bytes(b"not a bundle\n")
     _repoint(ws, stray)
@@ -1235,6 +1265,7 @@ def test_bundle_error_exits_one_with_the_type_only_and_keeps_current(
     try:
         setup(ws, spy, v1)
         state = _published_state(ws.out)
+        record = _record_snapshot(ws)
         result = _invoke(ws.argv("refresh", "--all"))
     finally:
         ws.out.chmod(0o755)
@@ -1245,8 +1276,416 @@ def test_bundle_error_exits_one_with_the_type_only_and_keeps_current(
     # dir left behind is not pinned: nothing points at it and the next run numbers past it.
     after = _published_state(ws.out)
     assert {key: after.get(key) for key in state} == state, (sorted(state), sorted(after))
+    # Round 10b item 7: the record is written only after the bundle is fully published, so a
+    # publish that failed (even after writing its version dir) leaves the old record.
+    assert _record_snapshot(ws) == record, "a failed publish rewrote the version record"
     _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
     assert net.attempts == []
+
+
+# ---------------------------------------------------------------------------
+# Round 10b (owner, 2026-10-13, option 2; grumpy MEDIUM at cli.py:566). refresh.yml caches
+# INGESTER_STATE_DIR but not out/, so on a hosted runner out/current never exists at run start.
+# The cli keeps a producer version record under the state dir: identical content republishes
+# under the recorded version (detect: unchanged), changed content never reuses a version name.
+# Every "emptied out/" step below is that runner: out/ gone, the state dir (and detect's own
+# record, refresh.yml's record step) kept.
+# ---------------------------------------------------------------------------
+
+
+def _record_path(ws: _Workspace) -> Path:
+    """Item 1: the record's place comes from a cli constant, under Settings.state_dir (F13)."""
+    constant = getattr(cli, "VERSION_RECORD_FILE", None)
+    assert constant is not None, "cli names no VERSION_RECORD_FILE constant (Round 10b item 1)"
+    relative = Path(constant)
+    assert not relative.is_absolute() and ".." not in relative.parts, constant
+    return ws.state / relative
+
+
+def _record_values(ws: _Workspace) -> set[str]:
+    path = _record_path(ws)
+    assert path.is_file() and not path.is_symlink(), "refresh wrote no version record in the state dir"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert isinstance(data, dict), type(data).__name__
+    return {value for value in data.values() if isinstance(value, str)}
+
+
+def _assert_record_names_current(ws: _Workspace, version: str) -> None:
+    # Items 1 and 2: the record holds the version out/current names and detect's own fingerprint
+    # of that bundle (computed by detect_bundle_change.read_bundle, not by a test copy).
+    linked, fingerprint = _DETECT.read_bundle(ws.out / _CURRENT)
+    assert linked == version, (linked, version)
+    values = _record_values(ws)
+    assert version in values, f"the record does not name {version}"
+    assert fingerprint in values, "the record's digest is not detect's fingerprint of the bundle"
+
+
+def _set_today(ws: _Workspace, monkeypatch: pytest.MonkeyPatch, day: date) -> None:
+    # refresh reads the run date once, via cli's `date.today()`; inject it there. The approvals
+    # are re-signed for that day so the gate stays green (only the version math is under test).
+    class _InjectedDate(date):
+        @classmethod
+        def today(cls) -> date:
+            return day
+
+    monkeypatch.setattr(cli, "date", _InjectedDate)
+    ws.today = day
+    for name in _repo_names():
+        ws.sign(name)
+
+
+def _calver(ws: _Workspace, day: date, patch: int) -> str:
+    # The version name for *day* and *patch*, in retention's own format (no restated pattern).
+    month = next_version(ws.root / "never-created", day).rpartition(".")[0]
+    return f"{month}.{patch}"
+
+
+def _first_of_next_month(day: date) -> date:
+    return (day.replace(day=1) + timedelta(days=32)).replace(day=1)
+
+
+def _empty_out(ws: _Workspace) -> None:
+    # The hosted runner: out/ is not in the actions/cache path, the state dir is.
+    shutil.rmtree(ws.out)
+
+
+@dataclass(frozen=True)
+class _RecordCase:
+    # Runs with out/ kept between them (amended source indexes per run), then out/ emptied.
+    kept_runs: tuple[frozenset[int], ...]
+    # Patches planted as real calver dirs (a copy of run 1's bundle) in the final run's month.
+    plant: tuple[int, ...] = ()
+    # "same" month, "next-month", or "next-year" (run 1 on 15 Dec, the final run on 1 Jan).
+    when: str = "same"
+    # "identical" to the last kept run's content, or "changed" (every source amended).
+    final: str = "identical"
+    drop_record: bool = False
+    # "recorded" (the last kept run's version) or the final run's patch in its own month.
+    expect: str | int = "recorded"
+
+
+_NONE: frozenset[int] = frozenset()
+_FIRST: frozenset[int] = frozenset({0})
+
+_RECORD_CASES: dict[str, _RecordCase] = {
+    "identical-emptied-out (item 3)": _RecordCase((_NONE,)),
+    "changed-emptied-out (item 4)": _RecordCase((_NONE,), final="changed", expect=1),
+    "identical-after-a-change (item 3)": _RecordCase((_NONE, _FIRST)),
+    "changed-after-a-change (item 4)": _RecordCase((_NONE, _FIRST), final="changed", expect=2),
+    "out-dir-above-record-changed (item 4)": _RecordCase((_NONE,), plant=(5,), final="changed", expect=6),
+    "out-dir-above-record-identical (item 3)": _RecordCase((_NONE,), plant=(5,)),
+    "record-above-out-dir-changed (item 4)": _RecordCase((_NONE, _FIRST), plant=(0,), final="changed", expect=2),
+    "next-month-identical (item 5)": _RecordCase((_NONE,), when="next-month"),
+    "next-month-changed (item 4)": _RecordCase((_NONE, _FIRST), when="next-month", final="changed", expect=0),
+    "next-year-identical (item 5)": _RecordCase((_NONE,), when="next-year"),
+    "next-year-changed (item 4)": _RecordCase((_NONE,), when="next-year", final="changed", expect=0),
+    "record-missing-identical (item 6, control)": _RecordCase((_NONE,), drop_record=True, expect=0),
+    "record-missing-changed (item 6, control)": _RecordCase(
+        (_NONE,), drop_record=True, final="changed", expect=0
+    ),
+}
+
+
+def test_record_case_table_covers_every_axis() -> None:
+    # Contract: both contents, all three date steps, both "larger wins" directions, the
+    # fallback controls, and both outcomes; a rule that ignores any one axis fails a row.
+    cases = list(_RECORD_CASES.values())
+    assert {c.final for c in cases} == {"identical", "changed"}
+    assert {c.when for c in cases} == {"same", "next-month", "next-year"}
+    for when in ("next-month", "next-year"):
+        assert {c.final for c in cases if c.when == when} == {"identical", "changed"}, when
+    planted = [c for c in cases if c.plant]
+    assert any(max(c.plant) >= len(c.kept_runs) for c in planted), "no out/ dir above the record"
+    assert any(max(c.plant) < len(c.kept_runs) - 1 for c in planted), "no record above out/ dirs"
+    assert {c.final for c in cases if c.drop_record} == {"identical", "changed"}
+    assert {isinstance(c.expect, int) for c in cases} == {True, False}
+
+
+@pytest.mark.parametrize("case", list(_RECORD_CASES))
+def test_version_after_an_emptied_out_dir_follows_the_record(
+    ws_all: _Workspace, spy: _Spy, net: _Net, monkeypatch: pytest.MonkeyPatch, case: str
+) -> None:
+    ws = ws_all
+    names = _repo_names()
+    assert len(names) >= 2, names
+    row = _RECORD_CASES[case]
+    start = date(ws.today.year, 12, 15) if row.when == "next-year" else ws.today
+    final_day = {
+        "same": start,
+        "next-month": _first_of_next_month(start),
+        "next-year": date(start.year + 1, 1, 1),
+    }[row.when]
+    _set_today(ws, monkeypatch, start)
+    saved = ws.root / "saved-bundle"
+    recorded = ""
+    for amended in row.kept_runs:
+        spy.amended = {names[i] for i in amended}
+        run = _invoke(ws.argv("refresh", "--all"))
+        assert run.exit_code == 0, _why(run)
+        recorded = _assert_current_bundle(ws, names)
+        if not saved.exists():
+            shutil.copytree(ws.out / recorded, saved, symlinks=True)
+        seed, _ = _bundle_script(ws, "record")
+        assert seed.returncode == 0, seed.stderr
+
+    _empty_out(ws)
+    if row.drop_record:
+        _record_path(ws).unlink()
+    ws.out.mkdir()
+    planted = {}
+    for patch in row.plant:
+        name = _calver(ws, final_day, patch)
+        shutil.copytree(saved, ws.out / name, symlinks=True)
+        planted[name] = _tree_digest(ws.out / name)
+    _set_today(ws, monkeypatch, final_day)
+    if row.final == "changed":
+        spy.amended = set(names)
+
+    result = _invoke(ws.argv("refresh", "--all"))
+    assert result.exit_code == 0, _why(result)
+    version = _assert_current_bundle(ws, names)
+    expected = recorded if row.expect == "recorded" else _calver(ws, final_day, int(row.expect))
+    assert version == expected, f"published {version}; the record and out/ call for {expected}"
+    assert {name: _tree_digest(ws.out / name) for name in planted} == planted, "a planted dir changed"
+    _assert_record_names_current(ws, version)
+    # refresh.yml's detect step against its own record of the last announced bundle: an alert
+    # only for new content (a missing producer record may still reuse a name: the known fallback).
+    detect, outputs = _bundle_script(ws, "detect", "--require-state")
+    assert detect.returncode == 0, detect.stderr
+    changed = row.final == "changed" or version != recorded
+    assert outputs == {"changed": str(changed).lower(), "new_target": version}, outputs
+    _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
+    assert net.attempts == []
+    assert _is_empty(ws.cwd)
+
+
+def test_weekly_runs_with_an_uncached_out_dir_alert_only_on_new_content(
+    ws_all: _Workspace, net: _Net
+) -> None:
+    # The CI case end to end, with the real Orchestrator and publisher and detect in its own
+    # process: four weekly runs in one month, out/ emptied before each, the state dir kept.
+    # Today every run restarts at .0, so week 3's new content reuses week 1's name.
+    ws = ws_all
+    net.upstream = ws
+    names = _repo_names()
+    changed = _changed_body(ws.body)
+    weeks = [("identical", "true"), ("identical", "false"), ("changed", "true"), ("identical", "false")]
+    versions: list[str] = []
+    for week, (content, alert) in enumerate(weeks):
+        if week:
+            _empty_out(ws)
+        if content == "changed":
+            net.bodies[load_all(ws.sources)[names[0]].pipeline.celex_id] = changed
+            ws.sign(names[0], signed_artifact_sha256=hashlib.sha256(changed).hexdigest())
+        result = _invoke(ws.argv("refresh", "--all"))
+        assert result.exit_code == 0, (week, _why(result))
+        version = _assert_current_bundle(ws, names)
+        _assert_record_names_current(ws, version)
+        detect, outputs = _bundle_script(ws, "detect", *(["--require-state"] if week else []))
+        assert detect.returncode == 0, (week, detect.stderr)
+        assert outputs == {"changed": alert, "new_target": version}, (week, outputs, versions)
+        if alert == "true":
+            assert version not in versions, f"week {week} reused {version} for new content"
+            record, _ = _bundle_script(ws, "record")
+            assert record.returncode == 0, record.stderr
+        versions.append(version)
+    assert versions[1] == versions[0] and versions[3] == versions[2], versions
+    assert _calver_key(versions[2]) > _calver_key(versions[0]), versions
+    assert net.attempts == [], net.attempts
+    assert _is_empty(ws.cwd)
+
+
+def test_version_record_is_its_own_file_under_the_state_dir(
+    ws_all: _Workspace, spy: _Spy, net: _Net, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Item 1: the producer record is not detect's last-published-bundle.json (refresh.yml's
+    # record step owns that), nor a baseline or checkpoint, and refresh never writes detect's
+    # default location under HOME / XDG_STATE_HOME.
+    ws = ws_all
+    home = ws.root / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(home / "xdg-state"))
+    path = _record_path(ws)
+    others = {
+        _DETECT.default_state_file().name,
+        _refresh_baseline_name(),
+        Path(AUDIT_BASELINE_FILE).name,
+        *(f"{name}.checkpoint.json" for name in _repo_names()),
+    }
+    assert path.name not in others, path.name
+    version = _spy_first_run(ws, spy)
+    _assert_record_names_current(ws, version)
+    assert _is_empty(home), sorted(str(p.relative_to(home)) for p in home.rglob("*"))
+    assert not _DETECT.default_state_file().exists()
+
+
+@pytest.mark.parametrize("argv", [("fetch", "eurlex_gdpr"), ("refresh", "--all", "--dry-run")], ids=["fetch", "dry-run"])
+def test_runs_that_publish_no_bundle_write_no_record(
+    ws_all: _Workspace, spy: _Spy, net: _Net, argv: tuple[str, ...]
+) -> None:
+    # Item 7's other side: no bundle published, so no record (positive control: the first test
+    # above shows a publishing run does write one).
+    ws = ws_all
+    result = _invoke(ws.argv(*argv))
+    assert result.exit_code == 0, _why(result)
+    path = _record_path(ws)
+    assert not os.path.lexists(path), f"{argv[0]} wrote a version record without a bundle"
+
+
+def _swap(old: str, new: str) -> Callable[[Path, bytes, str, str], None]:
+    # Replace one JSON string value in the record as written (the version or the digest).
+    def mutate(path: Path, valid: bytes, version: str, fingerprint: str) -> None:
+        source = {"version": version, "digest": fingerprint}[old]
+        token = json.dumps(source).encode()
+        assert valid.count(token) == 1, f"the record does not hold the {old} once as JSON"
+        path.write_bytes(valid.replace(token, new.encode()))
+
+    return mutate
+
+
+def _bytes(data: Callable[[bytes], bytes]) -> Callable[[Path, bytes, str, str], None]:
+    def mutate(path: Path, valid: bytes, version: str, fingerprint: str) -> None:
+        path.write_bytes(data(valid))
+
+    return mutate
+
+
+def _record_is_dir(path: Path, valid: bytes, version: str, fingerprint: str) -> None:
+    path.unlink()
+    path.mkdir()
+
+
+def _record_unreadable(path: Path, valid: bytes, version: str, fingerprint: str) -> None:
+    path.chmod(0o000)
+
+
+def _record_dangling(path: Path, valid: bytes, version: str, fingerprint: str) -> None:
+    path.unlink()
+    path.symlink_to(path.parent / "no-such-record")
+
+
+def _record_linked_copy(path: Path, valid: bytes, version: str, fingerprint: str) -> None:
+    # A valid record, but reached through a link out of the state dir: indirection, refused.
+    outside = path.parent.parent / "outside-record"
+    outside.write_bytes(valid)
+    path.unlink()
+    path.symlink_to(outside)
+
+
+_FULLWIDTH = str.maketrans("0123456789", "".join(chr(0xFF10 + d) for d in range(10)))
+_VERSION_FORGERIES = {
+    "version-parent-hop": lambda v: json.dumps("../" + v),
+    "version-forged-line": lambda v: json.dumps(v + "\n::error::forged"),
+    "version-line-separator": lambda v: json.dumps(v + " "),
+    "version-trailing-newline": lambda v: json.dumps(v + "\n"),
+    "version-trailing-slash": lambda v: json.dumps(v + "/"),
+    "version-not-calver": lambda v: json.dumps("latest"),
+    # \d in a str pattern matches these; detect's [0-9] does not.
+    "version-fullwidth-digits": lambda v: json.dumps(v.translate(_FULLWIDTH), ensure_ascii=False),
+    "version-lone-surrogate": lambda v: json.dumps(v + "\ud800"),
+    "version-number": lambda v: json.dumps(int(v.replace(".", ""))),
+}
+_DIGEST_FORGERIES = {
+    "digest-not-hex": lambda f: json.dumps("not-a-digest\n::error::forged"),
+    "digest-short": lambda f: json.dumps(f[:-1]),
+    "digest-number": lambda f: "0",
+}
+
+
+def _forged(kind: str, make: Callable[[str], str]) -> Callable[[Path, bytes, str, str], None]:
+    def mutate(path: Path, valid: bytes, version: str, fingerprint: str) -> None:
+        value = make(version if kind == "version" else fingerprint)
+        _swap(kind, value)(path, valid, version, fingerprint)
+
+    return mutate
+
+
+# How the record is left before an identical-content run -> the type the run names, or None
+# for the positive control (the record as the cli wrote it: exit 0).
+_BAD_RECORDS: dict[str, tuple[Callable[[Path, bytes, str, str], None], str | None]] = {
+    "as-written (control)": (lambda path, valid, version, fingerprint: None, None),
+    "empty": (_bytes(lambda valid: b""), ""),
+    "truncated": (_bytes(lambda valid: valid[: len(valid) // 2]), ""),
+    "not-json": (_bytes(lambda valid: b"version 2026.1.0\n"), ""),
+    "json-array": (_bytes(lambda valid: b"[]\n"), ""),
+    "json-null": (_bytes(lambda valid: b"null\n"), ""),
+    "no-fields": (_bytes(lambda valid: b"{}\n"), ""),
+    "invalid-utf8": (_bytes(lambda valid: b"\xff\xfe" + valid), ""),
+    "nul-prefixed": (_bytes(lambda valid: b"\x00" + valid), ""),
+    **{name: (_forged("version", make), "") for name, make in _VERSION_FORGERIES.items()},
+    **{name: (_forged("digest", make), "") for name, make in _DIGEST_FORGERIES.items()},
+    "record-is-a-dir": (_record_is_dir, "IsADirectoryError"),
+    "record-unreadable": (_record_unreadable, "PermissionError"),
+    "dangling-symlink": (_record_dangling, ""),
+    "symlink-to-a-valid-copy": (_record_linked_copy, ""),
+}
+
+
+def test_bad_record_table_has_a_control_and_every_hostile_class() -> None:
+    outcomes = [error for _, error in _BAD_RECORDS.values()]
+    assert outcomes.count(None) == 1, "exactly one positive control"
+    names = set(_BAD_RECORDS)
+    for needed in ("truncated", "invalid-utf8", "nul-prefixed", "version-forged-line",
+                   "version-line-separator", "version-fullwidth-digits", "version-lone-surrogate",
+                   "version-parent-hop", "digest-not-hex", "record-is-a-dir", "record-unreadable",
+                   "dangling-symlink", "symlink-to-a-valid-copy"):
+        assert needed in names, needed
+
+
+_TYPE_TOKEN = re.compile(r"\b[A-Z][A-Za-z]*(?:Error|Exception)\b")
+
+
+@pytest.mark.parametrize("out_dir", ["out-emptied", "out-kept"])
+@pytest.mark.parametrize("case", list(_BAD_RECORDS))
+def test_bad_version_record_fails_closed_with_the_type_only(
+    ws_all: _Workspace, spy: _Spy, net: _Net, case: str, out_dir: str
+) -> None:
+    # Item 6: a malformed or unreadable record is never read as "no record" (that would restart
+    # the patch and could reuse a name): exit 1, the type only, nothing published, record kept.
+    # Identical content, so a run that skips the record when out/current is valid is caught too.
+    ws = ws_all
+    if case == "record-unreadable" and os.geteuid() == 0:
+        pytest.fail("root ignores a 000 record; run the suite as a normal user")
+    v1 = _spy_first_run(ws, spy)
+    path = _record_path(ws)
+    assert path.is_file(), "refresh wrote no version record in the state dir"
+    valid = path.read_bytes()
+    _, fingerprint = _DETECT.read_bundle(ws.out / _CURRENT)
+    if out_dir == "out-emptied":
+        _empty_out(ws)
+    mutate, error = _BAD_RECORDS[case]
+    try:
+        mutate(path, valid, v1, fingerprint)
+        link = os.readlink(path) if path.is_symlink() else None
+        # The unreadable row: its bytes are the valid record (read back after the chmod is undone).
+        readable = path.is_file() and not path.is_symlink() and os.access(path, os.R_OK)
+        raw = path.read_bytes() if readable else valid if case == "record-unreadable" else None
+        state = _published_state(ws.out) if ws.out.is_dir() else {}
+        result = _invoke(ws.argv("refresh", "--all"))
+    finally:
+        if path.exists() and not path.is_symlink():
+            path.chmod(0o644 if path.is_file() else 0o755)
+    if error is None:
+        assert result.exit_code == 0, _why(result)
+        version = _assert_current_bundle(ws, _repo_names())
+        assert version == v1, (version, v1)
+        _assert_record_names_current(ws, v1)
+        return
+    assert result.exit_code == 1, _why(result)
+    types = _TYPE_TOKEN.findall(result.stderr)
+    assert types, f"no exception type named: {_why(result)}"
+    if error:
+        assert error in types, (error, types)
+    assert "Traceback" not in _output(result) and "forged" not in _output(result), _why(result)
+    assert "not-a-digest" not in _output(result) and "latest" not in _output(result), _why(result)
+    assert (_published_state(ws.out) if ws.out.is_dir() else {}) == state, "a bad record still published"
+    assert (os.readlink(path) if path.is_symlink() else None) == link
+    if raw is not None:
+        assert path.read_bytes() == raw, "the run rewrote the bad record"
+    _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
+    assert net.attempts == []
+    assert _is_empty(ws.cwd)
 
 
 # ---------------------------------------------------------------------------
