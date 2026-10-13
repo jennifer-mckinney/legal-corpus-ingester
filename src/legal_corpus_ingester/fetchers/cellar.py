@@ -56,19 +56,35 @@ _CONS_ACT_ROOT = "CONS.ACT"
 
 _MSG_CAP = 300
 
+# Validator limits for the two tunables (policy, not config: they bound what the config
+# may say). The lead ruling promises EUR-Lex at most 0.5 requests per second, so config
+# may slow the fetcher down but never speed it up. Below 0.01 rps (100 s per request) or
+# above a 120 s timeout, a typo would stall ``refresh`` for every EU source.
+_TIMEOUT_MAX_SECONDS = 120
+_RATE_MIN_RPS = 0.01
+_RATE_MAX_RPS = 0.5
+
 
 @dataclass(frozen=True)
 class CellarSettings:
-    """Caps for one Cellar package; loaded from ``config/fetchers/cellar.yaml``."""
+    """Caps and tunables for the Cellar fetcher; loaded from ``config/fetchers/cellar.yaml``."""
 
     max_zip_bytes: int
     max_members: int
     max_member_bytes: int
     max_total_bytes: int
     max_ratio: int
+    timeout_seconds: float
+    rate_limit_rps: float
 
 
-_CAP_NAMES: tuple[str, ...] = tuple(f.name for f in fields(CellarSettings))
+_TUNABLE_BOUNDS: dict[str, tuple[float, float, bool]] = {
+    # name: (low, high, low is inclusive)
+    "timeout_seconds": (0, _TIMEOUT_MAX_SECONDS, False),
+    "rate_limit_rps": (_RATE_MIN_RPS, _RATE_MAX_RPS, True),
+}
+_FIELD_NAMES: tuple[str, ...] = tuple(f.name for f in fields(CellarSettings))
+_CAP_NAMES: tuple[str, ...] = tuple(name for name in _FIELD_NAMES if name not in _TUNABLE_BOUNDS)
 
 
 @dataclass(frozen=True)
@@ -89,8 +105,24 @@ def _drift(message: str) -> SchemaDriftError:
     return SchemaDriftError(message[:_MSG_CAP])
 
 
+def _check_tunable(name: str, value: object) -> None:
+    """A finite int or float (never bool) inside the bounds in ``_TUNABLE_BOUNDS``."""
+    low, high, low_inclusive = _TUNABLE_BOUNDS[name]
+    ok = False
+    # bool is an int subclass and is never a tunable. NaN fails every comparison and
+    # +/-inf fall outside the finite bounds, so only finite values pass. Values are
+    # compared without float(): a YAML int may be too large to convert.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        ok = (value >= low if low_inclusive else value > low) and value <= high
+    if not ok:
+        bracket = "[" if low_inclusive else "("
+        raise ValueError(
+            f"cellar config {name} must be a finite number in {bracket}{low}, {high}], got {_safe(value)}"[:_MSG_CAP]
+        )
+
+
 def load_cellar_settings(path: Path | None = None) -> CellarSettings:
-    """Load and validate the caps; any bad value fails closed with ``ValueError``.
+    """Load and validate caps and tunables; any bad value fails closed with ``ValueError``.
 
     A missing file raises ``FileNotFoundError``. Messages name the bad key but never
     the absolute path of the file.
@@ -107,11 +139,13 @@ def load_cellar_settings(path: Path | None = None) -> CellarSettings:
     except yaml.YAMLError:
         raise ValueError("cellar config is not valid YAML") from None
     if not isinstance(data, dict):
-        raise ValueError(f"cellar config must be a mapping of {', '.join(_CAP_NAMES)}")
-    unknown = sorted(_safe(k) for k in data if k not in _CAP_NAMES)
+        raise ValueError(f"cellar config must be a mapping of {', '.join(_FIELD_NAMES)}")
+    # Exact keys: a host, base URL or redirect pattern is refused here, so config can
+    # never widen the fetcher's SSRF allowlist (F3; those stay code constants).
+    unknown = sorted(_safe(k) for k in data if k not in _FIELD_NAMES)
     if unknown:
         raise ValueError(f"cellar config has unknown keys: {', '.join(unknown)}"[:_MSG_CAP])
-    missing = [name for name in _CAP_NAMES if name not in data]
+    missing = [name for name in _FIELD_NAMES if name not in data]
     if missing:
         raise ValueError(f"cellar config is missing keys: {', '.join(missing)}")
     for name in _CAP_NAMES:
@@ -119,7 +153,9 @@ def load_cellar_settings(path: Path | None = None) -> CellarSettings:
         # type() not isinstance(): bool is an int subclass and is never a cap.
         if type(value) is not int or value <= 0:
             raise ValueError(f"cellar config {name} must be a positive integer, got {_safe(value)}")
-    settings = CellarSettings(**{name: data[name] for name in _CAP_NAMES})
+    for name in _TUNABLE_BOUNDS:
+        _check_tunable(name, data[name])
+    settings = CellarSettings(**{name: data[name] for name in _FIELD_NAMES})
     if settings.max_member_bytes > settings.max_total_bytes:
         raise ValueError("cellar config max_member_bytes must not exceed max_total_bytes")
     return settings
