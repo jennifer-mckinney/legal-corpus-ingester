@@ -550,10 +550,14 @@ def _publish_bundle(
     out_dir = settings.out_dir
     kept = {name: pair for name, pair in staged.items() if pair is not None}
     if not kept:
-        # The real Orchestrator always publishes on success, so this is only an Orchestrator
-        # that published nothing: said on stdout, and nothing is published or repointed.
-        typer.echo(f"No source staged a corpus; no bundle published, {CURRENT_LINK} unchanged.")
-        return
+        # Every source ran without error yet none staged a corpus. Exit 0 here could not be
+        # told from "content unchanged" (detect: changed=false), so it fails closed (ruling 9).
+        typer.echo(
+            f"Bundle {version} was not published (no source staged a corpus:"
+            f" {', '.join(staged)}); {CURRENT_LINK} was not repointed by this run.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
     try:
         if len(kept) != len(staged):
             # Some sources staged and some did not: the bundle would silently miss sources.

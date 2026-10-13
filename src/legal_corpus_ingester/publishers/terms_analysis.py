@@ -71,10 +71,7 @@ class TermsAnalysisPublisher:
         bundle_target = PublishTarget(kind="filesystem", path=bundle_dir)
         receipt = FilesystemPublisher().publish(corpus, bundle_target, manifest)
 
-        # --- 2. Atomically repoint the 'current' symlink ---
-        atomic_symlink(bundle_name, out_dir / CURRENT_LINK)
-
-        # --- 3. Copy hot-reload safety files into out_dir root ---
+        # --- 2. Copy hot-reload safety files into out_dir root ---
         shutil.copy2(
             bundle_dir / "index" / "legal_kb.npy",
             out_dir / "legal_kb.npy",
@@ -83,6 +80,12 @@ class TermsAnalysisPublisher:
             bundle_dir / "index" / "legal_kb_metadata.json",
             out_dir / "legal_kb_metadata.json",
         )
+
+        # --- 3. Atomically repoint the 'current' symlink, last ---
+        # Last, so a failed root copy leaves 'current' on the previous bundle (terms-analysis#93
+        # ruling 9b): a caller that reports "current unchanged" on an error is then telling
+        # the truth.
+        atomic_symlink(bundle_name, out_dir / CURRENT_LINK)
 
         # --- 4. Optionally signal the live server to reload ---
         if pid > 0:
