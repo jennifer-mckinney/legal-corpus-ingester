@@ -625,31 +625,34 @@ def test_health_job_surfaces_invalid_checkpoint_exit_code(tmp_path: Path, raw: b
         assert forbidden not in output
 
 
-@pytest.mark.parametrize("seed", ["empty-state", "valid-checkpoint"])
-def test_health_job_positive_control_runs_both_steps_and_passes(tmp_path: Path, seed: str) -> None:
-    # Green today and must stay green: a legitimate state runs BOTH steps and the job
-    # passes, with the not-wired warning (no source but the seeded one has run).
+def test_health_job_positive_control_runs_both_steps_and_passes(tmp_path: Path) -> None:
+    # Must stay green: a legitimate state runs BOTH steps and the job passes. Refresh is wired
+    # (terms-analysis#93), so a legitimate state is a fresh "done" checkpoint for every source;
+    # an empty state is now a never-run failure (next test), not a not-wired warning.
     xdg = tmp_path / "xdg"
     state = xdg / "legal-corpus-ingester" / "state"
     state.mkdir(parents=True)
-    if seed == "valid-checkpoint":
-        CheckpointStore(state).save(CheckpointState(source_name=_first_source(), stage="done", corpus_version="v1"))
-    assert not cli.REFRESH_WIRED
+    store = CheckpointStore(state)
+    for config in sorted((_REPO_ROOT / "config" / "sources").glob("*.yaml")):
+        store.save(CheckpointState(source_name=config.stem, stage="done", corpus_version="v1"))
+    assert cli.REFRESH_WIRED
     job_rc, failed, ran, output = _run_health_job(tmp_path, xdg)
     assert (job_rc, failed) == (0, None), output[-2000:]
     assert sorted(ran) == sorted(_HEALTH_STEPS)
-    assert "::warning title=Refresh not wired::" in output
+    assert "::warning title=Refresh not wired::" not in output
 
 
-def test_health_check_step_end_to_end_unwired_is_warning_and_ignores_checkout_state(tmp_path: Path) -> None:
+def test_health_check_step_end_to_end_never_run_fails_and_ignores_checkout_state(tmp_path: Path) -> None:
     # A fresh checkpoint inside the checkout must not be read: the real runner wipes it.
     (tmp_path / "checkout" / "state").mkdir(parents=True)
     (tmp_path / "checkout" / "state" / "eurlex_gdpr.checkpoint.json").write_text('{"stage": "done"}')
     result, _, _ = _run_health_step(tmp_path, "health-check", xdg=tmp_path / "xdg")
-    assert not cli.REFRESH_WIRED
-    assert result.returncode == 0, (result.stdout, result.stderr)
-    assert "::warning title=Refresh not wired::" in result.stdout
-    assert "Refresh is not wired yet" in result.stdout
+    # Refresh is wired (terms-analysis#93): a source that never ran is a real problem, no
+    # longer the excused not-wired state.
+    assert cli.REFRESH_WIRED
+    assert result.returncode == _HC.EXIT_SOURCE_PROBLEM, (result.stdout, result.stderr)
+    assert "::warning title=Refresh not wired::" not in result.stdout
+    assert "never-run" in result.stdout
     assert "| fresh |" not in result.stdout
 
 

@@ -2,20 +2,40 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import hashlib
 import importlib
 import json
 import os
+import re
 import shutil
 import stat
 import sys
+import warnings
+from datetime import date
 from pathlib import Path
 
 import httpx
 import typer
+import yaml
+from pydantic import ValidationError
 
-from legal_corpus_ingester.sources.registry import RegistryLoadError, load_all
+from legal_corpus_ingester.config import Settings
+from legal_corpus_ingester.embedders.localai import LocalAIEmbedder
+from legal_corpus_ingester.errors import LegalReviewGateError
+from legal_corpus_ingester.pipeline.approval_gate import _PLACEHOLDER_SHA, check_approval, load_approval
+from legal_corpus_ingester.pipeline.orchestrator import Fetcher, Orchestrator
+from legal_corpus_ingester.publishers.base import PublishTarget
+from legal_corpus_ingester.publishers.filesystem import FilesystemPublisher
+from legal_corpus_ingester.sources.registry import (
+    STAGE_PACKAGES,
+    RegistryLoadError,
+    StageClassError,
+    load_all,
+    resolve_stage_class,
+)
 from legal_corpus_ingester.sources.schema import SourceConfig
 from legal_corpus_ingester.pipeline.state import CheckpointStore
+from legal_corpus_ingester.types import FetchResult
 from legal_corpus_ingester.provenance.license_audit import (
     hash_content,
     check_license_drift,
@@ -42,19 +62,29 @@ MSG_LOAD_ERROR = "Error loading sources"
 MSG_NO_SOURCES = "No sources configured"
 MSG_SOURCES_DIR_MISSING = "Sources directory does not exist or is not a directory"
 MSG_NO_RUNS = "No runs recorded."
-# Pipeline not wired to the orchestrator yet (terms-analysis#90): must never look like success
+# Pipeline not wired to the orchestrator yet (terms-analysis#90). Reserved: fetch and refresh
+# are wired (terms-analysis#93), so no command exits 3 today. The number stays in the public
+# contract (renumbering is breaking) and scripts/health_check.py still re-exports it.
 EXIT_NOT_WIRED: int = 3
 # Single source for "does `ingester refresh` run the pipeline yet?". scripts/health_check.py
 # reads it to tell the expected never-run state (no checkpoint can exist yet) apart from a real
-# failure. Flip it in the change that wires refresh; test_cli_exit_codes pins it to refresh's
-# actual exit code, so wiring refresh without flipping it fails CI (terms-analysis#90).
-REFRESH_WIRED: bool = False
+# failure. test_cli_exit_codes pins it to refresh's actual exit code (terms-analysis#90); flipped
+# when refresh was wired (terms-analysis#93), so a never-run source is now stale, not expected.
+REFRESH_WIRED: bool = True
 # validate-round-trip could not import the terms-analysis consumer, so the bundle was NOT
 # verified end to end; must not look like VALID unless --allow-missing-consumer (terms-analysis#90)
 EXIT_CONSUMER_SKIPPED: int = 4
 # Command-line usage errors only: click's conventional code for an unknown command or option, a
 # missing argument or value, and (from main) no subcommand at all. No command body exits with it.
 EXIT_USAGE: int = 2
+# None of the requested sources holds a valid approval, so nothing ran (terms-analysis#93, lead
+# ruling 1 of 2026-10-13). Every approval in the repo is a placeholder until the owner signs real
+# hashes, so a real refresh exits 7 until then: the intended loud failure, never a silent pass.
+EXIT_NO_APPROVED_SOURCES: int = 7
+# At least one source failed: fetch, the post-fetch approval hash check, clean, chunk, embed or
+# publish. refresh continues with the remaining sources and names every failed one on stderr
+# with the exception type only (terms-analysis#93, lead rulings 1 and 3).
+EXIT_SOURCE_FAILED: int = 8
 # Help text for each public exit code, rendered as "<code> when <meaning>" clauses by
 # _exit_code_clauses into the top-level epilog and the status help. A meaning must not contain
 # ";" (the clause separator) or square brackets (rich markup).
@@ -67,7 +97,7 @@ _EXIT_MEANINGS: dict[int, str] = {
         "the command line is a usage error (unknown command or option, missing argument or"
         " value, no command)"
     ),
-    EXIT_NOT_WIRED: "the pipeline behind the command is not wired yet (fetch, refresh)",
+    EXIT_NOT_WIRED: "the pipeline behind a command is not wired yet, a reserved code no command exits today",
     EXIT_CONSUMER_SKIPPED: (
         "validate-round-trip could not import the terms-analysis consumer, so the bundle was"
         " not verified end to end"
@@ -77,6 +107,13 @@ _EXIT_MEANINGS: dict[int, str] = {
     # unknown one, for fetch and audit-license too).
     EXIT_NO_SOURCES: "the sources dir loads but holds no source (fetch, refresh, status, audit-license)",
     EXIT_SOURCES_DIR_MISSING: "the --sources-dir path does not exist or is not a directory",
+    EXIT_NO_APPROVED_SOURCES: (
+        "no requested source holds a valid approval, so nothing ran (fetch, refresh)"
+    ),
+    EXIT_SOURCE_FAILED: (
+        "at least one source failed to fetch, match its approved hash, clean, chunk, embed or"
+        " publish (fetch, refresh), and each failed source is named on stderr"
+    ),
 }
 # os.stat errno values meaning "this path names no directory": a component is missing or not a
 # directory, the name is too long to exist, or a symlink loop resolves to nothing. Any other
@@ -152,6 +189,225 @@ def _is_consumer_missing(exc: ModuleNotFoundError) -> bool:
         return False
     return name == _CONSUMER_MODULE or _CONSUMER_MODULE.startswith(name + ".")
 
+
+# ---------------------------------------------------------------------------
+# Pipeline wiring for fetch and refresh (terms-analysis#93)
+# ---------------------------------------------------------------------------
+
+# An exception type name is echoed only when it is a plain identifier: it is code, but a type
+# built at run time can carry any name, so the allowlist keeps the output to safe text (F8).
+_TYPE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,79}")
+# A signed approval names its artifact by a lowercase sha256 hex digest, as hashlib prints it.
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+# Approvals live beside the sources, one <source>.yaml each (lead ruling 6 of 2026-10-13).
+APPROVALS_SUBDIR = "approvals"
+
+
+def _type_name(exc: BaseException) -> str:
+    """The exception's type name, for output: never its message, which can carry paths or bytes."""
+    name = type(exc).__name__
+    return name if _TYPE_NAME_RE.fullmatch(name) else "Exception"
+
+
+def _load_settings() -> Settings:
+    """Read Settings from INGESTER_* env vars and .env, or exit EXIT_LOAD_ERROR naming bad fields.
+
+    Only field names are echoed, never values (they can carry CR/LF or a path), and only names
+    Settings declares: an unknown INGESTER_* key in .env is reported without its text (F8, F13).
+    """
+    try:
+        return Settings()
+    except ValidationError as exc:
+        names = sorted(
+            {
+                str(err["loc"][0]) if err["loc"] and str(err["loc"][0]) in Settings.model_fields
+                else "an unknown setting"
+                for err in exc.errors()
+            }
+        )
+        typer.echo(
+            f"Invalid settings: {', '.join(names)}. Fix the {Settings.model_config['env_prefix']}*"
+            " environment variables or .env; nothing was run.",
+            err=True,
+        )
+    except Exception as exc:
+        typer.echo(f"Settings cannot be loaded ({_type_name(exc)}); nothing was run.", err=True)
+    raise typer.Exit(code=EXIT_LOAD_ERROR)
+
+
+def _approvals_dir(settings: Settings) -> Path:
+    """The approvals dir under Settings.config_dir, or exit EXIT_LOAD_ERROR before any fetch.
+
+    A missing or unreadable dir fails the whole run (lead ruling 4): it is a broken
+    configuration, not a set of unsigned sources. The path is never echoed (F2).
+    """
+    path = settings.config_dir / APPROVALS_SUBDIR
+    try:
+        with os.scandir(path) as entries:
+            next(entries, None)
+    except OSError as exc:
+        typer.echo(
+            f"Approvals directory cannot be read ({_type_name(exc)}); expected"
+            f" {APPROVALS_SUBDIR}/ under INGESTER_CONFIG_DIR. Nothing was run.",
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_LOAD_ERROR)
+    return path
+
+
+def _approval_problem(approval_file: Path, source_name: str, today: date) -> str | None:
+    """Why *source_name* may not run, or None when its approval is valid before the fetch.
+
+    Excludes the source (returns a reason): no approval file, a placeholder or malformed
+    hash, or an approval check_approval rejects (source_id, expiry). Fails the whole run
+    (raises): a file that cannot be read or parsed as a mapping (lead ruling 4). The hash
+    itself can only be compared after the fetch; _ApprovalGatedFetcher does that. Every
+    reason is fixed text: nothing read from the file is echoed (F8).
+    """
+    if not approval_file.is_file():
+        return "no approval file"
+    data = load_approval(approval_file)  # raises LegalReviewGateError, YAMLError, OSError
+    signed = data.get("signed_artifact_sha256")
+    if signed == _PLACEHOLDER_SHA:
+        return "approval is not signed (placeholder hash)"
+    if not isinstance(signed, str) or not _SHA256_HEX_RE.fullmatch(signed):
+        return "approval hash is not a sha256 hex digest"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            # The signed hash stands in for the artifact's: this checks everything else.
+            check_approval(approval_file, source_name, signed, today=today)
+        except LegalReviewGateError:
+            return "approval check failed (wrong source_id, or expiry missing, invalid or past)"
+    if caught:
+        typer.echo(f"{source_name}: warning, approval expires soon; renew it.", err=True)
+    return None
+
+
+def _approved_sources(
+    names: list[str], approvals_dir: Path, today: date
+) -> list[str]:
+    """The *names* whose approval is valid; the rest are named on stderr with the reason.
+
+    A malformed or unreadable approval file exits EXIT_LOAD_ERROR before any fetch, naming the
+    source and the error type (lead ruling 4).
+    """
+    approved: list[str] = []
+    for name in names:
+        try:
+            problem = _approval_problem(approvals_dir / f"{name}.yaml", name, today)
+        except (LegalReviewGateError, yaml.YAMLError, OSError, UnicodeDecodeError) as exc:
+            typer.echo(
+                f"{name}: approval file is malformed or unreadable ({_type_name(exc)});"
+                " nothing was run.",
+                err=True,
+            )
+            raise typer.Exit(code=EXIT_LOAD_ERROR)
+        if problem is None:
+            approved.append(name)
+        else:
+            # Source names passed SourceConfig's name_is_safe allowlist, so echoing them is safe.
+            typer.echo(f"{name}: not run, {problem}.", err=True)
+    return approved
+
+
+class _ApprovalGatedFetcher:
+    """Wraps a fetcher so the approval's hash is checked after the fetch and before clean.
+
+    The Formex ruling F1 puts the gate before any parsing of untrusted bytes (lead ruling 5):
+    a payload whose sha256 is not the signed one raises LegalReviewGateError here, so the
+    Orchestrator checkpoints fetch_failed and nothing is cleaned, embedded or published.
+    """
+
+    def __init__(self, inner: Fetcher, approval_file: Path, source_name: str, today: date) -> None:
+        self._inner = inner
+        self._approval_file = approval_file
+        self._source_name = source_name
+        self._today = today
+
+    async def fetch(self, source_config: object) -> FetchResult:
+        result = await self._inner.fetch(source_config)
+        digest = hashlib.sha256(result.raw_bytes).hexdigest()
+        with warnings.catch_warnings():
+            # The expiry warning was already reported by the pre-check.
+            warnings.simplefilter("ignore")
+            check_approval(self._approval_file, self._source_name, digest, today=self._today)
+        return result
+
+
+def _stage_classes(registry: dict[str, SourceConfig], names: list[str]) -> dict[str, dict[str, type]]:
+    """Resolve each source's pipeline classes, or exit EXIT_LOAD_ERROR before any fetch.
+
+    Classes load only from the package's own stage subpackages (lead ruling 8), so a source
+    config can never import a module from elsewhere on sys.path.
+    """
+    resolved: dict[str, dict[str, type]] = {}
+    for name in names:
+        pipeline = registry[name].pipeline
+        try:
+            resolved[name] = {
+                stage: resolve_stage_class(stage, getattr(pipeline, stage)) for stage in STAGE_PACKAGES
+            }
+        except StageClassError as exc:
+            # The message names the stage only, never the configured class path.
+            typer.echo(f"{name}: {exc}; nothing was run.", err=True)
+            raise typer.Exit(code=EXIT_LOAD_ERROR)
+    return resolved
+
+
+def _run_sources(
+    settings: Settings,
+    registry: dict[str, SourceConfig],
+    names: list[str],
+    classes: dict[str, dict[str, type]],
+    approvals_dir: Path,
+    today: date,
+) -> None:
+    """Run the Orchestrator for each source in *names*; exit EXIT_SOURCE_FAILED if any failed.
+
+    One failing source does not stop the rest (lead ruling 3): each checkpoints its own failure
+    and the run ends non-zero naming every failed source, with the exception type only (F8).
+    Dirs, the LocalAI URL and model all come from Settings (F13); embedder_model is left to the
+    Orchestrator's default (terms-analysis#98 owns it).
+    """
+    failed: list[str] = []
+    for name in names:
+        stage = classes[name]
+        try:
+            orchestrator = Orchestrator(
+                fetcher=_ApprovalGatedFetcher(
+                    stage["fetcher"](), approvals_dir / f"{name}.yaml", name, today
+                ),
+                cleaner=stage["cleaner"](),
+                chunker=stage["chunker"](),
+                embedder=LocalAIEmbedder(settings.localai_url, settings.localai_model),
+                publisher=FilesystemPublisher(),
+                publish_target=PublishTarget(kind="filesystem", path=settings.out_dir / name),
+                state_dir=settings.state_dir,
+            )
+            receipt = orchestrator.run(name, registry[name])
+        except Exception as exc:
+            failed.append(name)
+            typer.echo(f"{name}: failed ({_type_name(exc)}).", err=True)
+            continue
+        typer.echo(f"{name}: published {receipt.chunk_count} chunk(s).")
+    if failed:
+        typer.echo(
+            f"{len(failed)} source(s) failed: {', '.join(failed)}. Checkpoints in INGESTER_STATE_DIR"
+            " record each failure.",
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_SOURCE_FAILED)
+
+
+def _exit_no_approved_sources() -> None:
+    typer.echo(
+        "No requested source holds a valid approval; nothing was run. Sign the approval files"
+        f" under {APPROVALS_SUBDIR}/ in INGESTER_CONFIG_DIR.",
+        err=True,
+    )
+    raise typer.Exit(code=EXIT_NO_APPROVED_SOURCES)
+
 # Main app
 app = typer.Typer(
     name="ingester",
@@ -160,7 +416,9 @@ app = typer.Typer(
     epilog=(
         "Exit codes: "
         + _exit_code_clauses(tuple(sorted(_EXIT_MEANINGS)))
-        + ". Other command failures (unknown source, license drift, invalid bundle) also exit 1."
+        + ". Other command failures (unknown source, invalid INGESTER_* settings, an unreadable"
+        " approvals dir or malformed approval file, a pipeline class outside the package, license"
+        " drift, invalid bundle) also exit 1."
     ),
     no_args_is_help=True,
 )
@@ -287,12 +545,21 @@ def status(
 
 @app.command(
     help=(
-        "Fetch a source (use --dry-run to preview without writing).\n\n"
-        "Exit codes: 0 when --dry-run prints what would be fetched; "
+        "Fetch one source and run it through the pipeline: fetch, check the approved hash,"
+        " clean, chunk, embed and publish under INGESTER_OUT_DIR (use --dry-run to preview"
+        " without writing).\n\n"
+        "Exit codes: 0 when the source is published, or --dry-run prints what would be fetched; "
         + _exit_code_clauses(
-            (EXIT_NOT_WIRED, EXIT_NO_SOURCES, EXIT_SOURCES_DIR_MISSING, EXIT_LOAD_ERROR)
+            (
+                EXIT_NO_APPROVED_SOURCES,
+                EXIT_SOURCE_FAILED,
+                EXIT_NO_SOURCES,
+                EXIT_SOURCES_DIR_MISSING,
+                EXIT_LOAD_ERROR,
+            )
         )
-        + ". An unknown source in a sources dir that holds sources also exits 1."
+        + ". An unknown source in a sources dir that holds sources, invalid INGESTER_* settings,"
+        " an unreadable approvals dir or a malformed approval file also exit 1."
     )
 )
 def fetch(
@@ -333,19 +600,48 @@ def fetch(
         typer.echo(f"DRY RUN: would fetch {source!r} from {cfg.base_url}")
         return
 
-    # Actual fetch not implemented in this thin CLI layer — delegate to pipeline
-    typer.echo(f"Fetching {source!r} from {cfg.base_url} ...")
-    # Fail loudly: exiting 0 here would report a no-op as success (terms-analysis#90)
-    typer.echo("(Full fetch pipeline not yet wired — use orchestrator directly.)", err=True)
-    raise typer.Exit(code=EXIT_NOT_WIRED)
+    # fetch applies the same legal gate as refresh: an unsigned source is refused before any
+    # network call (test_fetch_of_unsigned_source_refuses; see the #93 coder report, deviation A).
+    settings = _load_settings()
+    approvals_dir = _approvals_dir(settings)
+    today = date.today()
+    if not _approved_sources([source], approvals_dir, today):
+        _exit_no_approved_sources()
+    classes = _stage_classes(registry, [source])
+    _run_sources(settings, registry, [source], classes, approvals_dir, today)
 
 
-@app.command()
+@app.command(
+    help=(
+        "Refresh every configured source whose approval is valid: fetch, check the approved"
+        " hash, clean, chunk, embed and publish each under INGESTER_OUT_DIR. Sources without a"
+        " valid approval are named on stderr and not run. A failing source does not stop the"
+        " rest.\n\n"
+        "Exit codes: 0 when every approved source is published, or --dry-run lists what would"
+        " run; "
+        + _exit_code_clauses(
+            (
+                EXIT_NO_APPROVED_SOURCES,
+                EXIT_SOURCE_FAILED,
+                EXIT_NO_SOURCES,
+                EXIT_SOURCES_DIR_MISSING,
+                EXIT_LOAD_ERROR,
+            )
+        )
+        + ". Invalid INGESTER_* settings, an unreadable approvals dir, a malformed approval file"
+        " or a pipeline class outside the package also exit 1."
+    )
+)
 def refresh(
     all_sources: bool = typer.Option(
         False,
         "--all",
         help="Refresh all configured sources.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="List the sources that would run, without fetching or writing anything.",
     ),
     # A plain str, not Path: typer's Path type stats the argument itself and fails on NUL or a
     # lone surrogate before _require_sources_dir can classify it (#108).
@@ -355,7 +651,6 @@ def refresh(
         help="Directory containing *.yaml source configs.",
     ),
 ) -> None:
-    """Refresh corpus bundles for all configured sources (or a single source)."""
     sources_path = _require_sources_dir(sources_dir)
     try:
         registry = _load_sources_dir(sources_path)
@@ -367,11 +662,22 @@ def refresh(
         typer.echo(f"{MSG_NO_SOURCES}; nothing to refresh.")
         raise typer.Exit(code=EXIT_NO_SOURCES)
 
-    # Full pipeline orchestration not yet wired — placeholder for Phase 1.
-    typer.echo(f"Refreshing {len(registry)} source(s): {', '.join(registry)}")
-    # Fail loudly: exiting 0 here would report a no-op as success (terms-analysis#90)
-    typer.echo("(Full refresh pipeline not yet wired — use orchestrator directly.)", err=True)
-    raise typer.Exit(code=EXIT_NOT_WIRED)
+    # Every check that needs no network runs before the first fetch, and on --dry-run too, so
+    # a dry run exits with the code the real run would (lead ruling 5).
+    settings = _load_settings()
+    approvals_dir = _approvals_dir(settings)
+    today = date.today()
+    approved = _approved_sources(list(registry), approvals_dir, today)
+    if not approved:
+        _exit_no_approved_sources()
+    classes = _stage_classes(registry, approved)
+
+    if dry_run:
+        for name in approved:
+            typer.echo(f"DRY RUN: would refresh {name}")
+        return
+
+    _run_sources(settings, registry, approved, classes, approvals_dir, today)
 
 
 @app.command(

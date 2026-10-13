@@ -58,7 +58,8 @@ jobs:
       - name: Run refresh
         run: |
           source .venv/bin/activate
-          # Any non-zero fails the job; exit 3 (EXIT_NOT_WIRED) is intentionally red until G2 wires the orchestrator (terms-analysis#90).
+          # Any non-zero fails the job. Refresh runs the pipeline (terms-analysis#93): it exits 7 until
+          # the owner signs real approval hashes under config/approvals/, and 8 if a source fails.
           ingester refresh --all
 
       - name: Detect bundle change

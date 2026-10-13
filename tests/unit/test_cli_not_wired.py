@@ -1,16 +1,18 @@
-"""G0-1 acceptance tests: unwired `fetch` / `refresh` must not report success.
+"""G0-1 acceptance tests: `fetch` / `refresh` must not report success when they do no work.
 
-Tracking card: jennifer-mckinney/terms-analysis#90.
+Tracking cards: jennifer-mckinney/terms-analysis#90 (G0-1), #93 (G2-1).
 
-Until the orchestrator is wired (G2-1), `ingester fetch <source>` and
-`ingester refresh --all` do no work. They must exit non-zero and say so on
-stderr, so a scheduled job (refresh.yml) cannot go green while doing nothing.
+G0-1 pinned the unwired stub: exit non-zero and say so on stderr, so a scheduled job
+(refresh.yml) cannot go green while doing nothing. G2-1 wired both commands to the
+orchestrator; the same guarantee now holds for the case where no source holds a valid
+approval: nothing runs, the exit is non-zero and stderr names the approval as the reason.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from legal_corpus_ingester.cli import app
@@ -20,9 +22,18 @@ from legal_corpus_ingester.cli import app
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _SOURCES_DIR = _REPO_ROOT / "config" / "sources"
 
-_NOT_WIRED = "not yet wired"
+# The reason stderr must give when nothing ran (terms-analysis#93).
+_NOTHING_RAN_REASON = "approval"
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def _no_approvals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # An empty approvals dir from env, not the repo's: no source may run, and a signed repo
+    # approval can never turn these tests into live fetches.
+    (tmp_path / "approvals").mkdir()
+    monkeypatch.setenv("INGESTER_CONFIG_DIR", str(tmp_path))
 
 
 def test_fetch_unwired_exits_nonzero() -> None:
@@ -35,10 +46,10 @@ def test_fetch_unwired_exits_nonzero() -> None:
     )
 
     assert result.exit_code != 0, (
-        f"unwired fetch reported success (exit 0); stdout={result.stdout!r}"
+        f"fetch with no approval reported success (exit 0); stdout={result.stdout!r}"
     )
-    assert _NOT_WIRED in result.stderr, (
-        f"'{_NOT_WIRED}' not on stderr; stderr={result.stderr!r}"
+    assert _NOTHING_RAN_REASON in result.stderr, (
+        f"'{_NOTHING_RAN_REASON}' not on stderr; stderr={result.stderr!r}"
     )
 
 
@@ -52,8 +63,8 @@ def test_refresh_unwired_exits_nonzero() -> None:
     )
 
     assert result.exit_code != 0, (
-        f"unwired refresh reported success (exit 0); stdout={result.stdout!r}"
+        f"refresh with no approval reported success (exit 0); stdout={result.stdout!r}"
     )
-    assert _NOT_WIRED in result.stderr, (
-        f"'{_NOT_WIRED}' not on stderr; stderr={result.stderr!r}"
+    assert _NOTHING_RAN_REASON in result.stderr, (
+        f"'{_NOTHING_RAN_REASON}' not on stderr; stderr={result.stderr!r}"
     )

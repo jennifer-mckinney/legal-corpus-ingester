@@ -134,10 +134,12 @@ class TestMainExitCodes:
                    "--out-dir", str(tmp_path / "out")])
         assert rc == EXIT_SOURCE_PROBLEM == 1
 
-    def test_never_run_while_unwired_exits_not_wired_and_says_why(self, tmp_path, capsys):
-        # Today's real state: refresh is unwired, so no checkpoint can exist. That is the
-        # known state (cli.EXIT_NOT_WIRED), not success and not a broken pipeline.
-        assert health_check.REFRESH_WIRED is cli.REFRESH_WIRED is False
+    def test_never_run_while_unwired_exits_not_wired_and_says_why(self, tmp_path, capsys, monkeypatch):
+        # The unwired branch, kept for a command that is unwired again: no checkpoint can exist,
+        # which is the known state (cli.EXIT_NOT_WIRED), not success and not a broken pipeline.
+        # Refresh itself is wired since terms-analysis#93, so the flag is patched off here.
+        assert health_check.REFRESH_WIRED is cli.REFRESH_WIRED is True
+        monkeypatch.setattr(health_check, "REFRESH_WIRED", False)
         config_dir = tmp_path / "config"
         config_dir.mkdir()
         (config_dir / "eurlex.yaml").write_text("name: eurlex\n")

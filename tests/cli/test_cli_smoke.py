@@ -560,7 +560,8 @@ def test_top_level_help_lists_every_exit_code() -> None:
 # also echoed the path. A second ruling the same day gives an existing dir that holds no source
 # "its own error code ... 'no source'": fetch and audit-license exit EXIT_NO_SOURCES there, like
 # status and refresh. `sources list` on that dir still prints "No sources configured." and exits
-# 0, fetch on a valid dir exits EXIT_NOT_WIRED, and an unknown source in a configured dir is 1.
+# 0, fetch of an unsigned source on a valid dir exits EXIT_NO_APPROVED_SOURCES (terms-analysis#93),
+# and an unknown source in a configured dir is 1.
 
 _DIR_MISSING_CASES = tuple(c for c in _STATUS_CASES if c.kind == "dir_missing")
 _NO_SOURCES_CASES = tuple(c for c in _STATUS_CASES if c.kind == "no_sources")
@@ -728,7 +729,21 @@ def test_sources_list_configured_dir_lists_every_source() -> None:
 # lives in the top-level help only.
 _COMMAND_HELP_CODES: dict[str, tuple[str, ...]] = {
     # Owner ruling 2026-10-12: fetch and audit-license exit EXIT_NO_SOURCES on an empty dir.
-    "fetch": ("EXIT_NOT_WIRED", "EXIT_NO_SOURCES", "EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
+    # terms-analysis#93 wired fetch and refresh: EXIT_NOT_WIRED gave way to 7 and 8.
+    "fetch": (
+        "EXIT_NO_APPROVED_SOURCES",
+        "EXIT_SOURCE_FAILED",
+        "EXIT_NO_SOURCES",
+        "EXIT_SOURCES_DIR_MISSING",
+        "EXIT_LOAD_ERROR",
+    ),
+    "refresh": (
+        "EXIT_NO_APPROVED_SOURCES",
+        "EXIT_SOURCE_FAILED",
+        "EXIT_NO_SOURCES",
+        "EXIT_SOURCES_DIR_MISSING",
+        "EXIT_LOAD_ERROR",
+    ),
     "sources list": ("EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
     "audit-license": ("EXIT_NO_SOURCES", "EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
 }
@@ -763,18 +778,24 @@ def test_top_level_exit_code_scope_matches_commands(tmp_path: Path, monkeypatch:
     # Each code is checked against what the commands actually exit on its trigger.
     monkeypatch.chdir(tmp_path)
     (tmp_path / "empty").mkdir()
+    # An empty approvals dir: every repo source is unsigned, so fetch and refresh run nothing and
+    # never reach the network (terms-analysis#93). Env, not the repo's approvals, so signing a
+    # real approval cannot turn this into a live fetch.
+    (tmp_path / "config" / "approvals").mkdir(parents=True)
+    monkeypatch.setenv("INGESTER_CONFIG_DIR", str(tmp_path / "config"))
     triggers = {
         "EXIT_SOURCES_DIR_MISSING": str(tmp_path / "missing"),
         "EXIT_NO_SOURCES": str(tmp_path / "empty"),
-        "EXIT_NOT_WIRED": str(_REPO_SOURCES),
+        "EXIT_NO_APPROVED_SOURCES": str(_REPO_SOURCES),
     }
     # The behaviour the owner ruled (2026-10-12), so the scope cannot be satisfied by moving the
     # help and the code together in the wrong direction: 6 on every command, 5 ("no source") on
-    # every command but `sources list` (an empty listing is exit 0), 3 where nothing is wired.
+    # every command but `sources list` (an empty listing is exit 0), 7 where the pipeline runs
+    # and no source is approved (terms-analysis#93; it replaced 3, which no command exits now).
     expected_scope = {
         "EXIT_SOURCES_DIR_MISSING": set(SOURCES_DIR_COMMANDS),
         "EXIT_NO_SOURCES": set(SOURCES_DIR_COMMANDS) - {"sources list"},
-        "EXIT_NOT_WIRED": {"fetch", "refresh"},
+        "EXIT_NO_APPROVED_SOURCES": {"fetch", "refresh"},
     }
     assert set(expected_scope) == set(triggers)
     clauses, text = _help_clauses(["--help"])

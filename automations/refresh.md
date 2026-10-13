@@ -33,9 +33,13 @@ issue steps get `GH_TOKEN` (terms-analysis#90).
    workflow-level `bash -eo pipefail` shell. Any non-zero exit fails the job, including
    5 (`EXIT_NO_SOURCES`: `config/sources/` is tracked, so an empty registry means a
    broken checkout), 6 (`EXIT_SOURCES_DIR_MISSING`: `config/sources/` does not exist
-   or is not a directory, also a broken checkout; #108) and 3 (`EXIT_NOT_WIRED`:
-   intentionally red until G2 wires the orchestrator; terms-analysis#90). The full
-   list is in `ingester --help`.
+   or is not a directory, also a broken checkout; #108), 7 (`EXIT_NO_APPROVED_SOURCES`:
+   no source holds a valid approval, so nothing ran; every repo approval is a
+   placeholder until the owner signs real hashes, so the run is red until then) and
+   8 (`EXIT_SOURCE_FAILED`: at least one approved source failed; each is named on
+   stderr and checkpointed, and the remaining sources still run; terms-analysis#93).
+   Sources without a valid approval are named on stderr and skipped. The full list
+   is in `ingester --help`.
 
 3. **Detect bundle change.** Runs `scripts/detect_bundle_change.py detect`. It reads
    the bundle `out/current` points at and fingerprints it (SHA256 of its

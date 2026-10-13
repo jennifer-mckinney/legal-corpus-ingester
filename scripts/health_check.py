@@ -15,6 +15,8 @@ Exit 3 (cli.EXIT_NOT_WIRED): the only problem is never-run sources while
         known unwired state: not success, and not a broken pipeline either.
         health.yml turns exactly this code into a warning; every other non-zero
         code fails the run. health_verdict() is the one place this is decided.
+        Refresh is wired since terms-analysis#93 (REFRESH_WIRED is True), so
+        this branch is dormant and a never-run source exits 1.
 Exit 4 (EXIT_CHECKPOINT_INVALID): a checkpoint file exists but cannot be trusted
         (#17): not a regular file, not strict UTF-8 JSON, or not an object that
         CheckpointStore.load accepts (a missing, unknown or wrong-typed

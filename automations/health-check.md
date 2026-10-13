@@ -76,11 +76,12 @@ decided:
 | 3 (`EXIT_NOT_WIRED`) | The only problem is never-run sources and `cli.REFRESH_WIRED` is False | green with a "Refresh not wired" warning annotation |
 | 4 (`EXIT_CHECKPOINT_INVALID`) | A checkpoint file exists but is not a valid `CheckpointState` for its source (see below). Outranks 1 and 3 (stale or never-run sources do not mask it), wired or not | red |
 
-Exit 3 is the known unwired state: `ingester refresh` does not run the pipeline
-yet, so no checkpoint can exist. The step turns exactly that code into a warning
-and fails on every other non-zero code, including a crash. A stale checkpoint is
-never excused. The PR that wires refresh flips `REFRESH_WIRED` to True (a unit
-test fails until it does), after which never-run exits 1.
+Exit 3 was the known unwired state: no checkpoint could exist while `ingester
+refresh` did not run the pipeline. Refresh is wired since terms-analysis#93 and
+`REFRESH_WIRED` is True, so a never-run source now exits 1 and the run is red until
+every configured source has a fresh checkpoint. The step still turns exactly code 3
+into a warning (the code is reserved) and fails on every other non-zero code,
+including a crash. A stale checkpoint is never excused.
 
 A checkpoint is valid only when it is a regular file (a symlink to one is
 followed) holding strict UTF-8 JSON that `CheckpointStore.load` accepts: an
