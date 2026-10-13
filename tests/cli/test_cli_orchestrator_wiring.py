@@ -81,6 +81,7 @@ from legal_corpus_ingester.pipeline.approval_gate import (
 from legal_corpus_ingester.pipeline.manifest import MANIFEST_FILENAME, Manifest
 from legal_corpus_ingester.pipeline.orchestrator import Orchestrator as RealOrchestrator
 from legal_corpus_ingester.pipeline.state import STAGES, CheckpointState, CheckpointStore
+from legal_corpus_ingester.provenance.license_audit import DEFAULT_STATE_FILE as LICENSE_BASELINE_FILE
 from legal_corpus_ingester.publishers.base import PublishReceipt
 from legal_corpus_ingester.sources.registry import load_all
 from tests.cli.helpers import PUBLIC_EXIT_CODES, strip_ansi
@@ -506,6 +507,14 @@ def test_orchestrator_dirs_come_from_settings(ws_all: _Workspace, spy: _Spy, net
         state = Path(bound.arguments["state_dir"]).resolve()
         assert target.is_relative_to(ws.out.resolve()), target
         assert state.is_relative_to(ws.state.resolve()), state
+    # Round 5 J: refresh runs the licence-drift gate, with its baseline in the configured state
+    # dir (the one file every source shares), never None and never a cwd-relative default.
+    baselines = set()
+    for bound in spy.constructed:
+        baseline = bound.arguments.get("license_state_file")
+        assert baseline is not None, "refresh composes the Orchestrator without license_state_file"
+        baselines.add(Path(baseline).resolve())
+    assert baselines == {ws.state.resolve() / LICENSE_BASELINE_FILE.name}, baselines
     assert _is_empty(ws.cwd)
 
 
@@ -546,6 +555,59 @@ def test_refresh_all_end_to_end_fetches_only_approved_sources(ws: _Workspace, ne
     for name in _unsigned():
         _assert_not_approved_checkpoint(ws, name)
         assert _named_with(result.stderr, name, "fail"), (name, _why(result))
+    assert _is_empty(ws.cwd)
+
+
+_HOSTILE_SPDX = "CC0-1.0\x1b[2J\n::error::forged\u202eevil\u2028"
+
+
+def _baseline_hash(path: Path, name: str) -> str:
+    return str(json.loads(path.read_text(encoding="utf-8"))[name]["hash"])
+
+
+def test_refresh_spdx_drift_blocks_publish_and_names_the_source(ws_all: _Workspace, net: _Net) -> None:
+    # Round 5 J: the real pipeline, twice. Run 1 records each source's licence baseline in the
+    # configured state dir; audit-license reads that same file by default; an SPDX change on a
+    # signed source then blocks its publish, names it, and exits 8 while the others publish.
+    ws = ws_all
+    net.upstream = ws
+    first = _invoke(ws.argv("refresh", "--all"))
+    assert first.exit_code == 0, _why(first)
+    baseline = ws.state / LICENSE_BASELINE_FILE.name
+    assert baseline.is_file(), "refresh recorded no licence baseline in INGESTER_STATE_DIR"
+    recorded = json.loads(baseline.read_text(encoding="utf-8"))
+    assert set(recorded) == set(_repo_names()), sorted(recorded)
+
+    # audit-license with no --state-file reads the refresh baseline, not a cwd-relative decoy.
+    decoy = ws.cwd / LICENSE_BASELINE_FILE
+    decoy.parent.mkdir(parents=True)
+    decoy_hash = "d" * 64
+    assert decoy_hash[:12] != _baseline_hash(baseline, "eurlex_gdpr")[:12]
+    decoy.write_text(json.dumps({"eurlex_gdpr": {"hash": decoy_hash, "spdx": "CC-BY-4.0"}}), encoding="utf-8")
+    audit = _invoke(ws.argv("audit-license", "eurlex_gdpr", "--offline"))
+    assert audit.exit_code == 0, _why(audit)
+    assert "BASELINE_ONLY" in audit.stdout, _why(audit)
+    assert _baseline_hash(baseline, "eurlex_gdpr")[:12] in audit.stdout, _why(audit)
+    assert decoy_hash[:12] not in audit.stdout, "audit-license read the cwd-relative default"
+    shutil.rmtree(ws.cwd / LICENSE_BASELINE_FILE.parts[0])
+
+    # The stored SPDX differs from the one the fetcher reports: SPDX_DRIFT for eurlex_gdpr only.
+    recorded["eurlex_gdpr"]["spdx"] = _HOSTILE_SPDX
+    baseline.write_text(json.dumps(recorded), encoding="utf-8")
+    shutil.rmtree(ws.out)
+    second = _invoke(ws.argv("refresh", "--all"))
+    assert second.exit_code == _SOURCE_FAILED, _why(second)
+    assert _named_with(second.stderr, "eurlex_gdpr", "fail"), _why(second)
+    published = {path.parent.name for path in ws.out.rglob(MANIFEST_FILENAME)}
+    assert "eurlex_gdpr" not in published, "a source with SPDX drift was published"
+    assert published == set(_repo_names()) - {"eurlex_gdpr"}, published
+    state = CheckpointStore(ws.state).load("eurlex_gdpr")
+    assert state is None or state.stage != "done", state
+    # The drifted baseline is kept for review, not overwritten by the blocked run.
+    assert json.loads(baseline.read_text(encoding="utf-8"))["eurlex_gdpr"]["spdx"] == _HOSTILE_SPDX
+    assert "::error::" not in _output(second), _why(second)
+    _assert_safe_output(second, str(ws.root), str(ws.root.resolve()))
+    assert net.attempts == [], net.attempts
     assert _is_empty(ws.cwd)
 
 
@@ -983,9 +1045,15 @@ def test_stage_rows_cover_every_family_for_every_stage() -> None:
         assert {"m13a", "m13b", "m14"} <= families, (stage, families)
 
 
+# Round 5 gap: "mixed" leaves one source unsigned; "none" unsigns every source, the path that
+# exits 7 and checkpoints every source today. A load error outranks both (ruling 4): exit 1.
+_SIGNED_MIXES = ("mixed", "none")
+
+
+@pytest.mark.parametrize("signed", _SIGNED_MIXES)
 @pytest.mark.parametrize(("stage", "dotted"), _STAGE_ROWS)
 def test_config_class_path_must_name_a_class_defined_in_its_own_stage(
-    ws_all: _Workspace, spy: _Spy, net: _Net, stage: str, dotted: str
+    ws_all: _Workspace, spy: _Spy, net: _Net, stage: str, dotted: str, signed: str
 ) -> None:
     # Mutants M13 (a class from another stage's subpackage) and M14 (a class only imported into
     # the named module). The schema admits each path; the CLI must refuse the run before any
@@ -998,12 +1066,16 @@ def test_config_class_path_must_name_a_class_defined_in_its_own_stage(
     assert load_all(ws.sources)["eurlex_gdpr"].pipeline.model_dump()[stage] == dotted
     # Round 4 H (mutant C10): with an unsigned source in the run, the stage-class load error
     # still exits 1 before any not_approved checkpoint is written (ruling 4).
-    unsigned = _unsigned()[0]
-    ws.unsign(unsigned)
+    for name in _unsigned() if signed == "mixed" else _repo_names():
+        ws.unsign(name)
+    # Lead ruling 5: the dry run exits with the code the real run would, and writes nothing.
+    dry = _invoke(ws.argv("refresh", "--all", "--dry-run"))
+    assert dry.exit_code == _LOAD_ERROR, _why(dry)
+    assert _is_empty(ws.state), "a dry run left a checkpoint behind"
     result = _invoke(ws.argv("refresh", "--all"))
     assert result.exit_code == _LOAD_ERROR, _why(result)
     assert spy.constructed == [] and spy.runs == [], _why(result)
-    assert _is_empty(ws.state), "a stage-class load error left a checkpoint behind (round 4 H)"
+    assert _is_empty(ws.state), f"a stage-class load error left a checkpoint behind ({signed} signed)"
     assert "eurlex_gdpr" in _output(result), _why(result)
     _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
     assert net.attempts == []

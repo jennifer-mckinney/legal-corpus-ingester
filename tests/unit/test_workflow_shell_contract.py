@@ -17,6 +17,15 @@
    manifest: a manifest needs a separate sync job (or a human) to reach the
    repo, which is exactly the out-of-band wiring that was missing, while
    in-step creation heals a deleted or renamed label on the next run.
+4. One persisted state dir (terms-analysis#93 rulings K and L, ingester #71
+   option 1). Refresh writes checkpoints, the licence baseline and the bundle
+   record; health reads them. Both workflows declare the same INGESTER_STATE_DIR,
+   and it persists between hosted runners through the documented
+   actions/cache/restore + actions/cache/save pair. Refresh restores before it
+   runs and saves under a key unique to the run and attempt with `if: always()`,
+   so failure checkpoints persist too. Health restores and never saves. A
+   workflow_dispatch input seeds the first bundle record, and a cache miss
+   stays loud (`--require-state`; health's never-run exit).
 """
 from __future__ import annotations
 
@@ -28,6 +37,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -36,6 +46,7 @@ import pytest
 import yaml
 
 from legal_corpus_ingester import cli
+from legal_corpus_ingester.config import Settings
 from legal_corpus_ingester.pipeline.state import CheckpointState, CheckpointStore
 
 _WORKFLOWS_DIR = Path(__file__).resolve().parents[2] / ".github" / "workflows"
@@ -346,6 +357,9 @@ def test_refresh_detects_change_from_durable_record_not_pre_checkout_symlink() -
     assert "scripts/detect_bundle_change.py detect" in detect["run"]
     # ADR-016/#71: on a hosted runner a missing record must be a red run, never an announce.
     assert "--require-state" in detect["run"]
+    # Round 5 L: the guard stays live with the cache wired; a skipped or ignored detect would let
+    # a lost record pass green.
+    assert "if" not in detect and "continue-on-error" not in detect, detect
     issue_idx, _ = _step_by_name(doc, "Open issue on corpus change")
     record_idx, record = _step_by_name(doc, "Record announced bundle")
     # The record is written only after the alert step, and only when it ran.
@@ -413,6 +427,106 @@ def _load_health_check() -> ModuleType:
 _HC = _load_health_check()
 
 
+# ---------------------------------------------------------------------------
+# K and L (terms-analysis#93, ingester #71): the workflow env, rendered as the runner does
+# ---------------------------------------------------------------------------
+
+_REFRESH_YML = _WORKFLOWS_DIR / "refresh.yml"
+# The env var Settings reads for state_dir, derived from the Settings class (F13), never restated.
+_STATE_DIR_VAR = f"{Settings.model_config['env_prefix']}state_dir".upper()
+assert "state_dir" in Settings.model_fields
+_EXPR = re.compile(r"\$\{\{\s*(.*?)\s*\}\}")
+_UNSAFE_CATEGORIES = frozenset({"Cc", "Cf", "Cs", "Zl", "Zp"})
+
+
+class _Unmodelled(ValueError):
+    """A ${{ }} expression this model does not resolve; the checker reports it, never guesses."""
+
+
+def _contexts(root: Path, checkout: Path, run_id: str = "1001", run_attempt: str = "1") -> dict[str, str]:
+    """The runner contexts a state path or cache key may use, with test values."""
+    return {
+        "runner.temp": str(root / "runner-temp"),
+        "github.workspace": str(checkout),
+        "runner.os": "Linux",
+        "github.run_id": run_id,
+        "github.run_attempt": run_attempt,
+    }
+
+
+def _render(value: object, contexts: dict[str, str], env: dict[str, str]) -> str:
+    """Evaluate ${{ ctx }} and ${{ env.X }} as the runner does. Shell syntax is NOT expanded:
+    the runner passes `$HOME` or `~` in an env value or a `with:` input through literally."""
+
+    def sub(match: re.Match[str]) -> str:
+        expr = match.group(1)
+        if expr in contexts:
+            return contexts[expr]
+        if expr.startswith("env.") and expr[4:] in env:
+            return env[expr[4:]]
+        raise _Unmodelled(f"unmodelled expression ${{{{ {expr} }}}}")
+
+    return _EXPR.sub(sub, str(value))
+
+
+def _job_env(doc: dict[str, Any], job_name: str, contexts: dict[str, str]) -> dict[str, str]:
+    """Workflow env, then job env, rendered in order (a later value may use ${{ env.X }})."""
+    env: dict[str, str] = {}
+    for node in (doc, (doc.get("jobs") or {}).get(job_name) or {}):
+        for name, value in (node.get("env") or {}).items():
+            env[str(name)] = _render(value, contexts, env)
+    return env
+
+
+def _declared_state_dir(doc: dict[str, Any], job_name: str) -> object:
+    """The raw INGESTER_STATE_DIR the job sees (job env overrides workflow env), or None."""
+    job = (doc.get("jobs") or {}).get(job_name) or {}
+    for node in (job, doc):
+        env = node.get("env") or {}
+        if _STATE_DIR_VAR in env:
+            return env[_STATE_DIR_VAR]
+    return None
+
+
+def state_dir_problems(raw: object, contexts: dict[str, str], env: dict[str, str] | None = None) -> list[str]:
+    """Why a declared INGESTER_STATE_DIR value would not be one durable dir outside the checkout."""
+    if raw is None:
+        return [f"{_STATE_DIR_VAR} is not declared in the workflow or job env"]
+    text = str(raw)
+    if not text.strip():
+        return [f"{_STATE_DIR_VAR} is empty"]
+    if any(unicodedata.category(c) in _UNSAFE_CATEGORIES for c in text):
+        return [f"{_STATE_DIR_VAR} holds a control, format or line-separator character"]
+    try:
+        rendered = _render(text, contexts, env or {})
+    except _Unmodelled as exc:
+        return [f"{_STATE_DIR_VAR}: {exc}"]
+    if "$" in rendered or rendered.startswith("~") or "/~" in rendered:
+        return [f"{_STATE_DIR_VAR} uses shell syntax, which a workflow env value never expands"]
+    path = Path(os.path.normpath(rendered))
+    if not path.is_absolute():
+        return [f"{_STATE_DIR_VAR} is relative: it lands in the checkout, which checkout's clean wipes"]
+    if path.is_relative_to(Path(contexts["github.workspace"])):
+        return [f"{_STATE_DIR_VAR} is inside the checkout, which checkout's clean wipes"]
+    return []
+
+
+def _health_state_dir(runner_root: Path, xdg: Path | None, home: Path | None = None) -> Path:
+    """Where health.yml's steps must read state: the declared INGESTER_STATE_DIR, rendered.
+
+    Until K lands health.yml declares none; then the steps' own XDG layout is the expectation,
+    so these job tests keep checking the steps while K's own test is the red one.
+    """
+    doc = _load(_HEALTH_YML)
+    job_name, _, _ = _health_step(doc, "health-check")
+    contexts = _contexts(runner_root, runner_root / "checkout")
+    raw = _declared_state_dir(doc, job_name)
+    if raw is None:
+        base = xdg if xdg is not None else (home or runner_root / "home") / ".local" / "state"
+        return base / "legal-corpus-ingester" / "state"
+    return Path(_render(raw, contexts, _job_env(doc, job_name, contexts)))
+
+
 def _health_step(doc: dict[str, Any], key: str) -> tuple[str, int, dict[str, Any]]:
     """(job name, index in that job, step) of the ONE step that runs _HEALTH_STEPS[key]."""
     pattern = _HEALTH_STEPS[key]
@@ -430,16 +544,23 @@ def _health_step(doc: dict[str, Any], key: str) -> tuple[str, int, dict[str, Any
 
 
 def _run_health_step(
-    tmp_path: Path, key: str, *, python_rc: int | None = None, xdg: Path | None = None
+    tmp_path: Path,
+    key: str,
+    *,
+    python_rc: int | None = None,
+    xdg: Path | None = None,
+    runner_root: Path | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path, list[str]]:
     """Run a health.yml step; return (result, checkout dir, argv the fake command got).
 
     key names the step by the command it runs (a _HEALTH_STEPS key). python_rc None runs
     the real scripts/health_check.py and CLI; an int makes a fake `python`/`ingester`
-    that records its argv and exits with that code.
+    that records its argv and exits with that code. The step gets the workflow and job env
+    rendered as the runner renders it (K), with runner.temp under runner_root (default
+    tmp_path), so steps of one job share one runner.
     """
     doc = _load(_HEALTH_YML)
-    _, _, step = _health_step(doc, key)
+    job_name, _, step = _health_step(doc, key)
     checkout = tmp_path / "checkout"
     (checkout / ".venv" / "bin").mkdir(parents=True)
     (checkout / ".venv" / "bin" / "activate").write_text("")
@@ -469,6 +590,7 @@ def _run_health_step(
         env["PYTHONPATH"] = str(_REPO_ROOT / "src")
     if xdg is not None:
         env["XDG_STATE_HOME"] = str(xdg)
+    env.update(_job_env(doc, job_name, _contexts(runner_root or tmp_path, checkout)))
     script = tmp_path / "step.sh"
     script.write_text(str(step["run"]))
     shell = _default_shell(doc)
@@ -484,12 +606,13 @@ def _run_health_step(
 @pytest.mark.parametrize("key", sorted(_HEALTH_STEPS))
 @pytest.mark.parametrize("use_xdg", [True, False], ids=["xdg", "home-fallback"])
 def test_health_steps_read_state_outside_the_checkout(tmp_path: Path, key: str, use_xdg: bool) -> None:
+    # K: both steps read the declared INGESTER_STATE_DIR (refresh writes there), whatever
+    # XDG_STATE_HOME or HOME say; a step left on its own path reads a dir refresh never fills.
     xdg = tmp_path / "xdg" if use_xdg else None
     result, checkout, argv = _run_health_step(tmp_path, key, python_rc=0, xdg=xdg)
     assert result.returncode == 0, result.stderr
     state_dir = Path(argv[argv.index("--state-dir") + 1])
-    base = xdg if xdg is not None else tmp_path / "home" / ".local" / "state"
-    assert state_dir == base / "legal-corpus-ingester" / "state"
+    assert state_dir == _health_state_dir(tmp_path, xdg, tmp_path / "home")
     assert not state_dir.resolve().is_relative_to(checkout.resolve())
 
 
@@ -564,7 +687,7 @@ def _run_health_job(tmp_path: Path, xdg: Path) -> tuple[int, str | None, list[st
         assert "if" not in step, f"health.yml {key} step has an `if:` this test does not model"
         continue_on_error = step.get("continue-on-error", False)
         assert isinstance(continue_on_error, bool), f"health.yml {key}: unmodelled continue-on-error"
-        result, _, _ = _run_health_step(tmp_path / key, key, xdg=xdg)
+        result, _, _ = _run_health_step(tmp_path / key, key, xdg=xdg, runner_root=tmp_path)
         ran.append(key)
         output += result.stdout + result.stderr
         if result.returncode != 0 and not continue_on_error:
@@ -612,7 +735,7 @@ _MALFORMED_CHECKPOINTS.update({
 @pytest.mark.parametrize("raw", list(_MALFORMED_CHECKPOINTS.values()), ids=list(_MALFORMED_CHECKPOINTS))
 def test_health_job_surfaces_invalid_checkpoint_exit_code(tmp_path: Path, raw: bytes) -> None:
     xdg = tmp_path / "xdg"
-    state = xdg / "legal-corpus-ingester" / "state"
+    state = _health_state_dir(tmp_path, xdg)
     state.mkdir(parents=True)
     checkpoint = state / f"{_first_source()}.checkpoint.json"
     checkpoint.write_bytes(raw)
@@ -630,7 +753,7 @@ def test_health_job_positive_control_runs_both_steps_and_passes(tmp_path: Path) 
     # (terms-analysis#93), so a legitimate state is a fresh "done" checkpoint for every source;
     # an empty state is now a never-run failure (next test), not a not-wired warning.
     xdg = tmp_path / "xdg"
-    state = xdg / "legal-corpus-ingester" / "state"
+    state = _health_state_dir(tmp_path, xdg)
     state.mkdir(parents=True)
     store = CheckpointStore(state)
     for config in sorted((_REPO_ROOT / "config" / "sources").glob("*.yaml")):
@@ -657,7 +780,7 @@ def test_health_check_step_end_to_end_never_run_fails_and_ignores_checkout_state
 
 
 def test_health_check_step_end_to_end_stale_source_fails(tmp_path: Path) -> None:
-    state = tmp_path / "xdg" / "legal-corpus-ingester" / "state"
+    state = _health_state_dir(tmp_path, tmp_path / "xdg")
     state.mkdir(parents=True)
     cp = state / "eurlex_gdpr.checkpoint.json"
     cp.write_text(json.dumps(dataclasses.asdict(
@@ -669,3 +792,350 @@ def test_health_check_step_end_to_end_stale_source_fails(tmp_path: Path) -> None
     assert "| eurlex_gdpr |" in result.stdout
     assert "| stale |" in result.stdout
     assert "::warning" not in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# K: refresh and health declare one INGESTER_STATE_DIR (terms-analysis#93)
+# ---------------------------------------------------------------------------
+
+_REFRESH_RUN = re.compile(r"(?<![\w.-])ingester\s+refresh\b")
+_DETECT_RUN = re.compile(r"(?<![\w.-])scripts/detect_bundle_change\.py\s+detect\b")
+_RECORD_RUN = re.compile(r"(?<![\w.-])scripts/detect_bundle_change\.py\s+record\b")
+
+
+def _cmd_steps(doc: dict[str, Any], pattern: re.Pattern[str]) -> list[tuple[str, int, dict[str, Any]]]:
+    """(job, index, step) of every step whose run, comments stripped, runs *pattern*."""
+    return [
+        (job_name, i, step)
+        for job_name, job in (doc.get("jobs") or {}).items()
+        for i, step in enumerate(job.get("steps") or [])
+        if pattern.search(_SHELL_COMMENT.sub("", str(step.get("run") or "")))
+    ]
+
+
+def _one_cmd_step(doc: dict[str, Any], pattern: re.Pattern[str]) -> tuple[str, int, dict[str, Any]]:
+    hits = _cmd_steps(doc, pattern)
+    assert len(hits) == 1, f"expected one step running {pattern.pattern!r}, found {len(hits)}"
+    return hits[0]
+
+
+# Declared values, each with the verdict the checker must give. Negatives: every way a value
+# looks like a path in YAML but is not one durable dir outside the checkout on the runner.
+_STATE_DIR_VALUES: list[tuple[object, bool]] = [
+    ("${{ runner.temp }}/legal-corpus-ingester/state", True),
+    ("${{runner.temp}}/state", True),
+    (None, False),
+    ("", False),
+    ("   ", False),
+    ("state", False),
+    ("./state", False),
+    ("${XDG_STATE_HOME:-$HOME/.local/state}/legal-corpus-ingester/state", False),
+    ("$HOME/.local/state/legal-corpus-ingester/state", False),
+    ("~/.local/state/legal-corpus-ingester/state", False),
+    # Absolute once rendered, but the shell variable stays literal: env values never expand.
+    ("${{ runner.temp }}/$RUNNER_NAME/state", False),
+    ("${{ github.workspace }}/state", False),
+    ("${{ secrets.STATE_DIR }}/state", False),
+    ("${{ runner.temp }}/state\n/etc", False),
+    ("${{ runner.temp }}/state x", False),
+    ("${{ runner.temp }}/st‮ate", False),
+    ("${{ runner.temp }}/st\x00ate", False),
+]
+
+
+def test_state_dir_table_has_positive_and_negative_rows() -> None:
+    verdicts = {ok for _, ok in _STATE_DIR_VALUES}
+    assert verdicts == {True, False}
+
+
+@pytest.mark.parametrize(("raw", "ok"), _STATE_DIR_VALUES, ids=[repr(v)[:40] for v, _ in _STATE_DIR_VALUES])
+def test_state_dir_checker_verdicts(tmp_path: Path, raw: object, ok: bool) -> None:
+    problems = state_dir_problems(raw, _contexts(tmp_path, tmp_path / "checkout"))
+    assert (problems == []) is ok, problems
+
+
+@pytest.mark.parametrize(
+    ("workflow", "pattern"),
+    [(_REFRESH_YML, _REFRESH_RUN), (_HEALTH_YML, _HEALTH_STEPS["health-check"])],
+    ids=["refresh", "health"],
+)
+def test_workflow_declares_a_durable_state_dir(tmp_path: Path, workflow: Path, pattern: re.Pattern[str]) -> None:
+    # K: the job that writes (refresh) or reads (health) state declares INGESTER_STATE_DIR.
+    doc = _load(workflow)
+    job_name, _, _ = _one_cmd_step(doc, pattern)
+    contexts = _contexts(tmp_path, tmp_path / "checkout")
+    raw = _declared_state_dir(doc, job_name)
+    assert state_dir_problems(raw, contexts, _job_env(doc, job_name, contexts)) == []
+
+
+def test_refresh_and_health_declare_the_same_state_dir(tmp_path: Path) -> None:
+    # K (Copilot, refresh.yml:63): refresh writes where health reads, on every runner.
+    contexts = _contexts(tmp_path, tmp_path / "checkout")
+    rendered = {}
+    for workflow, pattern in ((_REFRESH_YML, _REFRESH_RUN), (_HEALTH_YML, _HEALTH_STEPS["health-check"])):
+        doc = _load(workflow)
+        job_name, _, _ = _one_cmd_step(doc, pattern)
+        raw = _declared_state_dir(doc, job_name)
+        assert raw is not None, f"{workflow.name}: {_STATE_DIR_VAR} is not declared"
+        rendered[workflow.name] = _render(raw, contexts, _job_env(doc, job_name, contexts))
+    assert len(set(rendered.values())) == 1, rendered
+
+
+# ---------------------------------------------------------------------------
+# L: actions/cache persistence, as the actions/cache restore and save READMEs document it
+# (inputs path, key, restore-keys, fail-on-cache-miss, lookup-only; save with the same path)
+# ---------------------------------------------------------------------------
+
+_CACHE = "actions/cache"
+_CACHE_RESTORE = "actions/cache/restore"
+_CACHE_SAVE = "actions/cache/save"
+# The repo's pin convention, as every existing `uses:` line follows it: a full commit SHA and
+# a version comment (checked against the whole repo below, so it is not a guess).
+_PINNED_USES = re.compile(r"^\s*(?:-\s+)?uses:\s+([\w.-]+/[\w./-]+)@([0-9a-f]{40})\s+#\s*v\d+(?:\.\d+)*\s*$")
+_USES_LINE = re.compile(r"^\s*(?:-\s+)?uses:")
+
+
+def _action(step: dict[str, Any]) -> str | None:
+    uses = step.get("uses")
+    return str(uses).split("@", 1)[0] if uses else None
+
+
+def _action_steps(doc: dict[str, Any], action: str) -> list[tuple[str, int, dict[str, Any]]]:
+    return [
+        (job_name, i, step)
+        for job_name, job in (doc.get("jobs") or {}).items()
+        for i, step in enumerate(job.get("steps") or [])
+        if _action(step) == action
+    ]
+
+
+def _lines(value: object) -> list[str]:
+    return [line.strip() for line in str(value or "").splitlines() if line.strip()]
+
+
+def _cache_inputs(
+    doc: dict[str, Any], job_name: str, step: dict[str, Any], contexts: dict[str, str]
+) -> dict[str, Any]:
+    """The step's `with:` inputs rendered as the runner renders them (multi-line lists split)."""
+    env = _job_env(doc, job_name, contexts)
+    env.update({str(k): _render(v, contexts, env) for k, v in (step.get("env") or {}).items()})
+    with_ = step.get("with") or {}
+    return {
+        "path": [_render(line, contexts, env) for line in _lines(with_.get("path"))],
+        "key": _render(with_.get("key") or "", contexts, env).strip(),
+        "restore-keys": [_render(line, contexts, env) for line in _lines(with_.get("restore-keys"))],
+        "fail-on-cache-miss": str(with_.get("fail-on-cache-miss", "false")).strip().lower(),
+        "lookup-only": str(with_.get("lookup-only", "false")).strip().lower(),
+    }
+
+
+def _bare_if(step: dict[str, Any]) -> str:
+    text = str(step.get("if", "")).strip()
+    match = re.fullmatch(r"\$\{\{\s*(.*?)\s*\}\}", text)
+    return match.group(1) if match else text
+
+
+def _rendered_state_dir(doc: dict[str, Any], job_name: str, contexts: dict[str, str]) -> str:
+    raw = _declared_state_dir(doc, job_name)
+    assert raw is not None, f"{_STATE_DIR_VAR} is not declared (K)"
+    return _render(raw, contexts, _job_env(doc, job_name, contexts))
+
+
+def _the_one(doc: dict[str, Any], action: str, where: str) -> tuple[str, int, dict[str, Any]]:
+    hits = _action_steps(doc, action)
+    assert len(hits) == 1, f"{where}: expected exactly one {action} step, found {len(hits)}"
+    return hits[0]
+
+
+def test_refresh_restores_the_state_cache_before_it_runs(tmp_path: Path) -> None:
+    doc = _load(_REFRESH_YML)
+    job_name, run_idx, _ = _one_cmd_step(doc, _REFRESH_RUN)
+    _, detect_idx, _ = _one_cmd_step(doc, _DETECT_RUN)
+    rjob, ridx, restore = _the_one(doc, _CACHE_RESTORE, "refresh.yml")
+    assert rjob == job_name and ridx < run_idx and ridx < detect_idx, (
+        "refresh.yml: the cache restore must run before refresh and change detection read state"
+    )
+    # Restore always runs: a skipped or ignored restore makes every run a first run.
+    assert "if" not in restore and "continue-on-error" not in restore
+    contexts = _contexts(tmp_path, tmp_path / "checkout")
+    inputs = _cache_inputs(doc, rjob, restore, contexts)
+    assert _rendered_state_dir(doc, job_name, contexts) in inputs["path"], inputs["path"]
+    assert inputs["key"], "restore needs a primary key"
+    assert inputs["restore-keys"], "restore needs a restore-keys prefix to find the latest run's save"
+    # The first ever run has no cache; it must reach the seed step, so a miss cannot fail here.
+    assert inputs["fail-on-cache-miss"] != "true"
+    # lookup-only checks for a cache without downloading it: nothing would be restored.
+    assert inputs["lookup-only"] != "true"
+
+
+def test_refresh_saves_the_state_cache_under_a_unique_key_on_every_outcome(tmp_path: Path) -> None:
+    doc = _load(_REFRESH_YML)
+    job_name, run_idx, _ = _one_cmd_step(doc, _REFRESH_RUN)
+    # The combined actions/cache saves only when the job succeeds: failure checkpoints and the
+    # licence baseline of a failed run would be lost.
+    assert _action_steps(doc, _CACHE) == [], "refresh.yml uses the combined actions/cache"
+    _, _, restore = _the_one(doc, _CACHE_RESTORE, "refresh.yml")
+    sjob, sidx, save = _the_one(doc, _CACHE_SAVE, "refresh.yml")
+    assert sjob == job_name
+    assert _bare_if(save) == "always()", f"save must run on every outcome, got if: {save.get('if')!r}"
+    writers = [run_idx] + [i for _, i, _ in _cmd_steps(doc, _RECORD_RUN)]
+    assert sidx > max(writers), "refresh.yml: the cache save must run after every step that writes state"
+    contexts = _contexts(tmp_path, tmp_path / "checkout")
+    restore_in = _cache_inputs(doc, job_name, restore, contexts)
+    save_in = _cache_inputs(doc, job_name, save, contexts)
+    # restore/README: use the same path as the save; the cache version hashes the paths.
+    assert save_in["path"] == restore_in["path"], (save_in["path"], restore_in["path"])
+    keys = {
+        _cache_inputs(doc, job_name, save, _contexts(tmp_path, tmp_path / "checkout", run, attempt))["key"]
+        for run, attempt in (("1001", "1"), ("1001", "2"), ("1002", "1"))
+    }
+    assert len(keys) == 3, f"save key must be unique per run and attempt (a cache key is immutable): {keys}"
+    for key in keys:
+        assert any(key.startswith(prefix) for prefix in restore_in["restore-keys"]), (
+            f"the next refresh cannot find {key!r} with restore-keys {restore_in['restore-keys']}"
+        )
+
+
+def test_health_restores_the_refresh_cache_and_never_saves(tmp_path: Path) -> None:
+    hdoc, rdoc = _load(_HEALTH_YML), _load(_REFRESH_YML)
+    for action in (_CACHE, _CACHE_SAVE):
+        assert _action_steps(hdoc, action) == [], f"health.yml must never save state ({action})"
+    hjob, hidx, restore = _the_one(hdoc, _CACHE_RESTORE, "health.yml")
+    for key in _HEALTH_STEPS:
+        job_name, idx, _ = _health_step(hdoc, key)
+        assert job_name == hjob and hidx < idx, f"health.yml: restore must precede the {key} step"
+    assert "if" not in restore and "continue-on-error" not in restore
+    contexts = _contexts(tmp_path, tmp_path / "checkout")
+    health_in = _cache_inputs(hdoc, hjob, restore, contexts)
+    rjob, _, _ = _one_cmd_step(rdoc, _REFRESH_RUN)
+    _, _, save = _the_one(rdoc, _CACHE_SAVE, "refresh.yml")
+    save_in = _cache_inputs(rdoc, rjob, save, contexts)
+    assert health_in["path"] == save_in["path"], (health_in["path"], save_in["path"])
+    assert any(save_in["key"].startswith(p) for p in health_in["restore-keys"]), (
+        save_in["key"], health_in["restore-keys"]
+    )
+    assert health_in["lookup-only"] != "true"
+
+
+def test_cache_actions_are_pinned_like_every_other_action() -> None:
+    cache_shas: set[str] = set()
+    for path in _WORKFLOW_FILES:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not _USES_LINE.match(line):
+                continue
+            match = _PINNED_USES.match(line)
+            assert match, f"{path.name}: not pinned to a commit SHA with a version comment: {line.strip()!r}"
+            if match.group(1).startswith(_CACHE + "/"):
+                cache_shas.add(match.group(2))
+    for path in (_REFRESH_YML, _HEALTH_YML):
+        assert _action_steps(_load(path), _CACHE_RESTORE), f"{path.name} has no {_CACHE_RESTORE} step"
+    # restore and save are sub-actions of one repo: one release, one SHA.
+    assert len(cache_shas) == 1, cache_shas
+
+
+def _dispatch_inputs(doc: dict[str, Any]) -> dict[str, Any]:
+    # PyYAML reads the bare key `on` as the boolean True.
+    on = doc.get("on", doc.get(True)) or {}
+    dispatch = on.get("workflow_dispatch") if isinstance(on, dict) else None
+    return dict((dispatch or {}).get("inputs") or {})
+
+
+def test_refresh_has_a_dispatch_seed_that_writes_the_first_record() -> None:
+    # #71: with --require-state the first record must be written on purpose, once.
+    doc = _load(_REFRESH_YML)
+    inputs = _dispatch_inputs(doc)
+    assert inputs, "refresh.yml: workflow_dispatch has no inputs, so nothing can seed the first record"
+    seeds = []
+    for job_name, idx, step in _cmd_steps(doc, _RECORD_RUN):
+        gate = _bare_if(step)
+        used = [n for n in inputs if re.search(rf"\b(?:github\.event\.)?inputs\.{re.escape(str(n))}\b", gate)]
+        if used:
+            seeds.append((idx, step, used[0]))
+    assert len(seeds) == 1, f"expected one record step gated on a dispatch input, found {len(seeds)}"
+    seed_idx, seed, name = seeds[0]
+    spec = inputs[name] or {}
+    # Never seeds by accident: a schedule has no inputs and a plain dispatch keeps the default.
+    assert spec.get("type") == "boolean", spec
+    assert spec.get("default", False) in (False, "false"), spec
+    assert "continue-on-error" not in seed
+    _, run_idx, _ = _one_cmd_step(doc, _REFRESH_RUN)
+    _, detect_idx, _ = _one_cmd_step(doc, _DETECT_RUN)
+    _, save_idx, _ = _the_one(doc, _CACHE_SAVE, "refresh.yml")
+    # After refresh publishes, before detect's --require-state reads the record, before the save.
+    assert run_idx < seed_idx < detect_idx < save_idx, (run_idx, seed_idx, detect_idx, save_idx)
+
+
+@pytest.mark.parametrize("workflow", [_REFRESH_YML, _HEALTH_YML], ids=["refresh", "health"])
+def test_dispatch_inputs_never_reach_a_run_script(workflow: Path) -> None:
+    # Script injection: ${{ inputs.x }} is pasted into the script before bash parses it.
+    for job_name, _, step in _steps(_load(workflow)):
+        run = str(step.get("run") or "")
+        assert not re.search(r"\$\{\{[^}]*\binputs\.", run), _step_label(job_name, step)
+
+
+def _load_detect_bundle_change() -> ModuleType:
+    spec = importlib.util.spec_from_file_location(
+        "_detect_bundle_change_for_workflow_contract", _REPO_ROOT / "scripts" / "detect_bundle_change.py"
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_bundle_record_lives_in_the_cached_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The seed and the record are only durable if the file they write is inside a cached path.
+    # Each detect/record step runs for real with a fake `python` that logs its argv and env;
+    # the state file is its --state-file, else the script's own default for that env.
+    doc = _load(_REFRESH_YML)
+    job_name, _, _ = _one_cmd_step(doc, _REFRESH_RUN)
+    checkout = tmp_path / "checkout"
+    contexts = _contexts(tmp_path, checkout)
+    _, _, restore = _the_one(doc, _CACHE_RESTORE, "refresh.yml")
+    cached = [Path(p) for p in _cache_inputs(doc, job_name, restore, contexts)["path"]]
+    module = _load_detect_bundle_change()
+    steps = _cmd_steps(doc, _DETECT_RUN) + _cmd_steps(doc, _RECORD_RUN)
+    assert len(steps) >= 2
+    (checkout / ".venv" / "bin").mkdir(parents=True)
+    (checkout / ".venv" / "bin" / "activate").write_text("")
+    fakebin = tmp_path / "bin"
+    fakebin.mkdir()
+    log = tmp_path / "python.json"
+    (fakebin / "python").write_text(
+        "#!/bin/bash\n"
+        f'"{sys.executable}" -c "import json,os,sys; json.dump({{\'argv\': sys.argv[2:], '
+        f"'env': dict(os.environ)}}, open(sys.argv[1], 'w'))\" \"{log}\" \"$@\"\n"
+    )
+    (fakebin / "python").chmod(0o755)
+    home = tmp_path / "home"
+    home.mkdir()
+    for _, _, step in steps:
+        env = {"PATH": f"{fakebin}{os.pathsep}/usr/bin{os.pathsep}/bin", "HOME": str(home),
+               "GITHUB_OUTPUT": str(tmp_path / "gh-output")}
+        env.update(_job_env(doc, job_name, contexts))
+        env.update({str(k): _render(v, contexts, env) for k, v in (step.get("env") or {}).items()})
+        script = tmp_path / "step.sh"
+        script.write_text(str(step["run"]))
+        log.unlink(missing_ok=True)
+        result = subprocess.run(
+            _REQUIRED_SHELL.replace("{0}", str(script)).split(),
+            cwd=checkout, env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        seen = json.loads(log.read_text())
+        argv = seen["argv"]
+        if "--state-file" in argv:
+            state_file = Path(argv[argv.index("--state-file") + 1])
+        else:
+            for name in ("XDG_STATE_HOME", "HOME"):
+                if name in seen["env"]:
+                    monkeypatch.setenv(name, seen["env"][name])
+                else:
+                    monkeypatch.delenv(name, raising=False)
+            state_file = module.default_state_file()
+        label = _step_label(job_name, step)
+        assert state_file.is_absolute(), (label, state_file)
+        assert any(state_file.is_relative_to(c) for c in cached), (
+            f"{label}: the bundle record {state_file} is outside every cached path {cached}"
+        )
