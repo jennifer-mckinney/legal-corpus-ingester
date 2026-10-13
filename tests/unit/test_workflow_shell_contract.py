@@ -454,6 +454,17 @@ def _contexts(root: Path, checkout: Path, run_id: str = "1001", run_attempt: str
     }
 
 
+# Contexts the runner evaluates in workflow- and job-level `env`, per GitHub's context
+# availability table (K2): `runner` is NOT among them, so ${{ runner.temp }} there is an error
+# (actionlint rejects it), not a path. Steps' `with:` inputs may use runner.* (cache keys).
+_ENV_LEVEL_CONTEXTS = frozenset({"github", "secrets", "inputs", "vars", "needs", "strategy", "matrix"})
+
+
+def _env_contexts(contexts: dict[str, str]) -> dict[str, str]:
+    """Only the contexts a workflow- or job-level env value may use."""
+    return {k: v for k, v in contexts.items() if k.split(".", 1)[0] in _ENV_LEVEL_CONTEXTS}
+
+
 def _render(value: object, contexts: dict[str, str], env: dict[str, str]) -> str:
     """Evaluate ${{ ctx }} and ${{ env.X }} as the runner does. Shell syntax is NOT expanded:
     the runner passes `$HOME` or `~` in an env value or a `with:` input through literally."""
@@ -474,7 +485,7 @@ def _job_env(doc: dict[str, Any], job_name: str, contexts: dict[str, str]) -> di
     env: dict[str, str] = {}
     for node in (doc, (doc.get("jobs") or {}).get(job_name) or {}):
         for name, value in (node.get("env") or {}).items():
-            env[str(name)] = _render(value, contexts, env)
+            env[str(name)] = _render(value, _env_contexts(contexts), env)
     return env
 
 
@@ -498,7 +509,7 @@ def state_dir_problems(raw: object, contexts: dict[str, str], env: dict[str, str
     if any(unicodedata.category(c) in _UNSAFE_CATEGORIES for c in text):
         return [f"{_STATE_DIR_VAR} holds a control, format or line-separator character"]
     try:
-        rendered = _render(text, contexts, env or {})
+        rendered = _render(text, _env_contexts(contexts), env or {})
     except _Unmodelled as exc:
         return [f"{_STATE_DIR_VAR}: {exc}"]
     if "$" in rendered or rendered.startswith("~") or "/~" in rendered:
@@ -506,8 +517,11 @@ def state_dir_problems(raw: object, contexts: dict[str, str], env: dict[str, str
     path = Path(os.path.normpath(rendered))
     if not path.is_absolute():
         return [f"{_STATE_DIR_VAR} is relative: it lands in the checkout, which checkout's clean wipes"]
-    if path.is_relative_to(Path(contexts["github.workspace"])):
+    workspace = Path(os.path.normpath(contexts["github.workspace"]))
+    if path.is_relative_to(workspace):
         return [f"{_STATE_DIR_VAR} is inside the checkout, which checkout's clean wipes"]
+    if workspace.is_relative_to(path):
+        return [f"{_STATE_DIR_VAR} contains the checkout, so caching it caches the checkout"]
     return []
 
 
@@ -556,18 +570,23 @@ def _run_health_step(
     key names the step by the command it runs (a _HEALTH_STEPS key). python_rc None runs
     the real scripts/health_check.py and CLI; an int makes a fake `python`/`ingester`
     that records its argv and exits with that code. The step gets the workflow and job env
-    rendered as the runner renders it (K), with runner.temp under runner_root (default
-    tmp_path), so steps of one job share one runner.
+    rendered as the runner renders it (K). The checkout (github.workspace) and HOME live under
+    runner_root (default tmp_path), so steps of one job share one checkout and workspace, as
+    on a real runner; only this step's fakes and script live under tmp_path.
     """
     doc = _load(_HEALTH_YML)
     job_name, _, step = _health_step(doc, key)
-    checkout = tmp_path / "checkout"
-    (checkout / ".venv" / "bin").mkdir(parents=True)
+    root = runner_root or tmp_path
+    checkout = root / "checkout"
+    # Idempotent: the first step of the job lays out the checkout, later steps reuse it (a test
+    # may already have made the dir, e.g. by creating the state dir beside it).
+    (checkout / ".venv" / "bin").mkdir(parents=True, exist_ok=True)
     (checkout / ".venv" / "bin" / "activate").write_text("")
-    (checkout / "scripts").symlink_to(_REPO_ROOT / "scripts")
-    (checkout / "config").symlink_to(_REPO_ROOT / "config")
+    for name in ("scripts", "config"):
+        if not (checkout / name).is_symlink():
+            (checkout / name).symlink_to(_REPO_ROOT / name)
     fakebin = tmp_path / "bin"
-    fakebin.mkdir()
+    fakebin.mkdir(parents=True)
     argv_log = tmp_path / "argv.json"
     for tool in ("python", "ingester"):
         if python_rc is None:
@@ -582,15 +601,15 @@ def _run_health_step(
             )
         (fakebin / tool).write_text("#!/bin/bash\n" + body)
         (fakebin / tool).chmod(0o755)
-    home = tmp_path / "home"
-    home.mkdir()
+    home = root / "home"
+    home.mkdir(exist_ok=True)
     env = {"PATH": f"{fakebin}{os.pathsep}/usr/bin{os.pathsep}/bin", "HOME": str(home)}
     if python_rc is None:
         # Import this checkout's code, as pytest does (pyproject pythonpath), not an install.
         env["PYTHONPATH"] = str(_REPO_ROOT / "src")
     if xdg is not None:
         env["XDG_STATE_HOME"] = str(xdg)
-    env.update(_job_env(doc, job_name, _contexts(runner_root or tmp_path, checkout)))
+    env.update(_job_env(doc, job_name, _contexts(root, checkout)))
     script = tmp_path / "step.sh"
     script.write_text(str(step["run"]))
     shell = _default_shell(doc)
@@ -762,6 +781,9 @@ def test_health_job_positive_control_runs_both_steps_and_passes(tmp_path: Path) 
     job_rc, failed, ran, output = _run_health_job(tmp_path, xdg)
     assert (job_rc, failed) == (0, None), output[-2000:]
     assert sorted(ran) == sorted(_HEALTH_STEPS)
+    # One job, one checkout: the steps' scratch dirs hold no checkout of their own.
+    assert sorted(p.name for p in tmp_path.glob("*/checkout")) == []
+    assert (tmp_path / "checkout").is_dir()
     assert "::warning title=Refresh not wired::" not in output
 
 
@@ -822,8 +844,17 @@ def _one_cmd_step(doc: dict[str, Any], pattern: re.Pattern[str]) -> tuple[str, i
 # Declared values, each with the verdict the checker must give. Negatives: every way a value
 # looks like a path in YAML but is not one durable dir outside the checkout on the runner.
 _STATE_DIR_VALUES: list[tuple[object, bool]] = [
-    ("${{ runner.temp }}/legal-corpus-ingester/state", True),
-    ("${{runner.temp}}/state", True),
+    # K2: the parent of the workspace, beside the checkout, as both workflows declare it.
+    ("${{ github.workspace }}/../legal-corpus-ingester-state", True),
+    ("${{github.workspace}}/../state", True),
+    # K2: the runner context is not available in workflow or job env (GitHub's table).
+    ("${{ runner.temp }}/legal-corpus-ingester/state", False),
+    ("${{runner.temp}}/state", False),
+    # Back into the checkout, or a dir that holds the checkout.
+    ("${{ github.workspace }}/../checkout/state", False),
+    ("${{ github.workspace }}/x/../state", False),
+    ("${{ github.workspace }}/..", False),
+    ("${{ github.workspace }}/../..", False),
     (None, False),
     ("", False),
     ("   ", False),
@@ -833,13 +864,13 @@ _STATE_DIR_VALUES: list[tuple[object, bool]] = [
     ("$HOME/.local/state/legal-corpus-ingester/state", False),
     ("~/.local/state/legal-corpus-ingester/state", False),
     # Absolute once rendered, but the shell variable stays literal: env values never expand.
-    ("${{ runner.temp }}/$RUNNER_NAME/state", False),
+    ("${{ github.workspace }}/../$RUNNER_NAME/state", False),
     ("${{ github.workspace }}/state", False),
     ("${{ secrets.STATE_DIR }}/state", False),
-    ("${{ runner.temp }}/state\n/etc", False),
-    ("${{ runner.temp }}/state x", False),
-    ("${{ runner.temp }}/st‮ate", False),
-    ("${{ runner.temp }}/st\x00ate", False),
+    ("${{ github.workspace }}/../state\n/etc", False),
+    ("${{ github.workspace }}/../state x", False),
+    ("${{ github.workspace }}/../st‮ate", False),
+    ("${{ github.workspace }}/../st\x00ate", False),
 ]
 
 
