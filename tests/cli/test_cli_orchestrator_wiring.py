@@ -25,11 +25,17 @@ Round 3 (2026-10-13): C. health treats every non-success checkpoint stage as fai
 (tests/unit/test_health_check.py). D. exit 7 also writes a `not_approved` checkpoint for every
 requested source. E. a dry run exits 8 when any requested source is unsigned, and writes nothing.
 
+Round 4 (2026-10-13): F. a fully signed `refresh --all --dry-run` exits 0 and lists every source
+without running one. G. a checkpoint write that fails is a loud source failure, named on stderr.
+H. a stage-class or approval load error exits 1 before any checkpoint is written (mutant C10).
+I. `fetch --dry-run` of an unsigned source exits 7, offline, as the real fetch does.
+
 The card's `--out <tmp>` is replaced by the `Settings.out_dir` env var (ruling 3).
 """
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib
 import inspect
@@ -74,7 +80,7 @@ from legal_corpus_ingester.pipeline.approval_gate import (
 )
 from legal_corpus_ingester.pipeline.manifest import MANIFEST_FILENAME, Manifest
 from legal_corpus_ingester.pipeline.orchestrator import Orchestrator as RealOrchestrator
-from legal_corpus_ingester.pipeline.state import CheckpointStore
+from legal_corpus_ingester.pipeline.state import STAGES, CheckpointState, CheckpointStore
 from legal_corpus_ingester.publishers.base import PublishReceipt
 from legal_corpus_ingester.sources.registry import load_all
 from tests.cli.helpers import PUBLIC_EXIT_CODES, strip_ansi
@@ -452,6 +458,24 @@ def test_refresh_all_dry_run_lists_without_writing(ws: _Workspace, spy: _Spy, ne
     assert _is_empty(ws.out) and _is_empty(ws.state) and _is_empty(ws.cwd)
 
 
+def test_refresh_all_dry_run_fully_signed_exits_zero(ws_all: _Workspace, spy: _Spy, net: _Net) -> None:
+    # Round 4 F: the success path of the pre-flight. Exit 0 must mean "every source would run",
+    # so it must differ from not-wired (exit 3) and from a no-op that lists nothing.
+    ws = ws_all
+    result = _invoke(ws.argv("refresh", "--all", "--dry-run"))
+    assert result.exit_code == 0, _why(result)
+    assert result.exit_code != _NOT_WIRED and "not wired" not in _output(result).lower()
+    listed = [line for line in result.stdout.splitlines() if line.startswith("DRY RUN")]
+    for name in _repo_names():
+        assert sum(name in line.split() for line in listed) == 1, (name, _why(result))
+    assert len(listed) == len(_repo_names()), _why(result)
+    assert result.stderr == "", _why(result)
+    assert spy.constructed == [] and spy.runs == []
+    assert net.attempts == []
+    assert _is_empty(ws.out) and _is_empty(ws.state) and _is_empty(ws.cwd)
+    _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
+
+
 # ---------------------------------------------------------------------------
 # Rulings 2 and 3: how the Orchestrator is composed
 # ---------------------------------------------------------------------------
@@ -585,6 +609,14 @@ def test_refresh_with_no_valid_approval_fails_loudly(
 def test_fetch_of_unsigned_source_refuses(ws: _Workspace, spy: _Spy, net: _Net) -> None:
     # `fetch` must not bypass the legal gate that `refresh --all` applies (needs a ruling).
     name = _unsigned()[0]
+    # Round 4 I: the dry run reports what the real fetch would do (exit 7), offline, and
+    # writes nothing (ruling E's principle; ruling D applies to the real run only).
+    dry = _invoke(ws.argv("fetch", name, "--dry-run"))
+    assert dry.exit_code == _NO_APPROVED, _why(dry)
+    assert _named_with(_output(dry), name, "approv"), _why(dry)
+    assert spy.constructed == [] and spy.runs == [] and net.attempts == [], _why(dry)
+    assert _is_empty(ws.out) and _is_empty(ws.state) and _is_empty(ws.cwd), _why(dry)
+    _assert_safe_output(dry, str(ws.root), str(ws.root.resolve()))
     result = _invoke(ws.argv("fetch", name))
     _assert_failed_loudly(result)
     assert result.exit_code == _NO_APPROVED, _why(result)  # decision A
@@ -746,8 +778,13 @@ def test_refresh_runs_a_source_only_with_a_valid_approval(
     ws = ws_all
     _write_state(ws, "eurlex_gdpr", key)
     others = [name for name in _repo_names() if name != "eurlex_gdpr"]
-    result = _invoke(ws.argv("refresh", "--all"))
     outcome = _APPROVAL_OUTCOME[key]
+    if outcome == _RUN_LOAD_ERROR:
+        # Round 4 H: an unsigned source checked before the malformed file must not leave a
+        # not_approved checkpoint behind; the load error (exit 1) writes nothing (ruling 4).
+        ws.unsign(others[0])
+        assert _repo_names().index(others[0]) < _repo_names().index("eurlex_gdpr")
+    result = _invoke(ws.argv("refresh", "--all"))
     if outcome == _RUNS:
         assert result.exit_code == 0, _why(result)
         assert sorted(spy.run_names()) == sorted(_repo_names()), _why(result)
@@ -761,6 +798,7 @@ def test_refresh_runs_a_source_only_with_a_valid_approval(
         assert result.exit_code == _LOAD_ERROR, _why(result)
         assert spy.constructed == [] and spy.runs == [], _why(result)
         assert _named_with(_output(result), "eurlex_gdpr", "approv"), _why(result)
+        assert _is_empty(ws.state), "a load error left a checkpoint behind (round 4 H)"
     _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
     assert net.attempts == []
 
@@ -795,6 +833,60 @@ def test_refresh_continues_past_failed_sources_and_names_each(ws: _Workspace, sp
     for name in (*failing, *_unsigned()):
         assert _named_with(result.stderr, name, "fail"), (name, _why(result))
     assert _TIER1[0] in result.stdout and _TIER1[0] not in result.stderr, _why(result)
+    _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
+    assert net.attempts == []
+
+
+# Round 4 G: where the checkpoint write fails -> (signed sources, failing stage, expected exit).
+# "unsigned": the not_approved record of a partly signed run (a source failure, exit 8).
+# "signed": the success checkpoint of a real run where every source is signed, so the write
+# failure is the only failure and a silent path would exit 0.
+# "all-unsigned": the not_approved record on the exit-7 path (decision B keeps exit 7 there).
+_CHECKPOINT_WRITE_FAILS: dict[str, tuple[tuple[str, ...], str, str]] = {
+    "unsigned": (_TIER1, "not_approved", "EXIT_SOURCE_FAILED"),
+    "signed": (tuple(_repo_names()), STAGES[-1], "EXIT_SOURCE_FAILED"),
+    "all-unsigned": ((), "not_approved", "EXIT_NO_APPROVED_SOURCES"),
+}
+
+
+@pytest.mark.parametrize("where", list(_CHECKPOINT_WRITE_FAILS))
+def test_checkpoint_write_failure_is_loud(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, net: _Net, where: str
+) -> None:
+    signed, failing_stage, exit_name = _CHECKPOINT_WRITE_FAILS[where]
+    assert failing_stage in (_NOT_APPROVED_STAGE, *STAGES), failing_stage
+    ws = _make_workspace(tmp_path, monkeypatch, signed=signed)
+    net.upstream = ws  # the real pipeline: the Orchestrator writes its own checkpoints
+    real_save = CheckpointStore.save
+    refused: list[str] = []
+
+    def failing_save(store: CheckpointStore, state: CheckpointState) -> None:
+        if state.stage == failing_stage:
+            refused.append(state.source_name)
+            # Hostile strerror carrying a local path: never echoed (F8).
+            raise OSError(errno.ENOSPC, f"disk full {ws.root}{_HOSTILE_TEXT}")
+        real_save(store, state)
+
+    monkeypatch.setattr(CheckpointStore, "save", failing_save)
+    result = _invoke(ws.argv("refresh", "--all"))
+    expected = sorted(n for n in _repo_names() if (n in signed) == (failing_stage != _NOT_APPROVED_STAGE))
+    assert sorted(refused) == expected, (refused, _why(result))  # the injection hit every one
+    assert result.exit_code == PUBLIC_EXIT_CODES[exit_name], _why(result)
+    _assert_failed_loudly(result)
+    lines = result.stderr.splitlines()
+    for name in expected:
+        assert _named_with(result.stderr, name, "fail"), (name, _why(result))
+        if failing_stage == _NOT_APPROVED_STAGE:
+            # The operator learns this source's state record is missing: a line of its own,
+            # not only the closing summary that lists every failed source.
+            others = [n for n in _repo_names() if n != name]
+            own = [ln for ln in lines if name in ln and not any(o in ln for o in others)]
+            assert any("checkpoint" in ln.lower() for ln in own), (name, _why(result))
+        state = CheckpointStore(ws.state).load(name)
+        assert state is None or state.stage != failing_stage, state
+    # Message honesty: no line may claim the state dir records each failure when a write failed.
+    claims = [ln for ln in lines if "record each failure" in ln.lower()]
+    assert claims == [], (claims, _why(result))
     _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
     assert net.attempts == []
 
@@ -904,9 +996,14 @@ def test_config_class_path_must_name_a_class_defined_in_its_own_stage(
     data["pipeline"][stage] = dotted
     path.write_text(yaml.safe_dump(data), encoding="utf-8")
     assert load_all(ws.sources)["eurlex_gdpr"].pipeline.model_dump()[stage] == dotted
+    # Round 4 H (mutant C10): with an unsigned source in the run, the stage-class load error
+    # still exits 1 before any not_approved checkpoint is written (ruling 4).
+    unsigned = _unsigned()[0]
+    ws.unsign(unsigned)
     result = _invoke(ws.argv("refresh", "--all"))
     assert result.exit_code == _LOAD_ERROR, _why(result)
     assert spy.constructed == [] and spy.runs == [], _why(result)
+    assert _is_empty(ws.state), "a stage-class load error left a checkpoint behind (round 4 H)"
     assert "eurlex_gdpr" in _output(result), _why(result)
     _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
     assert net.attempts == []
