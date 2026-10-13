@@ -1,0 +1,5 @@
+# Members of the Cellar Formex 4 zip recorded in gdpr_fetch.yaml (CELEX 02016R0679-20160504).
+# Generated from the recorded body; regenerate whenever the cassette is re-recorded.
+zip f458de5e4fe82bd0baf9ef141c67362d68dcf3b632d5c6987e0b16c0e94e892b 51496
+member CL2016R0679EN0000020.0001.xml 262201 28524c5589d9c80dee357fe96498302b4fefb29b3cc9ada7dcad52c967e3f15c CONS.ACT
+member CL2016R0679EN0000020.0001.doc.xml 1378 e0c46677bc013886ba60f434fa9b10993b1f767fff8e339e11f2dbaaf3f4a6c9 DOC

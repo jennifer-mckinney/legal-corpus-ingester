@@ -1,0 +1,16 @@
+# Caps for the Cellar Formex 4 fetcher (fetchers/cellar.py, terms-analysis#96).
+# Every value must be a positive integer; the loader refuses anything else.
+# Real packages probed 2026-10-13: AI Act 171,490-byte zip with 16 members,
+# DSA 108,735 bytes, GDPR (consolidated) 51,496 bytes.
+
+# Largest zip body accepted from the second hop, checked while streaming.
+max_zip_bytes: 20971520
+# Most members one package may hold (the AI Act has 16).
+max_members: 64
+# Largest single unzipped member. Must stay at or below the XML cleaner's
+# MAX_XML_BYTES, because each member is later parsed as XML.
+max_member_bytes: 20971520
+# Largest sum of all unzipped members.
+max_total_bytes: 67108864
+# Highest uncompressed / compressed ratio for any member (zip-bomb guard).
+max_ratio: 100

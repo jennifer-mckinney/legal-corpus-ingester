@@ -60,10 +60,10 @@ def test_eurlex_fetcher_returns_fetch_result() -> None:
     from legal_corpus_ingester.types import FetchResult
 
     fetcher = EurLexFetcher()
-    result = asyncio.run(fetcher.fetch("32016R0679"))
+    result = asyncio.run(fetcher.fetch("02016R0679-20160504"))
     assert isinstance(result, FetchResult)
-    assert result.mime_type in {"application/xml", "text/html", "text/plain"}
+    assert result.mime_type == "application/zip"
     assert result.provenance.source_name == "eurlex"
-    assert result.provenance.upstream_version == "32016R0679"
+    assert result.provenance.upstream_version == "02016R0679-20160504"
     assert result.provenance.license == "CC-BY-4.0"
     assert len(result.raw_bytes) > 0
