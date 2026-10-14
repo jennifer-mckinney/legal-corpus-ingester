@@ -465,6 +465,14 @@ def test_default_config_path_is_the_repo_file() -> None:
     assert set(_default_mapping()) == set(_CAP_FIELDS) | set(_TUNABLE_FIELDS)
 
 
+def test_default_config_loads_from_package_when_repo_file_is_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    cellar = _cellar()
+    monkeypatch.setattr(cellar, "DEFAULT_CONFIG_PATH", tmp_path / "missing.yaml")
+    assert cellar.load_cellar_settings() == cellar.load_cellar_settings(_DEFAULT_CONFIG)
+
+
 def test_settings_are_immutable() -> None:
     settings = _cellar().load_cellar_settings()
     with pytest.raises((AttributeError, TypeError)):

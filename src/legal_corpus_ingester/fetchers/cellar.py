@@ -19,6 +19,7 @@ import struct
 import zipfile
 import zlib
 from dataclasses import dataclass, fields
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
@@ -134,11 +135,18 @@ def load_cellar_settings(path: Path | None = None) -> CellarSettings:
     A missing file raises ``FileNotFoundError``. Messages name the bad key but never
     the absolute path of the file.
     """
-    target = DEFAULT_CONFIG_PATH if path is None else Path(path)
     try:
-        text = target.read_text(encoding="utf-8")
+        if path is None:
+            try:
+                text = DEFAULT_CONFIG_PATH.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                text = files("legal_corpus_ingester.fetchers").joinpath("cellar.yaml").read_text(
+                    encoding="utf-8"
+                )
+        else:
+            text = Path(path).read_text(encoding="utf-8")
     except FileNotFoundError:
-        raise FileNotFoundError(f"cellar config file not found: {target.name}") from None
+        raise FileNotFoundError(f"cellar config file not found: {(path or DEFAULT_CONFIG_PATH).name}") from None
     except UnicodeDecodeError:
         raise ValueError("cellar config is not UTF-8 text") from None
     try:
