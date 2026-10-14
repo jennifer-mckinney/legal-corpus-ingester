@@ -1,22 +1,55 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import errno
+import hashlib
 import importlib
 import json
 import os
+import re
 import shutil
 import stat
 import sys
+import tempfile
+import warnings
+from datetime import date
 from pathlib import Path
+from typing import NoReturn
 
 import httpx
+import numpy as np
 import typer
+import yaml
+from pydantic import ValidationError
 
-from legal_corpus_ingester.sources.registry import RegistryLoadError, load_all
+from legal_corpus_ingester.config import Settings
+from legal_corpus_ingester.embedders.localai import LocalAIEmbedder
+from legal_corpus_ingester.errors import LegalReviewGateError
+from legal_corpus_ingester.pipeline.approval_gate import _PLACEHOLDER_SHA, check_approval, load_approval
+from legal_corpus_ingester.pipeline.manifest import MANIFEST_FILENAME, Manifest
+from legal_corpus_ingester.pipeline.orchestrator import Fetcher, Orchestrator
+from legal_corpus_ingester.pipeline.retention import CALVER_RE, next_version
+from legal_corpus_ingester.publishers.base import PublishReceipt, PublishTarget
+from legal_corpus_ingester.publishers.filesystem import (
+    CHECKSUMS_FILENAME,
+    FilesystemPublisher,
+    bundle_fingerprint,
+)
+from legal_corpus_ingester.publishers.terms_analysis import CURRENT_LINK, TermsAnalysisPublisher
+from legal_corpus_ingester.sources.registry import (
+    STAGE_PACKAGES,
+    RegistryLoadError,
+    StageClassError,
+    load_all,
+    resolve_stage_class,
+)
 from legal_corpus_ingester.sources.schema import SourceConfig
-from legal_corpus_ingester.pipeline.state import CheckpointStore
+from legal_corpus_ingester.pipeline.state import STAGE_NOT_APPROVED, CheckpointState, CheckpointStore
+from legal_corpus_ingester.types import Corpus, FetchResult
 from legal_corpus_ingester.provenance.license_audit import (
+    DEFAULT_STATE_FILE,
+    REFRESH_BASELINE_FILE,
     hash_content,
     check_license_drift,
     record_license_baseline,
@@ -42,19 +75,41 @@ MSG_LOAD_ERROR = "Error loading sources"
 MSG_NO_SOURCES = "No sources configured"
 MSG_SOURCES_DIR_MISSING = "Sources directory does not exist or is not a directory"
 MSG_NO_RUNS = "No runs recorded."
-# Pipeline not wired to the orchestrator yet (terms-analysis#90): must never look like success
+# Pipeline not wired to the orchestrator yet (terms-analysis#90). Reserved: fetch and refresh
+# are wired (terms-analysis#93), so no command exits 3 today. The number stays in the public
+# contract (renumbering is breaking) and scripts/health_check.py still re-exports it.
 EXIT_NOT_WIRED: int = 3
 # Single source for "does `ingester refresh` run the pipeline yet?". scripts/health_check.py
 # reads it to tell the expected never-run state (no checkpoint can exist yet) apart from a real
-# failure. Flip it in the change that wires refresh; test_cli_exit_codes pins it to refresh's
-# actual exit code, so wiring refresh without flipping it fails CI (terms-analysis#90).
-REFRESH_WIRED: bool = False
+# failure. test_cli_exit_codes pins it to refresh's actual exit code (terms-analysis#90); flipped
+# when refresh was wired (terms-analysis#93), so a never-run source is now stale, not expected.
+REFRESH_WIRED: bool = True
 # validate-round-trip could not import the terms-analysis consumer, so the bundle was NOT
 # verified end to end; must not look like VALID unless --allow-missing-consumer (terms-analysis#90)
 EXIT_CONSUMER_SKIPPED: int = 4
 # Command-line usage errors only: click's conventional code for an unknown command or option, a
 # missing argument or value, and (from main) no subcommand at all. No command body exits with it.
 EXIT_USAGE: int = 2
+# None of the requested sources holds a valid approval, so nothing ran (terms-analysis#93, lead
+# ruling 1 of 2026-10-13). Every approval in the repo is a placeholder until the owner signs real
+# hashes, so a real refresh exits 7 until then: the intended loud failure, never a silent pass.
+EXIT_NO_APPROVED_SOURCES: int = 7
+# At least one source failed: it had no valid approval while another source did (decision B),
+# or it failed fetch, the post-fetch approval hash check, clean, chunk, embed or publish.
+# refresh continues with the remaining sources and names every failed one on stderr with the
+# exception type only (terms-analysis#93, lead rulings 1 and 3).
+EXIT_SOURCE_FAILED: int = 8
+# refresh found no licence baseline file (REFRESH_BASELINE_FILE under INGESTER_STATE_DIR is
+# missing, a dangling link or not a regular file) and was not told to seed one, so nothing ran
+# and nothing was written. Without the file every source reads as NEW to the licence-drift gate
+# and the run would silently record today's SPDX as the baseline: after a cache miss that is a
+# re-baseline of a legal control (terms-analysis#93 Round 11, rthoB). A file holding no entry
+# for a source is not missing: that source is NEW and allowed (Round 11 item 3).
+EXIT_LICENSE_BASELINE_MISSING: int = 9
+# The one opt-in past EXIT_LICENSE_BASELINE_MISSING (Round 11 item 2). It accepts the licence
+# each source declares today as the baseline, so the person seeding confirms each licence first.
+# It never overrides SPDX drift against a baseline file that exists.
+REFRESH_SEED_FLAG = "--seed-license-baseline"
 # Help text for each public exit code, rendered as "<code> when <meaning>" clauses by
 # _exit_code_clauses into the top-level epilog and the status help. A meaning must not contain
 # ";" (the clause separator) or square brackets (rich markup).
@@ -67,7 +122,7 @@ _EXIT_MEANINGS: dict[int, str] = {
         "the command line is a usage error (unknown command or option, missing argument or"
         " value, no command)"
     ),
-    EXIT_NOT_WIRED: "the pipeline behind the command is not wired yet (fetch, refresh)",
+    EXIT_NOT_WIRED: "the pipeline behind a command is not wired yet, a reserved code no command exits today",
     EXIT_CONSUMER_SKIPPED: (
         "validate-round-trip could not import the terms-analysis consumer, so the bundle was"
         " not verified end to end"
@@ -77,6 +132,18 @@ _EXIT_MEANINGS: dict[int, str] = {
     # unknown one, for fetch and audit-license too).
     EXIT_NO_SOURCES: "the sources dir loads but holds no source (fetch, refresh, status, audit-license)",
     EXIT_SOURCES_DIR_MISSING: "the --sources-dir path does not exist or is not a directory",
+    EXIT_NO_APPROVED_SOURCES: (
+        "no requested source holds a valid approval, so nothing ran (fetch, refresh)"
+    ),
+    EXIT_SOURCE_FAILED: (
+        "at least one source failed: it was not approved while another was, or it failed to"
+        " fetch, match its approved hash, clean, chunk, embed or publish (fetch, refresh), and"
+        " each failed source is named on stderr"
+    ),
+    EXIT_LICENSE_BASELINE_MISSING: (
+        "the licence baseline file in the state dir is missing and the run does not seed it"
+        f" with {REFRESH_SEED_FLAG}, so nothing ran and nothing was written (refresh)"
+    ),
 }
 # os.stat errno values meaning "this path names no directory": a component is missing or not a
 # directory, the name is too long to exist, or a symlink loop resolves to nothing. Any other
@@ -152,6 +219,566 @@ def _is_consumer_missing(exc: ModuleNotFoundError) -> bool:
         return False
     return name == _CONSUMER_MODULE or _CONSUMER_MODULE.startswith(name + ".")
 
+
+# ---------------------------------------------------------------------------
+# Pipeline wiring for fetch and refresh (terms-analysis#93)
+# ---------------------------------------------------------------------------
+
+# An exception type name is echoed only when it is a plain identifier: it is code, but a type
+# built at run time can carry any name, so the allowlist keeps the output to safe text (F8).
+_TYPE_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,79}")
+# A signed approval names its artifact by a lowercase sha256 hex digest, as hashlib prints it.
+_SHA256_HEX_RE = re.compile(r"[0-9a-f]{64}")
+# Approvals live beside the sources, one <source>.yaml each (lead ruling 6 of 2026-10-13).
+APPROVALS_SUBDIR = "approvals"
+
+
+def _type_name(exc: BaseException) -> str:
+    """The exception's type name, for output: never its message, which can carry paths or bytes."""
+    name = type(exc).__name__
+    return name if _TYPE_NAME_RE.fullmatch(name) else "Exception"
+
+
+def _load_settings() -> Settings:
+    """Read Settings from INGESTER_* env vars and .env, or exit EXIT_LOAD_ERROR naming bad fields.
+
+    Only field names are echoed, never values (they can carry CR/LF or a path), and only names
+    Settings declares: an unknown INGESTER_* key in .env is reported without its text (F8, F13).
+    """
+    try:
+        return Settings()
+    except ValidationError as exc:
+        names = sorted(
+            {
+                str(err["loc"][0]) if err["loc"] and str(err["loc"][0]) in Settings.model_fields
+                else "an unknown setting"
+                for err in exc.errors()
+            }
+        )
+        typer.echo(
+            f"Invalid settings: {', '.join(names)}. Fix the {Settings.model_config['env_prefix']}*"
+            " environment variables or .env; nothing was run.",
+            err=True,
+        )
+    except Exception as exc:
+        typer.echo(f"Settings cannot be loaded ({_type_name(exc)}); nothing was run.", err=True)
+    raise typer.Exit(code=EXIT_LOAD_ERROR)
+
+
+def _approvals_dir(settings: Settings) -> Path:
+    """The approvals dir under Settings.config_dir, or exit EXIT_LOAD_ERROR before any fetch.
+
+    A missing or unreadable dir fails the whole run (lead ruling 4): it is a broken
+    configuration, not a set of unsigned sources. The path is never echoed (F2).
+    """
+    path = settings.config_dir / APPROVALS_SUBDIR
+    try:
+        with os.scandir(path) as entries:
+            next(entries, None)
+    except OSError as exc:
+        typer.echo(
+            f"Approvals directory cannot be read ({_type_name(exc)}); expected"
+            f" {APPROVALS_SUBDIR}/ under INGESTER_CONFIG_DIR. Nothing was run.",
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_LOAD_ERROR)
+    return path
+
+
+def _approval_problem(approval_file: Path, source_name: str, today: date) -> str | None:
+    """Why *source_name* may not run, or None when its approval is valid before the fetch.
+
+    Excludes the source (returns a reason): no approval file, a placeholder or malformed
+    hash, or an approval check_approval rejects (source_id, expiry). Fails the whole run
+    (raises): a file that cannot be read or parsed as a mapping (lead ruling 4). The hash
+    itself can only be compared after the fetch; _ApprovalGatedFetcher does that. Every
+    reason is fixed text: nothing read from the file is echoed (F8).
+    """
+    if not approval_file.is_file():
+        return "no approval file"
+    data = load_approval(approval_file)  # raises LegalReviewGateError, YAMLError, OSError
+    signed = data.get("signed_artifact_sha256")
+    if signed == _PLACEHOLDER_SHA:
+        return "approval is not signed (placeholder hash)"
+    if not isinstance(signed, str) or not _SHA256_HEX_RE.fullmatch(signed):
+        return "approval hash is not a sha256 hex digest"
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            # The signed hash stands in for the artifact's: this checks everything else.
+            check_approval(approval_file, source_name, signed, today=today)
+        except LegalReviewGateError:
+            return "approval check failed (wrong source_id, or expiry missing, invalid or past)"
+    if caught:
+        typer.echo(f"{source_name}: warning, approval expires soon; renew it.", err=True)
+    return None
+
+
+def _approved_sources(
+    names: list[str], approvals_dir: Path, today: date
+) -> tuple[list[str], dict[str, str]]:
+    """Split *names* into (approved, unsigned), where unsigned maps each name to its reason.
+
+    An unsigned source is a source failure, not a skip (lead ruling 4, decision B): it is
+    named on stderr as failed here, and the caller records it and counts it in the exit code.
+    A malformed or unreadable approval file exits EXIT_LOAD_ERROR before any fetch, naming the
+    source and the error type (lead ruling 4).
+    """
+    approved: list[str] = []
+    unsigned: dict[str, str] = {}
+    for name in names:
+        try:
+            problem = _approval_problem(approvals_dir / f"{name}.yaml", name, today)
+        except (LegalReviewGateError, yaml.YAMLError, OSError, UnicodeDecodeError) as exc:
+            typer.echo(
+                f"{name}: approval file is malformed or unreadable ({_type_name(exc)});"
+                " nothing was run.",
+                err=True,
+            )
+            raise typer.Exit(code=EXIT_LOAD_ERROR)
+        if problem is None:
+            approved.append(name)
+        else:
+            unsigned[name] = problem
+    # Verdicts are reported only once every approval file has loaded, so a load error (exit 1)
+    # is never preceded by a "failed" verdict (lead ruling 4, round 4 H).
+    for name, problem in unsigned.items():
+        # Source names passed SourceConfig's name_is_safe allowlist, so echoing them is safe.
+        typer.echo(f"{name}: failed, not run, {problem}.", err=True)
+    return approved, unsigned
+
+
+def _record_not_approved(settings: Settings, unsigned: dict[str, str]) -> None:
+    """Checkpoint each unsigned source as STAGE_NOT_APPROVED under Settings.state_dir.
+
+    The state record then matches the exit code (lead rulings B and D), and health_check
+    reports the source as failed. The error is the fixed reason text from _approval_problem,
+    never bytes read from the approval file (F8). A checkpoint that cannot be written is
+    named on stderr by exception type only; the run still exits non-zero for that source.
+    """
+    store = CheckpointStore(settings.state_dir)
+    for name, reason in unsigned.items():
+        try:
+            store.save(CheckpointState(name, STAGE_NOT_APPROVED, "", error=reason))
+        except (OSError, ValueError) as exc:
+            typer.echo(f"{name}: failed to record its checkpoint ({_type_name(exc)}).", err=True)
+
+
+class _ApprovalGatedFetcher:
+    """Wraps a fetcher so the approval's hash is checked after the fetch and before clean.
+
+    The Formex ruling F1 puts the gate before any parsing of untrusted bytes (lead ruling 5):
+    a payload whose sha256 is not the signed one raises LegalReviewGateError here, so the
+    Orchestrator checkpoints fetch_failed and nothing is cleaned, embedded or published.
+    """
+
+    def __init__(self, inner: Fetcher, approval_file: Path, source_name: str, today: date) -> None:
+        self._inner = inner
+        self._approval_file = approval_file
+        self._source_name = source_name
+        self._today = today
+
+    async def fetch(self, source_config: object) -> FetchResult:
+        result = await self._inner.fetch(source_config)
+        digest = hashlib.sha256(result.raw_bytes).hexdigest()
+        with warnings.catch_warnings():
+            # The expiry warning was already reported by the pre-check.
+            warnings.simplefilter("ignore")
+            check_approval(self._approval_file, self._source_name, digest, today=self._today)
+        return result
+
+
+def _stage_classes(registry: dict[str, SourceConfig], names: list[str]) -> dict[str, dict[str, type]]:
+    """Resolve each source's pipeline classes, or exit EXIT_LOAD_ERROR before any fetch.
+
+    Classes load only from the package's own stage subpackages (lead ruling 8), so a source
+    config can never import a module from elsewhere on sys.path.
+    """
+    resolved: dict[str, dict[str, type]] = {}
+    for name in names:
+        pipeline = registry[name].pipeline
+        try:
+            resolved[name] = {
+                stage: resolve_stage_class(stage, getattr(pipeline, stage)) for stage in STAGE_PACKAGES
+            }
+        except StageClassError as exc:
+            # The message names the stage only, never the configured class path.
+            typer.echo(f"{name}: {exc}; nothing was run.", err=True)
+            raise typer.Exit(code=EXIT_LOAD_ERROR)
+    return resolved
+
+
+class _StagingPublisher:
+    """Publishes one source to its staging dir, out/<source>/, and keeps it for the run's bundle.
+
+    Staging, not a consumer output (terms-analysis#93 ruling 8): nothing reads out/<source>/.
+    It stays because `fetch` of one source must not repoint out/current at a one-source bundle,
+    so fetch's output is this dir, and the Orchestrator's ALERTS.md lands beside it, never at
+    the out/ root that consumers read. refresh builds its one bundle from the kept corpora.
+    """
+
+    def __init__(self) -> None:
+        self.staged: tuple[Corpus, Manifest] | None = None
+
+    def publish(self, corpus: Corpus, target: PublishTarget, manifest: Manifest) -> PublishReceipt:
+        receipt = FilesystemPublisher().publish(corpus, target, manifest)
+        self.staged = (corpus, manifest)
+        return receipt
+
+
+def _run_sources(
+    settings: Settings,
+    registry: dict[str, SourceConfig],
+    names: list[str],
+    classes: dict[str, dict[str, type]],
+    approvals_dir: Path,
+    today: date,
+    unsigned: dict[str, str],
+    version: str,
+) -> dict[str, tuple[Corpus, Manifest] | None]:
+    """Run the Orchestrator for each source in *names*; exit EXIT_SOURCE_FAILED if any failed.
+
+    One failing source does not stop the rest (lead ruling 3): each checkpoints its own failure
+    and the run ends non-zero naming every failed source, with the exception type only (F8).
+    The *unsigned* sources were never run and count as failed (decision B).
+    Dirs, the LocalAI URL and model all come from Settings (F13); embedder_model is left to the
+    Orchestrator's default (terms-analysis#98 owns it).
+
+    Every checkpoint and staged manifest names *version*, the one version the run would
+    publish new content under (ruling 8b). Returns each source's staged corpus and manifest
+    (None when its run published nothing), in run order, only when every source succeeded.
+    """
+    staged: dict[str, tuple[Corpus, Manifest] | None] = {}
+    failed: list[str] = list(unsigned)
+    for name in names:
+        stage = classes[name]
+        publisher = _StagingPublisher()
+        try:
+            orchestrator = Orchestrator(
+                fetcher=_ApprovalGatedFetcher(
+                    stage["fetcher"](), approvals_dir / f"{name}.yaml", name, today
+                ),
+                cleaner=stage["cleaner"](),
+                chunker=stage["chunker"](),
+                embedder=LocalAIEmbedder(settings.localai_url, settings.localai_model),
+                publisher=publisher,
+                publish_target=PublishTarget(kind="filesystem", path=settings.out_dir / name),
+                state_dir=settings.state_dir,
+                corpus_version=version,
+                # The licence-drift gate, in its own baseline file under the configured state
+                # dir (terms-analysis#93 rulings J and P): never None, never cwd-relative.
+                license_state_file=settings.state_dir / REFRESH_BASELINE_FILE,
+            )
+            receipt = orchestrator.run(name, registry[name])
+        except Exception as exc:
+            failed.append(name)
+            typer.echo(f"{name}: failed ({_type_name(exc)}).", err=True)
+            continue
+        staged[name] = publisher.staged
+        typer.echo(f"{name}: published {receipt.chunk_count} chunk(s).")
+    if failed:
+        typer.echo(
+            # No claim that every failure is checkpointed: a checkpoint write can itself fail,
+            # and that is named on its own line above (round 4 G).
+            f"{len(failed)} source(s) failed: {', '.join(failed)}. See INGESTER_STATE_DIR for"
+            " their checkpoints.",
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_SOURCE_FAILED)
+    return staged
+
+
+def _combined_bundle(
+    version: str, staged: dict[str, tuple[Corpus, Manifest]]
+) -> tuple[Corpus, Manifest]:
+    """One Corpus and Manifest for every staged source, in run order (ruling 8, item 2).
+
+    The Manifest keeps its schema (no new field). The chunker and embedder fields must agree
+    across sources: one bundle has one index, so a mismatch raises instead of picking one.
+    """
+    corpora = [corpus for corpus, _ in staged.values()]
+    manifests = [manifest for _, manifest in staged.values()]
+    models = {(m.chunker_version, m.embedder_model, m.embedder_revision) for m in manifests}
+    if len(models) != 1:
+        raise ValueError("staged sources disagree on chunker or embedder; no single index")
+    chunker_version, embedder_model, embedder_revision = models.pop()
+    corpus = Corpus(
+        chunks=[chunk for c in corpora for chunk in c.chunks],
+        embeddings=np.vstack([c.embeddings for c in corpora]),
+        corpus_files=[name for c in corpora for name in c.corpus_files],
+    )
+    manifest = Manifest(
+        corpus_version=version,
+        chunker_version=chunker_version,
+        embedder_model=embedder_model,
+        embedder_revision=embedder_revision,
+        sources=list(staged),
+        chunk_count=len(corpus.chunks),
+    )
+    return corpus, manifest
+
+
+def _current_version(out_dir: Path) -> str | None:
+    """The version out/current points at, or None when there is no valid current bundle.
+
+    Valid means a relative link whose target is one bundle name (the retention pattern) naming
+    a real dir under out/. Anything else (missing, absolute, a dir, a dangling name) is not a
+    bundle to compare against, so the run publishes a fresh one (ruling 8c).
+    """
+    link = out_dir / CURRENT_LINK
+    if not link.is_symlink():
+        return None
+    target = os.readlink(link)
+    if not CALVER_RE.fullmatch(target):
+        return None
+    bundle = out_dir / target
+    if bundle.is_symlink() or not bundle.is_dir():
+        return None
+    return target
+
+
+def _file_digests(bundle: Path, skip: frozenset[str] = frozenset()) -> dict[str, str]:
+    """sha256 of every file under *bundle* but those named in *skip* (relative posix paths).
+
+    A symlink is listed by its target, so it never compares equal to a real file.
+    """
+    digests: dict[str, str] = {}
+    for path in sorted(bundle.rglob("*")):
+        rel = path.relative_to(bundle).as_posix()
+        if rel in skip:
+            continue
+        if path.is_symlink():
+            digests[rel] = "symlink:" + os.readlink(path)
+        elif path.is_file():
+            digests[rel] = hashlib.sha256(path.read_bytes()).hexdigest()
+    return digests
+
+
+# Not content (ruling 8b, 4a): the MANIFEST names the version, so it differs between any two
+# bundles, and the checksums list covers it. What is left is corpus/ texts and index/.
+_NOT_CONTENT = frozenset({MANIFEST_FILENAME, CHECKSUMS_FILENAME})
+
+# The producer version record (terms-analysis#93 Round 10b): the version refresh last published
+# and detect's fingerprint of that bundle. It lives under Settings.state_dir, which refresh.yml
+# caches, because out/ is not cached: without it an emptied out/ restarts the patch at .0 and
+# can reuse a name for new content. Its own file: detect's last-published-bundle.json belongs
+# to the workflow's record step.
+VERSION_RECORD_FILE = "producer-version-record.json"
+
+
+class VersionRecordError(ValueError):
+    """The producer version record exists but is not a record this cli wrote."""
+
+
+@dataclasses.dataclass(frozen=True)
+class _VersionRecord:
+    version: str
+    digest: str
+
+
+def _read_version_record(state_dir: Path) -> _VersionRecord | None:
+    """The producer version record, or None when there is none (first run, cache eviction).
+
+    Anything else that is not a regular file holding ``{"version": <calver>, "digest":
+    <sha256 hex>}`` raises (item 6): read as "no record", it would restart the patch and could
+    reuse a name. A link is refused even when its target is valid (O_NOFOLLOW), a dir names
+    IsADirectoryError, and an unreadable file its own OSError. Callers echo the type only.
+    """
+    path = state_dir / VERSION_RECORD_FILE
+    if not os.path.lexists(path):
+        return None
+    # O_NONBLOCK: a FIFO planted at the path must not hang the run before fstat refuses it.
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        mode = os.fstat(fd).st_mode
+        if stat.S_ISDIR(mode):
+            raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR))
+        if not stat.S_ISREG(mode):
+            raise VersionRecordError("the version record is not a regular file")
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            raw = handle.read()
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise VersionRecordError("the version record is not a JSON object")
+    version, digest = data.get("version"), data.get("digest")
+    if not isinstance(version, str) or not _is_calver(version):
+        raise VersionRecordError("the version record names no bundle version")
+    if not isinstance(digest, str) or not _SHA256_HEX_RE.fullmatch(digest):
+        raise VersionRecordError("the version record holds no sha256 digest")
+    return _VersionRecord(version=version, digest=digest)
+
+
+def _is_calver(name: str) -> bool:
+    """A bundle name retention reads (ASCII YYYY.M.N) whose month is a real month."""
+    match = CALVER_RE.fullmatch(name)
+    return match is not None and 1 <= int(match.group(2)) <= 12
+
+
+def _write_version_record(state_dir: Path, record: _VersionRecord) -> None:
+    """Write the record atomically: a temp file in the state dir, then os.replace."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    body = json.dumps({"version": record.version, "digest": record.digest}, sort_keys=True)
+    fd, tmp = tempfile.mkstemp(prefix=".version-record-", dir=state_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(body + "\n")
+        os.replace(tmp, state_dir / VERSION_RECORD_FILE)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def _is_bundle_dir(path: Path) -> bool:
+    return not path.is_symlink() and path.is_dir()
+
+
+def _publish_bundle(
+    settings: Settings,
+    fresh: str,
+    staged: dict[str, tuple[Corpus, Manifest] | None],
+    record: _VersionRecord | None,
+) -> None:
+    """Publish the run's one bundle and repoint out/current (ruling 8, Round 10b).
+
+    Only called after every source succeeded. The version, by content:
+    - equal to the bundle a valid out/current names: nothing is published or repointed
+      (ruling 8b, 4a), so detect reports no change;
+    - equal to the producer *record*'s digest: the recorded version, so an emptied out/ (the
+      hosted runner) or a new month brings no alert. Already on disk byte for byte, it is only
+      repointed; on disk in any other form, it is never rewritten and *fresh* is used;
+    - otherwise *fresh*, the next patch past out/ and the record (Round 10b item 4).
+    The record is rewritten only after a full publish. Any error exits 1 with its type only;
+    out/current is repointed last, so a failure leaves it (and the record) as they were.
+    """
+    out_dir = settings.out_dir
+    kept = {name: pair for name, pair in staged.items() if pair is not None}
+    if not kept:
+        # Every source ran without error yet none staged a corpus. Exit 0 here could not be
+        # told from "content unchanged" (detect: changed=false), so it fails closed (ruling 9).
+        typer.echo(
+            f"Bundle {fresh} was not published (no source staged a corpus:"
+            f" {', '.join(staged)}); {CURRENT_LINK} was not repointed by this run.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    version = fresh
+    try:
+        if len(kept) != len(staged):
+            # Some sources staged and some did not: the bundle would silently miss sources.
+            raise ValueError("not every source staged a corpus; the bundle would be partial")
+        # The candidate carries the recorded version's MANIFEST, so it is byte-comparable with
+        # that bundle on disk; content comparisons skip the MANIFEST and checksums anyway.
+        corpus, manifest = _combined_bundle(record.version if record else fresh, kept)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        # Written by the same FilesystemPublisher layout as the real bundle, into a dot-named
+        # dir that is never a bundle name, and always removed.
+        candidate = Path(tempfile.mkdtemp(prefix=".candidate-", dir=out_dir))
+        try:
+            FilesystemPublisher().publish(
+                corpus, PublishTarget(kind="filesystem", path=candidate), manifest
+            )
+            content = _file_digests(candidate, _NOT_CONTENT)
+            whole = _file_digests(candidate)
+            fingerprint = bundle_fingerprint(candidate)
+        finally:
+            shutil.rmtree(candidate, ignore_errors=True)
+        current = _current_version(out_dir)
+        if current is not None and _file_digests(out_dir / current, _NOT_CONTENT) == content:
+            typer.echo(f"Bundle unchanged: {CURRENT_LINK} stays at {current}.")
+            return
+        publisher = TermsAnalysisPublisher()
+        on_disk = False
+        if record is not None and record.digest == fingerprint:
+            recorded = out_dir / record.version
+            if not os.path.lexists(recorded):
+                version = record.version
+            elif _is_bundle_dir(recorded) and _file_digests(recorded) == whole:
+                version, on_disk = record.version, True
+        if on_disk:
+            publisher.repoint(out_dir, version)
+        else:
+            publisher.publish(
+                corpus,
+                PublishTarget(kind="terms_analysis", path=out_dir),
+                dataclasses.replace(manifest, corpus_version=version),
+            )
+    except (OSError, ValueError) as exc:
+        typer.echo(
+            f"Bundle {version} was not published ({_type_name(exc)}); {CURRENT_LINK} was not"
+            " repointed by this run.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    try:
+        _write_version_record(
+            settings.state_dir,
+            _VersionRecord(version=version, digest=bundle_fingerprint(out_dir / version)),
+        )
+    except (OSError, ValueError) as exc:
+        # current already names the new bundle; without the record the next run on an emptied
+        # out/ could reuse this name, so the run must not end green.
+        typer.echo(
+            f"Bundle {version} was published and {CURRENT_LINK} -> {version}, but the version"
+            f" record was not written ({_type_name(exc)}).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(f"Published bundle {version}; {CURRENT_LINK} -> {version}.")
+
+
+def _refresh_baseline_present(state_dir: Path) -> bool:
+    """True only when the refresh licence baseline is a regular file the drift gate can read.
+
+    os.stat follows a link, so a dangling link (ENOENT) is missing; so is a directory, FIFO or
+    other non-regular file in its place. Any other error reading it (EACCES, ELOOP) also counts
+    as missing: the gate fails closed rather than letting the drift check read every source as
+    NEW (terms-analysis#93 Round 11 item 1).
+    """
+    try:
+        mode = os.stat(state_dir / REFRESH_BASELINE_FILE).st_mode
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISREG(mode)
+
+
+def _exit_license_baseline_missing() -> NoReturn:
+    """Exit EXIT_LICENSE_BASELINE_MISSING before any source runs, writing nothing (Round 11).
+
+    The reason only: no path, and no source name, since no source failed.
+    """
+    typer.echo(
+        "The refresh licence baseline in INGESTER_STATE_DIR is missing or not a regular file;"
+        f" nothing ran and {CURRENT_LINK} was not repointed. Restore the state, or confirm each"
+        f" source's current licence (SPDX) and run with {REFRESH_SEED_FLAG} to accept it as the"
+        " baseline.",
+        err=True,
+    )
+    raise typer.Exit(code=EXIT_LICENSE_BASELINE_MISSING)
+
+
+def _exit_no_approved_sources(
+    settings: Settings, unsigned: dict[str, str], dry_run: bool
+) -> NoReturn:
+    """Exit EXIT_NO_APPROVED_SOURCES; a real run first checkpoints every source (ruling D).
+
+    The hash to sign is the payload sha256 in the source's cassette sidecar manifest (#96):
+    fetch never downloads an unsigned source (decision A), so the message says where it is.
+    """
+    if not dry_run:
+        _record_not_approved(settings, unsigned)
+    typer.echo(
+        "No requested source holds a valid approval; nothing was run. Sign each approval file"
+        f" under {APPROVALS_SUBDIR}/ in INGESTER_CONFIG_DIR with the payload sha256 from the"
+        " source's cassette sidecar manifest.",
+        err=True,
+    )
+    raise typer.Exit(code=EXIT_NO_APPROVED_SOURCES)
+
 # Main app
 app = typer.Typer(
     name="ingester",
@@ -160,7 +787,9 @@ app = typer.Typer(
     epilog=(
         "Exit codes: "
         + _exit_code_clauses(tuple(sorted(_EXIT_MEANINGS)))
-        + ". Other command failures (unknown source, license drift, invalid bundle) also exit 1."
+        + ". Other command failures (unknown source, invalid INGESTER_* settings, an unreadable"
+        " approvals dir or malformed approval file, a pipeline class outside the package, license"
+        " drift, invalid bundle) also exit 1."
     ),
     no_args_is_help=True,
 )
@@ -287,12 +916,23 @@ def status(
 
 @app.command(
     help=(
-        "Fetch a source (use --dry-run to preview without writing).\n\n"
-        "Exit codes: 0 when --dry-run prints what would be fetched; "
+        "Fetch one source and run it through the pipeline: fetch, check the approved hash,"
+        " clean, chunk, embed and publish under INGESTER_OUT_DIR (use --dry-run to preview"
+        " without writing).\n\n"
+        "Exit codes: 0 when the source is published, or --dry-run finds the source approved and"
+        " prints what would be fetched; "
         + _exit_code_clauses(
-            (EXIT_NOT_WIRED, EXIT_NO_SOURCES, EXIT_SOURCES_DIR_MISSING, EXIT_LOAD_ERROR)
+            (
+                EXIT_NO_APPROVED_SOURCES,
+                EXIT_SOURCE_FAILED,
+                EXIT_NO_SOURCES,
+                EXIT_SOURCES_DIR_MISSING,
+                EXIT_LOAD_ERROR,
+            )
         )
-        + ". An unknown source in a sources dir that holds sources also exits 1."
+        + ". An unknown source in a sources dir that holds sources, invalid INGESTER_* settings,"
+        " an unreadable approvals dir, a malformed approval file or a pipeline class outside the"
+        " package also exit 1, before any approval verdict, on --dry-run too."
     )
 )
 def fetch(
@@ -329,23 +969,81 @@ def fetch(
 
     cfg = registry[source]
 
+    # fetch applies the same legal gate as refresh: an unsigned source is refused before any
+    # network call and checkpointed as not_approved (#93 lead decisions A and D). Load errors
+    # exit 1 before any verdict (ruling 4), and --dry-run runs every one of these offline checks
+    # so it exits as the real fetch would, writing nothing (round 4 I).
+    settings = _load_settings()
+    classes = _stage_classes(registry, [source])
+    approvals_dir = _approvals_dir(settings)
+    today = date.today()
+    approved, unsigned = _approved_sources([source], approvals_dir, today)
+    if not approved:
+        _exit_no_approved_sources(settings, unsigned, dry_run)
+
     if dry_run:
         typer.echo(f"DRY RUN: would fetch {source!r} from {cfg.base_url}")
         return
 
-    # Actual fetch not implemented in this thin CLI layer — delegate to pipeline
-    typer.echo(f"Fetching {source!r} from {cfg.base_url} ...")
-    # Fail loudly: exiting 0 here would report a no-op as success (terms-analysis#90)
-    typer.echo("(Full fetch pipeline not yet wired — use orchestrator directly.)", err=True)
-    raise typer.Exit(code=EXIT_NOT_WIRED)
+    # fetch publishes no bundle, so it neither reads nor writes the producer version record.
+    _run_sources(
+        settings, registry, approved, classes, approvals_dir, today, {}, next_version(settings.out_dir, today)
+    )
 
 
-@app.command()
+@app.command(
+    help=(
+        "Refresh every configured source whose approval is valid: fetch, check the approved"
+        " hash, clean, chunk, embed and stage each under INGESTER_OUT_DIR/<source>, then publish"
+        " one combined bundle as INGESTER_OUT_DIR/<YYYY.M.patch> and repoint the relative link"
+        " INGESTER_OUT_DIR/current at it. A bundle whose content equals the one current points"
+        " at is not published again, and content equal to the producer version record's"
+        " (INGESTER_STATE_DIR) keeps the recorded version; new content takes the next patch past"
+        " the record and the bundles on disk. A malformed record exits 1. A run with a failed"
+        " source publishes no bundle and leaves current as it was; a bundle that cannot be"
+        " published exits 1. A source without a"
+        " valid approval is not run and counts as failed: it is named on stderr and checkpointed"
+        " as not_approved. A source whose licence SPDX changed since its recorded baseline is"
+        " checkpointed as license_failed and not published. A source whose checkpoint cannot be"
+        " written counts as failed. Checkpoints and the licence baseline live under"
+        " INGESTER_STATE_DIR. A failing source does not stop the rest. A missing licence"
+        f" baseline file stops the run before any source unless {REFRESH_SEED_FLAG} is given.\n\n"
+        "Exit codes: 0 when every configured source is approved and published (or the bundle"
+        " is unchanged), or --dry-run finds every source approved; "
+        + _exit_code_clauses(
+            (
+                EXIT_NO_APPROVED_SOURCES,
+                EXIT_LICENSE_BASELINE_MISSING,
+                EXIT_SOURCE_FAILED,
+                EXIT_NO_SOURCES,
+                EXIT_SOURCES_DIR_MISSING,
+                EXIT_LOAD_ERROR,
+            )
+        )
+        + ". Invalid INGESTER_* settings, an unreadable approvals dir, a malformed approval file"
+        " or a pipeline class outside the package also exit 1, before any approval verdict or"
+        " checkpoint, on --dry-run too."
+    )
+)
 def refresh(
     all_sources: bool = typer.Option(
         False,
         "--all",
         help="Refresh all configured sources.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="List the sources that would run, without fetching or writing anything.",
+    ),
+    seed_license_baseline: bool = typer.Option(
+        False,
+        REFRESH_SEED_FLAG,
+        help=(
+            "Run even though the licence baseline file is missing, and record the licence"
+            " (SPDX) each source declares today as the baseline. Confirm each licence first."
+            " Never overrides a licence change against an existing baseline."
+        ),
     ),
     # A plain str, not Path: typer's Path type stats the argument itself and fails on NUL or a
     # lone surrogate before _require_sources_dir can classify it (#108).
@@ -355,7 +1053,6 @@ def refresh(
         help="Directory containing *.yaml source configs.",
     ),
 ) -> None:
-    """Refresh corpus bundles for all configured sources (or a single source)."""
     sources_path = _require_sources_dir(sources_dir)
     try:
         registry = _load_sources_dir(sources_path)
@@ -367,11 +1064,57 @@ def refresh(
         typer.echo(f"{MSG_NO_SOURCES}; nothing to refresh.")
         raise typer.Exit(code=EXIT_NO_SOURCES)
 
-    # Full pipeline orchestration not yet wired — placeholder for Phase 1.
-    typer.echo(f"Refreshing {len(registry)} source(s): {', '.join(registry)}")
-    # Fail loudly: exiting 0 here would report a no-op as success (terms-analysis#90)
-    typer.echo("(Full refresh pipeline not yet wired — use orchestrator directly.)", err=True)
-    raise typer.Exit(code=EXIT_NOT_WIRED)
+    # Every check that needs no network runs before the first fetch, and on --dry-run too, so
+    # a dry run exits with the code the real run would (lead ruling 5).
+    # Load errors (settings, every source's stage classes, approval files) exit 1 before any
+    # approval verdict or checkpoint (lead ruling 4, round 4 H and the round 5 gap).
+    settings = _load_settings()
+    classes = _stage_classes(registry, list(registry))
+    approvals_dir = _approvals_dir(settings)
+    today = date.today()
+    try:
+        record = _read_version_record(settings.state_dir)
+    except (OSError, ValueError) as exc:
+        # Never read as "no record" (Round 10b item 6), and never echoed: type only.
+        typer.echo(
+            f"The producer version record in INGESTER_STATE_DIR is unusable ({_type_name(exc)});"
+            f" nothing was run and {CURRENT_LINK} was not repointed.",
+            err=True,
+        )
+        raise typer.Exit(code=EXIT_LOAD_ERROR)
+    approved, unsigned = _approved_sources(list(registry), approvals_dir, today)
+    if not approved:
+        _exit_no_approved_sources(settings, unsigned, dry_run)
+    # Exit 7 above stays first (ruling 11b-b): with nothing approved nothing can publish, so the
+    # licence gate has nothing to guard. Otherwise a missing baseline stops the run here, before
+    # any checkpoint, fetch or record, on --dry-run too, unless the run explicitly seeds it.
+    if not seed_license_baseline and not _refresh_baseline_present(settings.state_dir):
+        _exit_license_baseline_missing()
+
+    if dry_run:
+        for name in approved:
+            typer.echo(f"DRY RUN: would refresh {name}")
+        if unsigned:
+            # The real run would fail each unsigned source, so the dry run exits as it would
+            # (ruling E); it writes no checkpoint.
+            typer.echo(
+                f"DRY RUN: {len(unsigned)} source(s) would fail, not approved:"
+                f" {', '.join(unsigned)}.",
+                err=True,
+            )
+            raise typer.Exit(code=EXIT_SOURCE_FAILED)
+        return
+
+    # Only after every offline check passed: a load error (exit 1) writes nothing.
+    _record_not_approved(settings, unsigned)
+    # Exits EXIT_SOURCE_FAILED if any source failed, so a partial run never reaches the bundle.
+    # One version for new content, from the injected date, the bundles on disk and the record
+    # (ruling 8b, Round 10b item 4); every checkpoint names it.
+    fresh = next_version(settings.out_dir, today, after=record.version if record else None)
+    staged = _run_sources(
+        settings, registry, approved, classes, approvals_dir, today, unsigned, fresh
+    )
+    _publish_bundle(settings, fresh, staged, record)
 
 
 @app.command(
@@ -394,10 +1137,13 @@ def audit_license(
         "--sources-dir",
         help="Directory containing *.yaml source configs.",
     ),
-    state_file: Path = typer.Option(
-        Path("state/license-hashes.json"),
+    state_file: Path | None = typer.Option(
+        None,
         "--state-file",
-        help="Path to license-hashes.json baseline state file.",
+        help=(
+            f"Baseline state file. Default: {DEFAULT_STATE_FILE.name} under INGESTER_STATE_DIR,"
+            " the state dir refresh uses (never the current directory)."
+        ),
     ),
     update_baseline: bool = typer.Option(
         False,
@@ -430,6 +1176,11 @@ def audit_license(
             err=True,
         )
         raise typer.Exit(code=1)
+
+    # One configured state dir for every tool (terms-analysis#93 rulings K and P); audit-license
+    # keeps its own file there, separate from the refresh gate's REFRESH_BASELINE_FILE.
+    if state_file is None:
+        state_file = _load_settings().state_dir / DEFAULT_STATE_FILE.name
 
     cfg = registry[source]
     license_url: str = cfg.license.url

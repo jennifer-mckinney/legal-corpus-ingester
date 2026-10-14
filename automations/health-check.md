@@ -38,13 +38,14 @@ The `health` job runs two checks in this order. Neither step has `if:` or
    (terms-analysis#190). It is not masked; a crash fails the job
    (terms-analysis#90).
 
-Both steps pass `--state-dir "${XDG_STATE_HOME:-$HOME/.local/state}/legal-corpus-ingester/state"`,
-outside the checkout. `actions/checkout` cleans ignored files, which wipes the
-gitignored `state/`, so reading `./state` would always report every source as
-never-run. On a GitHub-hosted runner the whole filesystem is new each run, so
-this directory is empty too until state persistence is designed (ADR-016). When
-refresh is wired it must write its checkpoints to this same directory and
-persist them across runs.
+Both steps pass `--state-dir "$INGESTER_STATE_DIR"`, the directory refresh writes,
+declared with the same value in the workflow `env` of `health.yml` and `refresh.yml`
+and outside the checkout (`actions/checkout` cleans ignored files, which wipes the
+gitignored `state/`). Before them, `actions/cache/restore` restores the state the newest
+refresh run saved (ingester #71); health never saves. On a miss (no refresh has run
+yet, or the cache was evicted after 7 days unused) the directory is empty and the
+health check fails every source as never-run: a red run, not a green one. See
+`automations/refresh.md`, "State between runs".
 
 ## What it produces
 
@@ -71,16 +72,17 @@ decided:
 | Exit | Meaning | Workflow result |
 |------|---------|-----------------|
 | 0 | Every source is fresh | green |
-| 1 | A source is stale, or never-run while refresh is wired | red |
+| 1 | A source is stale, its last checkpoint stage is not the success stage `done` (status `failed`: `not_approved`, any `*_failed`, an unfinished or unknown stage, however recent), or it is never-run while refresh is wired | red |
 | 2 | Config problem: `config/sources/` missing, unreadable or holding zero source configs, a non-file `*.yaml` entry, or an empty / non-mapping source YAML | red |
 | 3 (`EXIT_NOT_WIRED`) | The only problem is never-run sources and `cli.REFRESH_WIRED` is False | green with a "Refresh not wired" warning annotation |
 | 4 (`EXIT_CHECKPOINT_INVALID`) | A checkpoint file exists but is not a valid `CheckpointState` for its source (see below). Outranks 1 and 3 (stale or never-run sources do not mask it), wired or not | red |
 
-Exit 3 is the known unwired state: `ingester refresh` does not run the pipeline
-yet, so no checkpoint can exist. The step turns exactly that code into a warning
-and fails on every other non-zero code, including a crash. A stale checkpoint is
-never excused. The PR that wires refresh flips `REFRESH_WIRED` to True (a unit
-test fails until it does), after which never-run exits 1.
+Exit 3 was the known unwired state: no checkpoint could exist while `ingester
+refresh` did not run the pipeline. Refresh is wired since terms-analysis#93 and
+`REFRESH_WIRED` is True, so a never-run source now exits 1 and the run is red until
+every configured source has a fresh checkpoint. The step still turns exactly code 3
+into a warning (the code is reserved) and fails on every other non-zero code,
+including a crash. A stale checkpoint is never excused.
 
 A checkpoint is valid only when it is a regular file (a symlink to one is
 followed) holding strict UTF-8 JSON that `CheckpointStore.load` accepts: an
@@ -101,7 +103,7 @@ python scripts/health_check.py --stale-days 14
 
 ## Failure mode
 
-If `health_check.py` exits 1 (stale source, or never-run once refresh is wired),
+If `health_check.py` exits 1 (stale or failed source, or never-run once refresh is wired),
 2 (config problem: `config/sources/` missing, unreadable or holding zero source
 configs, a `*.yaml` entry that is not a regular file, or a source YAML that is
 empty or not a mapping; terms-analysis#90, #173), 4 (an invalid checkpoint;

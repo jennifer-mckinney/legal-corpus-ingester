@@ -32,7 +32,7 @@ from types import ModuleType
 import pytest
 import yaml
 
-from legal_corpus_ingester.pipeline.state import CheckpointState
+from legal_corpus_ingester.pipeline.state import STAGES, CheckpointState
 
 # scripts/ is not a package; inject it into the path.
 _SCRIPTS = Path(__file__).parent.parent.parent / "scripts"
@@ -44,6 +44,9 @@ import health_check  # noqa: E402
 from health_check import main  # noqa: E402
 
 _EXIT_CONFIG = 2
+# The success terminal stage the Orchestrator writes; the only stage health may call fresh
+# (#93 ruling C, round 3).
+_SUCCESS_STAGE = STAGES[-1]
 _FIXTURE_SOURCE = Path(__file__).resolve().parents[1] / "fixtures" / "sources" / "eurlex.yaml"
 
 
@@ -545,7 +548,7 @@ def test_hostile_source_stem_is_escaped_in_report_and_stdout(
         assert f"| {_HOSTILE_STEM_SHOWN} |" in text  # still identifies the source
 
 
-def test_hostile_checkpoint_stage_is_escaped_on_exit_zero_path(
+def test_hostile_checkpoint_stage_is_escaped_and_not_fresh(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config_dir = tmp_path / "config"
@@ -555,8 +558,11 @@ def test_hostile_checkpoint_stage_is_escaped_on_exit_zero_path(
     state.mkdir()
     stage = "pub\x1b[2J|lished\nFORGED | x | y | z | fresh |\u2028\u202e"
     (state / "eurlex.checkpoint.json").write_text(json.dumps(_checkpoint(stage)))
+    # Fresh mtime, but the stage is not the success terminal stage, so the run is unhealthy
+    # (#93 ruling C). Before round 3 this was the exit-0 path; the escaping must hold either way.
+    os.utime(state / "eurlex.checkpoint.json")
     rc, out, _err = _run(config_dir, tmp_path, capsys)
-    assert rc == 0  # fresh source: the success path must be safe too
+    assert rc == health_check.EXIT_SOURCE_PROBLEM, f"hostile stage read as healthy: rc={rc}"
     (report,) = (tmp_path / "out" / "health").glob("*.md")
     for text in (out, report.read_text()):
         for raw in ("\x1b", "\u2028", "\u202e"):
@@ -568,6 +574,7 @@ def test_hostile_checkpoint_stage_is_escaped_on_exit_zero_path(
             assert _REPORT_ROW.fullmatch(row), f"row has a forged cell delimiter: {row!r}"
         # Grumpy r2-2: the stage is escaped, not dropped.
         assert f"| {health_check.table_cell(stage)} |" in rows[1]
+        assert not rows[1].endswith("| fresh |"), f"hostile stage row reads fresh: {rows[1]!r}"
 
 
 # ---------------------------------------------------------------------------
@@ -621,10 +628,12 @@ def test_fresh_valid_source_still_exits_zero(tmp_path: Path, capsys: pytest.Capt
     (config_dir / "eurlex.yaml").write_text(_FIXTURE_SOURCE.read_text())
     state = tmp_path / "state"
     state.mkdir()
-    (state / "eurlex.checkpoint.json").write_text(json.dumps(_checkpoint("published")))
+    # #93 ruling C: only the success terminal stage is fresh ("published" was never a stage).
+    (state / "eurlex.checkpoint.json").write_text(json.dumps(_checkpoint(_SUCCESS_STAGE)))
     rc, out, _err = _run(config_dir, tmp_path, capsys)
     assert rc == 0
     assert "| eurlex |" in out
+    assert out.count("| fresh |") == 1
 
 
 # ---------------------------------------------------------------------------

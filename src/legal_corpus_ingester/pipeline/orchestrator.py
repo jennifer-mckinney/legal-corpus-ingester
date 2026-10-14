@@ -11,7 +11,11 @@ import numpy as np
 
 from legal_corpus_ingester.errors import EmbedEndpointError, LicenseDriftError
 from legal_corpus_ingester.pipeline.manifest import Manifest
-from legal_corpus_ingester.pipeline.state import CheckpointState, CheckpointStore
+from legal_corpus_ingester.pipeline.state import (
+    STAGE_LICENSE_FAILED,
+    CheckpointState,
+    CheckpointStore,
+)
 from legal_corpus_ingester.provenance.license_audit import (
     DriftStatus,
     check_license_drift,
@@ -151,6 +155,16 @@ class Orchestrator:
                 alert_path.write_text(
                     f"# LICENSE DRIFT ALERT\n\nSource: {source_name}\nSPDX changed.\n",
                     encoding="utf-8",
+                )
+                # The source checkpoints its own failure before it raises (terms-analysis#93
+                # ruling Q). Fixed text: both SPDX values are untrusted bytes (F8).
+                self._store.save(
+                    CheckpointState(
+                        source_name,
+                        STAGE_LICENSE_FAILED,
+                        self._corpus_version,
+                        error="SPDX changed since the recorded licence baseline; publish blocked.",
+                    )
                 )
                 raise LicenseDriftError(source_name, old_spdx=old_spdx, new_spdx=license_spdx)
             elif drift_status == DriftStatus.DRIFT:

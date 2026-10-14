@@ -1,4 +1,4 @@
-"""Exit-code contract tests for unwired CLI commands (terms-analysis#90).
+"""Exit-code contract tests for the CLI (terms-analysis#90, #93).
 
 The behavioural acceptance tests live in test_cli_not_wired.py (owned by the
 acceptance-test author, asserts only `!= 0`). The exact-code assertions below
@@ -59,16 +59,27 @@ def test_every_cli_exit_constant_is_in_the_public_table() -> None:
     assert owners == ["EXIT_USAGE"], owners
 
 
-def test_fetch_unwired_exits_exactly_not_wired() -> None:
+@pytest.fixture
+def _no_approvals(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # terms-analysis#93: fetch and refresh are wired. An empty approvals dir (env, not the repo's
+    # approvals, so a signed repo approval can never turn these into live fetches) means no
+    # source may run.
+    (tmp_path / "approvals").mkdir()
+    monkeypatch.setenv("INGESTER_CONFIG_DIR", str(tmp_path))
+
+
+@pytest.mark.usefixtures("_no_approvals")
+def test_fetch_unsigned_exits_exactly_no_approved_sources() -> None:
     assert (_SOURCES_DIR / "eurlex_gdpr.yaml").is_file()
     result = runner.invoke(cli.app, ["fetch", "eurlex_gdpr", "--sources-dir", str(_SOURCES_DIR)])
-    assert result.exit_code == cli.EXIT_NOT_WIRED, (result.exit_code, result.stderr)
+    assert result.exit_code == cli.EXIT_NO_APPROVED_SOURCES, (result.exit_code, result.stderr)
 
 
-def test_refresh_unwired_exits_exactly_not_wired() -> None:
+@pytest.mark.usefixtures("_no_approvals")
+def test_refresh_unsigned_exits_exactly_no_approved_sources() -> None:
     assert any(_SOURCES_DIR.glob("*.yaml"))
     result = runner.invoke(cli.app, ["refresh", "--all", "--sources-dir", str(_SOURCES_DIR)])
-    assert result.exit_code == cli.EXIT_NOT_WIRED, (result.exit_code, result.stderr)
+    assert result.exit_code == cli.EXIT_NO_APPROVED_SOURCES, (result.exit_code, result.stderr)
 
 
 def test_refresh_help_still_exits_zero() -> None:
@@ -81,6 +92,7 @@ def test_refresh_empty_dir_still_exit_no_sources(tmp_path: Path) -> None:
     assert result.exit_code == cli.EXIT_NO_SOURCES
 
 
+@pytest.mark.usefixtures("_no_approvals")
 def test_refresh_wired_flag_matches_refresh_behaviour() -> None:
     # health_check.py excuses never-run sources only while REFRESH_WIRED is False. If refresh
     # is wired without flipping the flag, never-run would stay excused forever; if the flag is

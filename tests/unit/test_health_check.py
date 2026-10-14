@@ -76,10 +76,11 @@ class TestBuildReport:
         (config_dir / "eurlex.yaml").write_text("name: eurlex\n")
         state_dir = tmp_path / "state"
         state_dir.mkdir()
-        # Write a checkpoint so the source is "fresh" (recent mtime)
+        # Write a finished-run checkpoint (recent mtime). terms-analysis#93 round 3 (ruling C):
+        # only the success terminal stage can be fresh, so this is STAGES[-1], not "publish".
         cp = state_dir / "eurlex.checkpoint.json"
         cp.write_text(json.dumps(dataclasses.asdict(
-            CheckpointState(source_name="eurlex", stage="publish", corpus_version="v1"))))
+            CheckpointState(source_name="eurlex", stage=_SUCCESS_STAGE, corpus_version="v1"))))
         # Patch _checkpoint_info to control lag — instead use real file with recent mtime
         report, verdict = build_report(
             config_dir=config_dir,
@@ -134,10 +135,12 @@ class TestMainExitCodes:
                    "--out-dir", str(tmp_path / "out")])
         assert rc == EXIT_SOURCE_PROBLEM == 1
 
-    def test_never_run_while_unwired_exits_not_wired_and_says_why(self, tmp_path, capsys):
-        # Today's real state: refresh is unwired, so no checkpoint can exist. That is the
-        # known state (cli.EXIT_NOT_WIRED), not success and not a broken pipeline.
-        assert health_check.REFRESH_WIRED is cli.REFRESH_WIRED is False
+    def test_never_run_while_unwired_exits_not_wired_and_says_why(self, tmp_path, capsys, monkeypatch):
+        # The unwired branch, kept for a command that is unwired again: no checkpoint can exist,
+        # which is the known state (cli.EXIT_NOT_WIRED), not success and not a broken pipeline.
+        # Refresh itself is wired since terms-analysis#93, so the flag is patched off here.
+        assert health_check.REFRESH_WIRED is cli.REFRESH_WIRED is True
+        monkeypatch.setattr(health_check, "REFRESH_WIRED", False)
         config_dir = tmp_path / "config"
         config_dir.mkdir()
         (config_dir / "eurlex.yaml").write_text("name: eurlex\n")
@@ -188,6 +191,9 @@ class TestHealthVerdict:
             # Fail closed: a status nobody planned for is a problem, never excused.
             (["unknown"], False, EXIT_SOURCE_PROBLEM),
             (["never-run", ""], False, EXIT_SOURCE_PROBLEM),
+            # terms-analysis#93 ruling C: a failed run is never excused, wired or not.
+            (["never-run", "failed:not_approved"], False, EXIT_SOURCE_PROBLEM),
+            (["fresh", "failed:fetch_failed"], True, EXIT_SOURCE_PROBLEM),
         ],
     )
     def test_truth_table(self, statuses, wired, expected):
@@ -231,6 +237,8 @@ _RAW_FORBIDDEN = (_CANARY, "\x1b", "‮", " ", "\x00")
 _HOSTILE_TEXT = f"{_CANARY}\x1b[2J‮ "
 # Status labels that would wrongly describe a source whose checkpoint is unreadable.
 _TRUSTED_STATUSES = ("fresh", "stale", "never-run")
+# The one success terminal stage the Orchestrator writes ("done"), read from the stage list.
+_SUCCESS_STAGE = checkpoint_module.STAGES[-1]
 # Bound for the child process: a FIFO or other blocking path must not hang the job.
 _CHILD_TIMEOUT_S = 30.0
 
@@ -617,3 +625,102 @@ class TestCheckpointParityWithStore:
         assert message is not None
         for raw in _RAW_FORBIDDEN:
             assert raw not in message
+
+
+
+# ---------------------------------------------------------------------------
+# terms-analysis#93 round 3, ruling C: the stage decides, not the mtime alone.
+# #93 makes refresh write failure checkpoints (not_approved, *_failed). Judged by mtime only,
+# a failed refresh a few seconds ago reads as "fresh" and health exits 0: a silent success.
+# Contract pinned here, fail-closed:
+#   * only the success terminal stage (STAGES[-1], what the Orchestrator writes last) can be
+#     fresh;
+#   * every other stage (a failure, an unfinished run, an unknown or hostile string) is a
+#     non-trusted status and exits EXIT_SOURCE_PROBLEM, wired or not, however recent;
+#   * the stage text is escaped in the report: one row, five cells, no raw control bytes.
+# ---------------------------------------------------------------------------
+
+# Decision B's failure stage for a source with no valid approval (written by the CLI).
+_NOT_APPROVED_STAGE = "not_approved"
+_RECENT_S = 5.0
+
+_STAGE_ROWS: dict[str, tuple[str, bool]] = {
+    "success": (_SUCCESS_STAGE, True),
+    "not-approved": (_NOT_APPROVED_STAGE, False),
+    **{f"failed-{s}": (f"{s}_failed", False) for s in checkpoint_module.STAGES[:-1]},
+    **{f"unfinished-{s}": (s, False) for s in checkpoint_module.STAGES[:-1]},
+    "unknown-empty": ("", False),
+    "unknown-word": ("finished", False),
+    "unknown-case": (_SUCCESS_STAGE.upper(), False),
+    "unknown-trailing-space": (f"{_SUCCESS_STAGE} ", False),
+    "unknown-status-name": ("fresh", False),
+    "hostile-newline-row": (f"{_SUCCESS_STAGE}\n| {_SOURCE} | x | {_SUCCESS_STAGE} | 0.0 | fresh |", False),
+    "hostile-pipe": (f"{_SUCCESS_STAGE}|fresh", False),
+    "hostile-ansi": (f"\x1b[32m{_SUCCESS_STAGE}\x1b[0m", False),
+    "hostile-bidi-crlf": (f"{_SUCCESS_STAGE}\u202e\r\u2028", False),
+    "hostile-huge": (_SUCCESS_STAGE + "x" * 100_000, False),
+}
+_STAGE_RAW_FORBIDDEN = ("\x1b", "\u202e", "\r", "\u2028")
+
+
+def _write_stage_checkpoint(tmp_path: Path, stage: str, source: str = _SOURCE) -> None:
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    CheckpointStore(state).save(CheckpointState(source_name=source, stage=stage, corpus_version="v1"))
+    path = state / f"{source}.checkpoint.json"
+    recent = time.time() - _RECENT_S
+    os.utime(path, (recent, recent))
+
+
+def _health_texts(tmp_path: Path, out: str, err: str) -> list[str]:
+    health_dir = tmp_path / "out" / "health"
+    reports = list(health_dir.glob("*.md")) if health_dir.is_dir() else []
+    return [out, err, *(r.read_text(encoding="utf-8") for r in reports)]
+
+
+class TestCheckpointStageDecidesFreshness:
+    def test_stage_table_covers_every_family(self):
+        # Contract: one success row, a failure and an unfinished row for every non-terminal
+        # stage, not_approved, unknown rows, and hostile rows for newline, pipe and ANSI.
+        stages = {stage for stage, _ok in _STAGE_ROWS.values()}
+        assert [k for k, (_s, ok) in _STAGE_ROWS.items() if ok] == ["success"]
+        for s in checkpoint_module.STAGES[:-1]:
+            assert {s, f"{s}_failed"} <= stages, s
+        assert _NOT_APPROVED_STAGE in stages
+        assert any(k.startswith("unknown-") for k in _STAGE_ROWS)
+        hostile = "".join(stage for k, (stage, _ok) in _STAGE_ROWS.items() if k.startswith("hostile-"))
+        assert "\n" in hostile and "|" in hostile and "\x1b" in hostile
+
+    @pytest.mark.parametrize(("stage", "ok"), list(_STAGE_ROWS.values()), ids=list(_STAGE_ROWS))
+    def test_only_the_success_stage_is_fresh(self, tmp_path, capsys, refresh_wired, stage, ok):
+        _write_source_configs(tmp_path / "config")
+        _write_stage_checkpoint(tmp_path, stage)
+        rc, out, err = _run_main(tmp_path, capsys)
+        assert "Traceback" not in err, err[-600:]
+        rows = _source_rows(out)
+        # Escaping: the stage cannot add a row or a cell, whatever it carries.
+        assert len(rows) == 1 and len(rows[0]) == 5, rows
+        table_lines = [line for line in out.splitlines() if line.startswith("|")]
+        assert len(table_lines) == 3, table_lines
+        status = rows[0][-1]
+        if ok:
+            assert (rc, status) == (0, "fresh"), (rc, rows)
+        else:
+            assert status not in _TRUSTED_STATUSES, (stage[:80], rows)
+            assert rc == EXIT_SOURCE_PROBLEM, (rc, stage[:80], out[-600:])
+        for text in _health_texts(tmp_path, out, err):
+            for raw in _STAGE_RAW_FORBIDDEN:
+                assert raw not in text, f"stage bytes echoed raw: {raw!r}"
+        if "|" in stage and stage.isprintable():
+            assert stage.replace("|", "\\|") in out, "a pipe in the stage must be escaped as \\|"
+
+    def test_one_failed_source_fails_a_run_with_a_fresh_one(self, tmp_path, capsys):
+        # A partly failed refresh: one source done, one not_approved, both seconds old.
+        names = (_SOURCE, "other")
+        _write_source_configs(tmp_path / "config", names)
+        _write_stage_checkpoint(tmp_path, _SUCCESS_STAGE, _SOURCE)
+        _write_stage_checkpoint(tmp_path, _NOT_APPROVED_STAGE, "other")
+        rc, out, _err = _run_main(tmp_path, capsys)
+        assert _source_rows(out)[0][-1] == "fresh"
+        assert _source_rows(out, "other")[0][-1] not in _TRUSTED_STATUSES
+        assert rc == EXIT_SOURCE_PROBLEM
