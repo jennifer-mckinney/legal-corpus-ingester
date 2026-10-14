@@ -1,0 +1,5 @@
+# Members of the Cellar Formex 4 zip recorded in dsa_fetch.yaml (CELEX 32022R2065).
+# Generated from the recorded body; regenerate whenever the cassette is re-recorded.
+zip a65366578bc1738b77bcdb3bff847780e19d65869cd2c2b545638ca687c5349e 108735
+member L_2022277EN.01000101.doc.xml 1520 8979b43fe0e03a9337cf1b42259d458f86970d8b9f3ff1ca6aca548e75939a49 DOC
+member L_2022277EN.01000101.xml 498033 397e488ee00c3468499fecd0a08aa738cb82981632abb73129e0c02eeea0cf18 ACT
