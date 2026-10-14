@@ -8,6 +8,6 @@ refresh:
   cadence: weekly
 pipeline:
   fetcher: fetchers.eurlex.EurLexFetcher
-  celex_id: 02024R1689-20240712
+  celex_id: 32024R1689
   cleaner: cleaners.xml_akn.AKNXMLCleaner
   chunker: chunkers.sectioned.SectionedChunker

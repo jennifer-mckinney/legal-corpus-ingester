@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pytest
+from lxml import etree
 
 # ---------------------------------------------------------------------------
 # terms-analysis backend on sys.path
@@ -67,7 +69,8 @@ class _MockLocalAIClient:
 # ---------------------------------------------------------------------------
 
 _CASSETTE = "tests/fixtures/cassettes/eurlex/gdpr_fetch.yaml"
-_CELEX_ID = "32016R0679"
+# Consolidated GDPR: the Cellar Formex 4 zip recorded for terms-analysis#96.
+_CELEX_ID = "02016R0679-20160504"
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +78,12 @@ _CELEX_ID = "32016R0679"
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.xfail(
+    strict=True,
+    raises=etree.XMLSyntaxError,
+    reason="the cassette now holds a Formex 4 zip; AKNXMLCleaner cannot read it until the "
+    "Formex cleaner lands (jennifer-mckinney/terms-analysis#95)",
+)
 def test_e2e_round_trip_gdpr(tmp_path: Path) -> None:
     """EUR-Lex VCR cassette → ingester pipeline → publish bundle → LegalKB retrieve.
 

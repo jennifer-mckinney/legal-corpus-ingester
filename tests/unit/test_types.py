@@ -59,6 +59,18 @@ def test_fetch_result_valid_mime_type() -> None:
     assert fr.mime_type == "text/html"
 
 
+def test_fetch_result_accepts_zip_mime_type() -> None:
+    """terms-analysis#96: Cellar serves the act as a Formex 4 zip; the raw fetch keeps it."""
+    fr = FetchResult(
+        source_name="eurlex",
+        raw_bytes=b"PK\x03\x04",
+        mime_type="application/zip",
+        upstream_metadata={"celex_id": "32024R1689"},
+        provenance=_PROV,
+    )
+    assert fr.mime_type == "application/zip"
+
+
 def test_fetch_result_invalid_mime_type_raises() -> None:
     try:
         FetchResult(

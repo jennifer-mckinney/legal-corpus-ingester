@@ -1,0 +1,25 @@
+# Caps and tunables for the Cellar Formex 4 fetcher (fetchers/cellar.py, terms-analysis#96).
+# Every cap must be a positive integer; the loader refuses anything else.
+# Real packages probed 2026-10-13: AI Act 171,490-byte zip with 16 members,
+# DSA 108,735 bytes, GDPR (consolidated) 51,496 bytes.
+
+# Largest zip body accepted from the second hop, checked while streaming.
+max_zip_bytes: 20971520
+# Most members one package may hold (the AI Act has 16).
+max_members: 64
+# Largest single unzipped member. Must stay at or below the XML cleaner's
+# MAX_XML_BYTES, because each member is later parsed as XML.
+max_member_bytes: 20971520
+# Largest sum of all unzipped members.
+max_total_bytes: 67108864
+# Highest uncompressed / compressed ratio for any member (zip-bomb guard).
+max_ratio: 100
+
+# Tunables (lead ruling on 565e280: no hard-coded values). The Cellar host, the
+# /resource/celex/ base and the redirect pattern are NOT here on purpose: they are
+# the fetcher's SSRF allowlist and stay code constants; the loader refuses such keys.
+# Seconds allowed for each request phase (connect, read, write, pool). 0 < value <= 120.
+timeout_seconds: 30
+# Most Cellar requests per second for the whole process (every hop, retry, fetch and
+# fetcher instance). The promise to EUR-Lex is at most 0.5; 0.01 <= value <= 0.5.
+rate_limit_rps: 0.5

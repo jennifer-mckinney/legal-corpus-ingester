@@ -36,6 +36,9 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"legal_corpus_ingester.fetchers" = ["cellar.yaml"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --cov=src/legal_corpus_ingester --cov-report=term-missing"

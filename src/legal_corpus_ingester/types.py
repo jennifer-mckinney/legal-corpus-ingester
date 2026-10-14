@@ -9,6 +9,7 @@ VALID_MIME_TYPES: frozenset[str] = frozenset({
     "application/pdf",
     "application/xml",
     "text/plain",
+    "application/zip",
 })
 
 
