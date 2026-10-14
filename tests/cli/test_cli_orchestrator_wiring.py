@@ -56,6 +56,7 @@ import hashlib
 import importlib
 import importlib.util
 import inspect
+import io
 import json
 import os
 import pkgutil
@@ -66,6 +67,7 @@ import subprocess
 import sys
 import unicodedata
 import warnings
+import zipfile
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -93,7 +95,7 @@ from legal_corpus_ingester.errors import (
     UpstreamNotFoundError,
 )
 from legal_corpus_ingester.fetchers import eurlex as eurlex_fetcher
-from legal_corpus_ingester.fetchers.eurlex import EURLEX_BASE_URL
+from legal_corpus_ingester.fetchers.eurlex import CELEX_BASE_URL
 from legal_corpus_ingester.pipeline.approval_gate import (
     _PLACEHOLDER_SHA,
     EXPIRY_WARNING_DAYS,
@@ -122,12 +124,62 @@ def _invoke(args: list[str]) -> Result:
 _REPO = Path(__file__).resolve().parents[2]
 _REPO_SOURCES = _REPO / "config" / "sources"
 _REPO_APPROVALS = _REPO / "config" / "approvals"
-# The AKN sample the cleaner and chunker tests use; served as the EUR-Lex XML body.
-_AKN_SAMPLE = _REPO / "tests" / "fixtures" / "corpus" / "gdpr_akn_sample.xml"
 # Ruling 1: Tier 1. Every other repo source stays unsigned (placeholder SHA) in these tests.
 _TIER1 = ("eurlex_gdpr", "eurlex_ai_act", "eurlex_dsa")
-_EURLEX_HOST = urlparse(EURLEX_BASE_URL).hostname
+_CELLAR_HOST = urlparse(CELEX_BASE_URL).hostname
 _ENV_PREFIX = str(Settings.model_config["env_prefix"])
+
+
+def _cellar_replays() -> dict[str, tuple[str, bytes]]:
+    replays: dict[str, tuple[str, bytes]] = {}
+    cassette_dir = _REPO / "tests" / "fixtures" / "cassettes" / "eurlex"
+    for path in cassette_dir.glob("*_fetch.yaml"):
+        interactions = yaml.safe_load(path.read_text(encoding="utf-8"))["interactions"]
+        redirect, download = interactions
+        celex = urlparse(redirect["request"]["uri"]).path.rsplit("/", 1)[-1]
+        location = redirect["response"]["headers"]["location"][0]
+        body = download["response"]["body"]["string"]
+        assert isinstance(body, bytes), path
+        replays[celex] = (location, body)
+    return replays
+
+
+_CELLAR_REPLAYS = _cellar_replays()
+
+
+def _fixture_cellar_bodies() -> dict[str, bytes]:
+    sources = load_all(_REPO_SOURCES)
+    bodies = {celex: body for celex, (_location, body) in _CELLAR_REPLAYS.items()}
+    dsa_body = bodies["32022R2065"]
+    for name, config in sources.items():
+        celex = config.pipeline.celex_id
+        if celex in bodies:
+            continue
+        year, number = celex[1:5], celex[-4:]
+        with zipfile.ZipFile(io.BytesIO(dsa_body)) as source:
+            output = io.BytesIO()
+            with zipfile.ZipFile(output, "w") as target:
+                for info in source.infolist():
+                    content = source.read(info.filename)
+                    content = content.replace(b"<YEAR>2022</YEAR>", f"<YEAR>{year}</YEAR>".encode())
+                    content = content.replace(
+                        b"<NO.CURRENT>2065</NO.CURRENT>",
+                        f"<NO.CURRENT>{number}</NO.CURRENT>".encode(),
+                    )
+                    target.writestr(info, content)
+        bodies[celex] = output.getvalue()
+    return bodies
+
+
+_CELLAR_BODIES = _fixture_cellar_bodies()
+
+
+def _cellar_location(celex: str) -> str:
+    replay = _CELLAR_REPLAYS.get(celex)
+    if replay is not None:
+        return replay[0]
+    serial = sorted(_CELLAR_BODIES).index(celex) + 1
+    return f"http://publications.europa.eu/resource/cellar/00000000-0000-0000-0000-{serial:012d}/zip"
 
 # Exit codes whose public meaning is false for "no source ran" and for "a source failed".
 # EXIT_NOT_WIRED is the red today; EXIT_NO_SOURCES says the dir "holds no source", which is
@@ -235,15 +287,20 @@ class _Workspace:
     localai_model: str
     body: bytes
     today: date
+    source_bodies: dict[str, bytes] = field(default_factory=dict)
 
     @property
     def body_sha(self) -> str:
         return hashlib.sha256(self.body).hexdigest()
 
+    def body_for_source(self, name: str) -> bytes:
+        celex = load_all(self.sources)[name].pipeline.celex_id
+        return self.source_bodies[celex]
+
     def approval(self, name: str, **overrides: Any) -> dict[str, Any]:
         data: dict[str, Any] = {
             "source_id": name,
-            "signed_artifact_sha256": self.body_sha,
+            "signed_artifact_sha256": hashlib.sha256(self.body_for_source(name)).hexdigest(),
             # Past the warning window so a signed approval raises no expiry warning.
             "expiry": (self.today + timedelta(days=EXPIRY_WARNING_DAYS + 30)).isoformat(),
             "approved_by": "reviewer@example.invalid",
@@ -292,8 +349,9 @@ def _make_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, signed: tup
         state=tmp_path / "state-from-env",
         localai_url=localai_url,
         localai_model=localai_model,
-        body=_AKN_SAMPLE.read_bytes(),
+        body=_CELLAR_BODIES["02016R0679-20160504"],
         today=date.today(),
+        source_bodies=_CELLAR_BODIES,
     )
     monkeypatch.setenv(_env("config_dir"), str(config))
     monkeypatch.setenv(_env("out_dir"), str(ws.out))
@@ -359,7 +417,7 @@ class _Spy:
         if source_name in self.amended:
             text += " Amended under test."
         provenance = ProvenanceRecord(
-            source_url=f"https://{_EURLEX_HOST}/spy/{source_name}",
+            source_url=f"https://{_CELLAR_HOST}/spy/{source_name}",
             fetch_timestamp=_SPY_FETCHED_AT,
             license="CC-BY-4.0",
             upstream_version=None,
@@ -437,21 +495,42 @@ class _Net:
     upstream: _Workspace | None = None
     # URL -> body served to the sync client (audit-license's live licence fetch).
     licence_pages: dict[str, bytes] = field(default_factory=dict)
-    # CELEX ids EUR-Lex answers 404 for: one source's fetch fails, the others are served.
+    # CELEX ids Cellar answers 404 for: one source's fetch fails, the others are served.
     missing_celex: set[str] = field(default_factory=set)
-    # CELEX id -> XML body served instead of the workspace body (one source's text changed).
+    # CELEX id -> ZIP body served instead of the workspace body (one source's text changed).
     bodies: dict[str, bytes] = field(default_factory=dict)
 
     def handle(self, request: httpx.Request) -> httpx.Response:
         url = request.url
         ws = self.upstream
         if ws is not None:
-            if url.host == _EURLEX_HOST and "/XML/" in url.path and request.method == "GET":
+            if url.host == _CELLAR_HOST and request.method == "GET":
                 self.served.append(request)
-                celex = str(url.params.get("uri", "")).removeprefix("CELEX:")
-                if celex in self.missing_celex:
-                    return httpx.Response(404, request=request)
-                return httpx.Response(200, content=self.bodies.get(celex, ws.body), request=request)
+                if url.path.startswith("/resource/celex/"):
+                    celex = url.path.rsplit("/", 1)[-1]
+                    if celex in self.missing_celex:
+                        return httpx.Response(404, request=request)
+                    if celex not in ws.source_bodies:
+                        return httpx.Response(404, request=request)
+                    return httpx.Response(
+                        303, headers={"Location": _cellar_location(celex)}, request=request
+                    )
+                if url.path.startswith("/resource/cellar/") and url.path.endswith("/zip"):
+                    celex = next(
+                        (
+                            name
+                            for name in ws.source_bodies
+                            if urlparse(_cellar_location(name)).path == url.path
+                        ),
+                        None,
+                    )
+                    if celex is not None:
+                        return httpx.Response(
+                            200,
+                            headers={"Content-Type": "application/zip"},
+                            content=self.bodies.get(celex, ws.source_bodies[celex]),
+                            request=request,
+                        )
             if request.method == "POST" and str(url) == ws.localai_url.rstrip("/") + "/embeddings":
                 self.served.append(request)
                 payload = json.loads(request.content)
@@ -463,13 +542,13 @@ class _Net:
 
     def eurlex_celex_ids(self) -> set[str]:
         return {
-            str(r.url.params.get("uri", "")).removeprefix("CELEX:")
+            r.url.path.rsplit("/", 1)[-1]
             for r in self.served
-            if r.url.host == _EURLEX_HOST
+            if r.url.host == _CELLAR_HOST and r.url.path.startswith("/resource/celex/")
         }
 
     def embed_requests(self) -> list[httpx.Request]:
-        return [r for r in self.served if r.url.host != _EURLEX_HOST]
+        return [r for r in self.served if r.url.host != _CELLAR_HOST]
 
 
 @pytest.fixture
@@ -678,7 +757,7 @@ def test_orchestrator_dirs_come_from_settings(ws_all: _Workspace, spy: _Spy, net
 
 
 def test_fetch_end_to_end_uses_settings_for_localai_and_dirs(ws: _Workspace, net: _Net) -> None:
-    # The real Orchestrator behind a fake transport: EUR-Lex XML and LocalAI are served only
+    # The real Orchestrator behind a fake transport: Cellar Formex and LocalAI are served only
     # at the env-configured URL, so a literal default URL or dir fails here.
     net.upstream = ws
     result = _invoke(ws.argv("fetch", "eurlex_gdpr"))
@@ -1028,10 +1107,24 @@ def test_identical_second_refresh_publishes_nothing_new(ws_all: _Workspace, net:
 
 
 def _changed_body(body: bytes) -> bytes:
-    # One more sentence inside the first paragraph: the cleaned text, and so a chunk, changes.
-    changed = body.replace(b"</p>", b" Amended under test.</p>", 1)
-    assert changed != body, "the fixture has no paragraph to change"
-    return changed
+    # Change one Formex paragraph while keeping a valid ZIP for the Cellar validator.
+    output = io.BytesIO()
+    changed = False
+    with zipfile.ZipFile(io.BytesIO(body)) as source:
+        with zipfile.ZipFile(output, "w") as target:
+            for info in source.infolist():
+                content = source.read(info.filename)
+                if (
+                    not changed
+                    and not info.filename.endswith(".doc.xml")
+                    and ".toc." not in info.filename
+                ):
+                    amended = content.replace(b"</P>", b" Amended under test.</P>", 1)
+                    changed = amended != content
+                    content = amended
+                target.writestr(info, content)
+    assert changed, "the fixture has no Formex paragraph to change"
+    return output.getvalue()
 
 
 @pytest.mark.parametrize("between_runs", ["keep-current", "current-removed"])
@@ -1044,7 +1137,7 @@ def test_changed_second_refresh_publishes_a_new_version_detect_reports_changed(
     ws = ws_all
     v1, v1_digest = _first_run_recorded(ws, net)
     victim = _repo_names()[0]
-    changed = _changed_body(ws.body)
+    changed = _changed_body(ws.body_for_source(victim))
     net.bodies[load_all(ws.sources)[victim].pipeline.celex_id] = changed
     ws.sign(victim, signed_artifact_sha256=hashlib.sha256(changed).hexdigest())
     if between_runs == "current-removed":
@@ -1509,7 +1602,7 @@ def test_weekly_runs_with_an_uncached_out_dir_alert_only_on_new_content(
     ws = ws_all
     net.upstream = ws
     names = _repo_names()
-    changed = _changed_body(ws.body)
+    changed = _changed_body(ws.body_for_source(names[0]))
     weeks = [("identical", "true"), ("identical", "false"), ("changed", "true"), ("identical", "false")]
     versions: list[str] = []
     for week, (content, alert) in enumerate(weeks):
@@ -1820,13 +1913,20 @@ def test_refresh_dry_run_real_pipeline_stays_offline(ws: _Workspace, net: _Net) 
 
 
 def test_fetched_artifact_must_match_the_signed_sha(ws: _Workspace, net: _Net) -> None:
-    # A signed approval for a different artifact: the fetched body must not be embedded or
-    # published (the SHA check can only run after the fetch).
+    # The valid Cellar redirect and ZIP are fetched and validated, but their signed SHA differs,
+    # so the artifact must not be embedded or published.
     ws.sign("eurlex_gdpr", signed_artifact_sha256=hashlib.sha256(b"another artifact").hexdigest())
     net.upstream = ws
     result = _invoke(ws.argv("fetch", "eurlex_gdpr"))
     _assert_failed_loudly(result)
     assert "eurlex_gdpr" in _output(result), _why(result)
+    celex = load_all(ws.sources)["eurlex_gdpr"].pipeline.celex_id
+    cellar_requests = [request for request in net.served if request.url.host == _CELLAR_HOST]
+    assert [request.url.path for request in cellar_requests] == [
+        f"/resource/celex/{celex}",
+        urlparse(_cellar_location(celex)).path,
+    ], cellar_requests
+    assert "LegalReviewGateError" in result.stderr, _why(result)
     assert net.embed_requests() == []
     assert list(ws.out.rglob(MANIFEST_FILENAME)) == []
     state = CheckpointStore(ws.state).load("eurlex_gdpr")
