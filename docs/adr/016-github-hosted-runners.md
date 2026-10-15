@@ -26,8 +26,8 @@ download path ends in `mkdir: /Users/runner: Permission denied`. Issue #19 liste
 Option (a) was written up as `docs/runbooks/self-hosted-runner-python.md` (PR #69 commit
 `66b56c3`) and executed on 2026-10-10. The local seed completed and verified, but the dispatched
 `health.yml` run (38071582790, on the exact tip) still reported `Version 3.14 was not found in
-the local cache` and failed on the same `mkdir`. The read-only diagnosis in
-`docs/evidence/2026-10-10-runner-toolcache-seed.md` shows why: setup-python v5.6.0's `run()`
+the local cache` and failed on the same `mkdir: /Users/runner: Permission denied`. A read-only
+diagnosis of that run found why: setup-python v5.6.0's `run()`
 (`dist/setup/index.js`, the `if (IS_MAC)` block) sets
 `AGENT_TOOLSDIRECTORY=/Users/runner/hostedtoolcache` unconditionally on macOS and copies it into
 `RUNNER_TOOL_CACHE` before any cache lookup. A seed under `_work/_tool` is never consulted, and
@@ -83,5 +83,7 @@ unchanged: moving CI does not move inference.
   `cd ~/actions-runner-legal-corpus && ./svc.sh stop && ./svc.sh uninstall && ./config.sh remove --token <removal-token>`,
   delete the seeded `_work/_tool/Python/3.14.3`, and remove the runner from the repository's
   settings if `config.sh remove` did not. Until then the runner stays registered and idle.
-- `docs/evidence/2026-10-10-runner-toolcache-seed.md` remains as the record of the option (a)
-  attempt; the runbook it executed is deleted rather than corrected.
+- The evidence file for the option (a) attempt was removed from the repository for privacy on
+  2026-10-14 (PR #117). The facts above (the `IS_MAC` override, the `mkdir: /Users/runner`
+  failure) are inlined here, and the Actions log of run 38071582790 is the remaining record.
+  The runbook option (a) executed is deleted rather than corrected.
