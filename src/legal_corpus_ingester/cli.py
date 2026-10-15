@@ -127,10 +127,8 @@ _EXIT_MEANINGS: dict[int, str] = {
         "validate-round-trip could not import the terms-analysis consumer, so the bundle was"
         " not verified end to end"
     ),
-    # Scoped: every --sources-dir command but `sources list`, which prints that nothing is
-    # configured and exits 0 (owner ruling 2026-10-12: an empty dir is "no source", not an
-    # unknown one, for fetch and audit-license too).
-    EXIT_NO_SOURCES: "the sources dir loads but holds no source (fetch, refresh, status, audit-license)",
+    # Every --sources-dir command reports an empty source directory with this code.
+    EXIT_NO_SOURCES: "the sources dir loads but holds no source (fetch, refresh, status, sources list, audit-license)",
     EXIT_SOURCES_DIR_MISSING: "the --sources-dir path does not exist or is not a directory",
     EXIT_NO_APPROVED_SOURCES: (
         "no requested source holds a valid approval, so nothing ran (fetch, refresh)"
@@ -823,9 +821,8 @@ def init(
     "list",
     help=(
         "List all configured sources (name + jurisdiction).\n\n"
-        f"Exit codes: 0 when the sources dir loads (one line per source, or '{MSG_NO_SOURCES}.'"
-        " when it holds none); "
-        + _exit_code_clauses((EXIT_SOURCES_DIR_MISSING, EXIT_LOAD_ERROR))
+        "Exit codes: 0 when sources are configured (one line per source); "
+        + _exit_code_clauses((EXIT_NO_SOURCES, EXIT_SOURCES_DIR_MISSING, EXIT_LOAD_ERROR))
         + "."
     ),
 )
@@ -846,8 +843,8 @@ def sources_list(
         raise typer.Exit(code=EXIT_LOAD_ERROR)
 
     if not registry:
-        typer.echo("No sources configured.")
-        return
+        typer.echo(f"{MSG_NO_SOURCES} in --sources-dir; nothing to list.", err=True)
+        raise typer.Exit(code=EXIT_NO_SOURCES)
 
     # Print a simple table
     name_w = max(len(name) for name in registry) + 2
