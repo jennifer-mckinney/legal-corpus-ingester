@@ -46,7 +46,7 @@ def test_sources_list_no_sources(tmp_path: object, monkeypatch: object) -> None:
     monkeypatch.chdir(tmp_path)  # type: ignore[attr-defined]
     (tmp_path / "config" / "sources").mkdir(parents=True)  # type: ignore[operator]
     result = runner.invoke(app, ["sources", "list"])
-    assert result.exit_code == 0
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_NO_SOURCES"]
     assert "No sources" in result.output
 
 
@@ -559,8 +559,8 @@ def test_top_level_help_lists_every_exit_code() -> None:
 # Before the fold-in they exited 1 through load_all ("Sources directory not found: <path>"), which
 # also echoed the path. A second ruling the same day gives an existing dir that holds no source
 # "its own error code ... 'no source'": fetch and audit-license exit EXIT_NO_SOURCES there, like
-# status and refresh. `sources list` on that dir still prints "No sources configured." and exits
-# 0, fetch of an unsigned source on a valid dir exits EXIT_NO_APPROVED_SOURCES (terms-analysis#93),
+# status and refresh. `sources list` on that dir exits EXIT_NO_SOURCES with an error message,
+# fetch of an unsigned source on a valid dir exits EXIT_NO_APPROVED_SOURCES (terms-analysis#93),
 # and an unknown source in a configured dir is 1.
 
 _DIR_MISSING_CASES = tuple(c for c in _STATUS_CASES if c.kind == "dir_missing")
@@ -653,17 +653,18 @@ def test_default_sources_dir_in_empty_cwd_is_dir_missing(
 
 
 @pytest.mark.parametrize("case", _NO_SOURCES_CASES, ids=[c.id for c in _NO_SOURCES_CASES])
-def test_sources_list_existing_empty_dir_still_exits_zero(
+def test_sources_list_existing_empty_dir_exits_no_sources(
     case: _StatusCase, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Positive control (green today): the owner did not change `sources list` on an existing dir
-    # that holds no source. It is not EXIT_NO_SOURCES and not EXIT_SOURCES_DIR_MISSING.
+    # An existing sources directory with no source configuration is an error.
     monkeypatch.chdir(tmp_path)
     sources_arg, _, _ = case.build(tmp_path)
     result = runner.invoke(app, sources_dir_argv("sources list", sources_arg, tmp_path, ""))
-    assert result.exit_code == 0, (result.exit_code, result.stdout, result.stderr)
-    assert result.stdout.splitlines() == [f"{_NO_SOURCES_MSG}."], result.stdout
-    assert result.stderr == ""
+    assert result.exit_code == PUBLIC_EXIT_CODES["EXIT_NO_SOURCES"], (
+        result.exit_code, result.stdout, result.stderr
+    )
+    assert result.stdout == ""
+    assert result.stderr == f"{_NO_SOURCES_MSG} in --sources-dir; nothing to list.\n"
 
 
 @pytest.mark.parametrize("command", ["fetch", "audit-license"])
@@ -746,7 +747,7 @@ _COMMAND_HELP_CODES: dict[str, tuple[str, ...]] = {
         "EXIT_SOURCES_DIR_MISSING",
         "EXIT_LOAD_ERROR",
     ),
-    "sources list": ("EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
+    "sources list": ("EXIT_NO_SOURCES", "EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
     "audit-license": ("EXIT_NO_SOURCES", "EXIT_SOURCES_DIR_MISSING", "EXIT_LOAD_ERROR"),
 }
 
@@ -762,9 +763,7 @@ def test_sources_dir_command_help_documents_exit_codes(command: str) -> None:
     for code, clause in clauses:
         if int(code) == 0:
             if command == "sources list":
-                # Honest about the one outcome that differs from status / refresh: an existing
-                # empty dir is a 0 with "No sources configured.", not EXIT_NO_SOURCES.
-                assert _NO_SOURCES_MSG in clause, (code, clause)
+                assert "sources are configured" in clause, (code, clause)
             if command == "refresh":
                 # terms-analysis#93 decision B: an unsigned source fails the run, so 0 needs
                 # every configured source approved, not just "every approved source published".
@@ -794,13 +793,12 @@ def test_top_level_exit_code_scope_matches_commands(tmp_path: Path, monkeypatch:
         "EXIT_NO_SOURCES": str(tmp_path / "empty"),
         "EXIT_NO_APPROVED_SOURCES": str(_REPO_SOURCES),
     }
-    # The behaviour the owner ruled (2026-10-12), so the scope cannot be satisfied by moving the
-    # help and the code together in the wrong direction: 6 on every command, 5 ("no source") on
-    # every command but `sources list` (an empty listing is exit 0), 7 where the pipeline runs
+    # The scope must match the observed behavior: 6 for missing directories, 5 for every empty
+    # source directory, and 7 where the pipeline runs but no source is approved.
     # and no source is approved (terms-analysis#93; it replaced 3, which no command exits now).
     expected_scope = {
         "EXIT_SOURCES_DIR_MISSING": set(SOURCES_DIR_COMMANDS),
-        "EXIT_NO_SOURCES": set(SOURCES_DIR_COMMANDS) - {"sources list"},
+        "EXIT_NO_SOURCES": set(SOURCES_DIR_COMMANDS),
         "EXIT_NO_APPROVED_SOURCES": {"fetch", "refresh"},
     }
     assert set(expected_scope) == set(triggers)
