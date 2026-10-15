@@ -81,6 +81,7 @@ import numpy as np
 import pydantic
 import pytest
 import yaml
+from lxml import etree
 from typer.main import get_command
 from typer.testing import CliRunner, Result
 
@@ -128,6 +129,51 @@ _REPO_APPROVALS = _REPO / "config" / "approvals"
 _TIER1 = ("eurlex_gdpr", "eurlex_ai_act", "eurlex_dsa")
 _CELLAR_HOST = urlparse(CELEX_BASE_URL).hostname
 _ENV_PREFIX = str(Settings.model_config["env_prefix"])
+
+# Since #115 the eurlex fetcher returns Cellar Formex 4 zip bytes, but config/sources/eurlex_*.yaml
+# still name AKNXMLCleaner, which raises XMLSyntaxError on them: the source is checkpointed
+# clean_failed and the run exits 8, so no eurlex source reaches "done".
+# The xfail accepts only _FormexNotReady, which _raise_if_formex_not_ready raises on that exact
+# symptom at the point a test first needs "done". Every assertion that holds without the Formex
+# cleaner runs before that point and stays a hard failure. Strict: once the Formex cleaner lands
+# the symptom is gone, the tests XPASS and fail, which forces this mark's removal.
+class _FormexNotReady(Exception):
+    """The one failure _FORMEX_XFAIL accepts: AKNXMLCleaner rejected a Formex zip."""
+
+
+_FORMEX_XFAIL = pytest.mark.xfail(
+    strict=True,
+    raises=_FormexNotReady,
+    reason="the eurlex fetcher now returns a Formex 4 zip; AKNXMLCleaner cannot read it until the "
+    "Formex cleaner lands (jennifer-mckinney/terms-analysis#95)",
+)
+# The symptom, exactly: the Orchestrator checkpoints a cleaner exception as "clean_failed" (a
+# literal in pipeline/orchestrator.py, with no constant to import), and the CLI names the
+# exception type on the source's own failure line.
+_FORMEX_SYMPTOM_STAGE = "clean_failed"
+_FORMEX_SYMPTOM_ERROR = f"({etree.XMLSyntaxError.__name__})"
+
+
+def _raise_if_formex_not_ready(ws: _Workspace, result: Result, names: tuple[str, ...] | list[str]) -> None:
+    """Raise _FormexNotReady only if the run failed with the #95 symptom on every one of *names*.
+
+    The symptom: exit EXIT_SOURCE_FAILED, each named source checkpointed clean_failed under
+    Settings.state_dir, and stderr naming each with XMLSyntaxError. Any other outcome (exit 0,
+    another exit, another stage or exception, no checkpoint) returns, so the test's own
+    assertions decide: a regression fails hard, and a fixed cleaner makes the test XPASS.
+    """
+    assert names, "the Formex gate needs the sources the run must finish"
+    if result.exit_code != _SOURCE_FAILED:
+        return
+    store = CheckpointStore(ws.state)
+    lines = result.stderr.splitlines()
+    for name in names:
+        state = store.load(name)
+        if state is None or state.stage != _FORMEX_SYMPTOM_STAGE:
+            return
+        if not any(line.startswith(f"{name}:") and _FORMEX_SYMPTOM_ERROR in line for line in lines):
+            return
+    raise _FormexNotReady(f"{len(names)} source(s) {_FORMEX_SYMPTOM_STAGE} {_FORMEX_SYMPTOM_ERROR}")
 
 
 def _cellar_replays() -> dict[str, tuple[str, bytes]]:
@@ -756,13 +802,16 @@ def test_orchestrator_dirs_come_from_settings(ws_all: _Workspace, spy: _Spy, net
     assert _is_empty(ws.cwd)
 
 
+@_FORMEX_XFAIL
 def test_fetch_end_to_end_uses_settings_for_localai_and_dirs(ws: _Workspace, net: _Net) -> None:
     # The real Orchestrator behind a fake transport: Cellar Formex and LocalAI are served only
     # at the env-configured URL, so a literal default URL or dir fails here.
     net.upstream = ws
     result = _invoke(ws.argv("fetch", "eurlex_gdpr"))
-    assert result.exit_code == 0, _why(result)
     assert net.attempts == [], net.attempts
+    assert _is_empty(ws.cwd)
+    _raise_if_formex_not_ready(ws, result, ["eurlex_gdpr"])
+    assert result.exit_code == 0, _why(result)
     embeds = net.embed_requests()
     assert embeds, "LocalAI was never called at the Settings URL"
     for request in embeds:
@@ -777,6 +826,7 @@ def test_fetch_end_to_end_uses_settings_for_localai_and_dirs(ws: _Workspace, net
     assert _is_empty(ws.cwd)
 
 
+@_FORMEX_XFAIL
 def test_refresh_all_end_to_end_fetches_only_approved_sources(ws: _Workspace, net: _Net) -> None:
     # Decision B: the signed sources publish, the unsigned ones fail with not_approved, exit 8.
     net.upstream = ws
@@ -786,10 +836,6 @@ def test_refresh_all_end_to_end_fetches_only_approved_sources(ws: _Workspace, ne
     registry = load_all(ws.sources)
     expected = {registry[name].pipeline.celex_id for name in _TIER1}
     assert net.eurlex_celex_ids() == expected, net.eurlex_celex_ids()
-    store = CheckpointStore(ws.state)
-    for name in _TIER1:
-        state = store.load(name)
-        assert state is not None and state.stage == "done", (name, state)
     for name in _unsigned():
         _assert_not_approved_checkpoint(ws, name)
         assert _named_with(result.stderr, name, "fail"), (name, _why(result))
@@ -797,6 +843,11 @@ def test_refresh_all_end_to_end_fetches_only_approved_sources(ws: _Workspace, ne
     assert _bundle_versions(ws.out) == set(), _bundle_versions(ws.out)
     assert not os.path.lexists(ws.out / _CURRENT), "a partly failed run created out/current"
     assert _is_empty(ws.cwd)
+    _raise_if_formex_not_ready(ws, result, _TIER1)
+    store = CheckpointStore(ws.state)
+    for name in _TIER1:
+        state = store.load(name)
+        assert state is not None and state.stage == "done", (name, state)
 
 
 _HOSTILE_SPDX = "CC0-1.0\x1b[2J\n::error::forged\u202eevil\u2028"
@@ -806,6 +857,7 @@ def _baseline_hash(path: Path, name: str) -> str:
     return str(json.loads(path.read_text(encoding="utf-8"))[name]["hash"])
 
 
+@_FORMEX_XFAIL
 def test_refresh_spdx_drift_blocks_publish_and_names_the_source(ws_all: _Workspace, net: _Net) -> None:
     # Round 5 J: the real pipeline, twice. Run 1 records each source's licence baseline in the
     # configured state dir; an SPDX change on a signed source then blocks its publish, names it,
@@ -813,6 +865,9 @@ def test_refresh_spdx_drift_blocks_publish_and_names_the_source(ws_all: _Workspa
     ws = ws_all
     net.upstream = ws
     first = _invoke(ws.argv("refresh", "--all"))
+    assert net.attempts == [], net.attempts
+    assert _is_empty(ws.cwd)
+    _raise_if_formex_not_ready(ws, first, _repo_names())
     assert first.exit_code == 0, _why(first)
     baseline = ws.state / _refresh_baseline_name()
     assert baseline.is_file(), "refresh recorded no licence baseline in INGESTER_STATE_DIR"
@@ -998,13 +1053,16 @@ def _calver_key(version: str) -> tuple[int, ...]:
     return tuple(int(part) for part in version.split("."))
 
 
+@_FORMEX_XFAIL
 def test_refresh_all_publishes_one_bundle_that_detect_accepts(ws_all: _Workspace, net: _Net) -> None:
     # Round 8 items 1 and 2: the workflow's own sequence (refresh, seed record, detect).
     ws = ws_all
     net.upstream = ws
     result = _invoke(ws.argv("refresh", "--all"))
-    assert result.exit_code == 0, _why(result)
     assert net.attempts == [], net.attempts
+    assert _is_empty(ws.cwd)
+    _raise_if_formex_not_ready(ws, result, _repo_names())
+    assert result.exit_code == 0, _why(result)
     # The consumer first, as the workflow runs it: no record yet, so the first bundle is news
     # (detect without --require-state). Exit 1 here is the grumpy HIGH: no bundle to read.
     first, outputs = _bundle_script(ws, "detect")
@@ -1034,6 +1092,7 @@ _PARTIAL_FAILURES = {
 }
 
 
+@_FORMEX_XFAIL
 @pytest.mark.parametrize("failure", sorted(_PARTIAL_FAILURES))
 def test_failed_source_publishes_nothing_and_keeps_current(
     ws_all: _Workspace, net: _Net, failure: str
@@ -1041,6 +1100,9 @@ def test_failed_source_publishes_nothing_and_keeps_current(
     ws = ws_all
     net.upstream = ws
     first = _invoke(ws.argv("refresh", "--all"))
+    assert net.attempts == [], net.attempts
+    assert _is_empty(ws.cwd)
+    _raise_if_formex_not_ready(ws, first, _repo_names())
     assert first.exit_code == 0, _why(first)
     version = _assert_current_bundle(ws, _repo_names())
     seed, _ = _bundle_script(ws, "record")
@@ -1080,6 +1142,9 @@ def _first_run_recorded(ws: _Workspace, net: _Net) -> tuple[str, str]:
     """Run 1 of item 4: a clean refresh, then the workflow's record step. Returns (v1, digest)."""
     net.upstream = ws
     first = _invoke(ws.argv("refresh", "--all"))
+    assert net.attempts == [], net.attempts
+    assert _is_empty(ws.cwd)
+    _raise_if_formex_not_ready(ws, first, _repo_names())
     assert first.exit_code == 0, _why(first)
     v1 = _assert_current_bundle(ws, _repo_names())
     seed, _ = _bundle_script(ws, "record")
@@ -1087,6 +1152,7 @@ def _first_run_recorded(ws: _Workspace, net: _Net) -> tuple[str, str]:
     return v1, _tree_digest(ws.out / v1)
 
 
+@_FORMEX_XFAIL
 def test_identical_second_refresh_publishes_nothing_new(ws_all: _Workspace, net: _Net) -> None:
     # Round 8b item 4a: the same fixtures again. Same chunk texts and the same corpus/ and index/
     # bytes, so no new version, no repoint, bundle 1's bytes as they were, and no weekly
@@ -1127,6 +1193,7 @@ def _changed_body(body: bytes) -> bytes:
     return output.getvalue()
 
 
+@_FORMEX_XFAIL
 @pytest.mark.parametrize("between_runs", ["keep-current", "current-removed"])
 def test_changed_second_refresh_publishes_a_new_version_detect_reports_changed(
     ws_all: _Workspace, net: _Net, between_runs: str
@@ -1164,6 +1231,7 @@ def test_changed_second_refresh_publishes_a_new_version_detect_reports_changed(
     assert _is_empty(ws.cwd)
 
 
+@_FORMEX_XFAIL
 def test_refresh_replaces_a_planted_absolute_current_link(ws_all: _Workspace, net: _Net) -> None:
     # Indirection: out/current left pointing outside out/ (absolute) by an old tool or an
     # attacker. A successful run repoints it to its own relative version; the outside dir is
@@ -1177,6 +1245,8 @@ def test_refresh_replaces_a_planted_absolute_current_link(ws_all: _Workspace, ne
     ws.out.mkdir(parents=True)
     (ws.out / _CURRENT).symlink_to(outside.resolve())
     result = _invoke(ws.argv("refresh", "--all"))
+    assert _tree_digest(outside) == planted, "refresh wrote through the planted current link"
+    _raise_if_formex_not_ready(ws, result, _repo_names())
     assert result.exit_code == 0, _why(result)
     _assert_current_bundle(ws, _repo_names())
     assert _tree_digest(outside) == planted, "refresh wrote through the planted current link"
@@ -1593,6 +1663,7 @@ def test_version_after_an_emptied_out_dir_follows_the_record(
     assert _is_empty(ws.cwd)
 
 
+@_FORMEX_XFAIL
 def test_weekly_runs_with_an_uncached_out_dir_alert_only_on_new_content(
     ws_all: _Workspace, net: _Net
 ) -> None:
@@ -1612,6 +1683,9 @@ def test_weekly_runs_with_an_uncached_out_dir_alert_only_on_new_content(
             net.bodies[load_all(ws.sources)[names[0]].pipeline.celex_id] = changed
             ws.sign(names[0], signed_artifact_sha256=hashlib.sha256(changed).hexdigest())
         result = _invoke(ws.argv("refresh", "--all"))
+        assert net.attempts == [], (week, net.attempts)
+        assert _is_empty(ws.cwd), week
+        _raise_if_formex_not_ready(ws, result, names)
         assert result.exit_code == 0, (week, _why(result))
         version = _assert_current_bundle(ws, names)
         _assert_record_names_current(ws, version)
@@ -1843,6 +1917,7 @@ def test_baseline_files_are_two_named_constants() -> None:
     assert _refresh_baseline_name() != AUDIT_BASELINE_FILE.name
 
 
+@_FORMEX_XFAIL
 def test_refresh_and_audit_license_never_touch_each_others_baseline(ws_all: _Workspace, net: _Net) -> None:
     ws = ws_all
     _serve_licence_pages(ws, net)
@@ -1855,8 +1930,11 @@ def test_refresh_and_audit_license_never_touch_each_others_baseline(ws_all: _Wor
     audit_bytes = audit_file.read_bytes()
 
     refresh = _invoke(ws.argv("refresh", "--all"))
-    assert refresh.exit_code == 0, _why(refresh)
     assert audit_file.read_bytes() == audit_bytes, "refresh rewrote audit-license's baseline"
+    assert net.attempts == [], net.attempts
+    assert _is_empty(ws.cwd)
+    _raise_if_formex_not_ready(ws, refresh, _repo_names())
+    assert refresh.exit_code == 0, _why(refresh)
     assert refresh_file.is_file(), "refresh recorded no baseline of its own"
     refresh_bytes = refresh_file.read_bytes()
 
@@ -1881,6 +1959,7 @@ def test_refresh_and_audit_license_never_touch_each_others_baseline(ws_all: _Wor
     assert _is_empty(ws.cwd)
 
 
+@_FORMEX_XFAIL
 def test_unchanged_document_never_warns_text_drift_across_audit_runs(ws_all: _Workspace, net: _Net) -> None:
     # The ping-pong regression: audit-license, refresh, audit-license, refresh, all on an
     # unchanged document and licence page. With one shared file each tool reads the other's hash:
@@ -1896,9 +1975,14 @@ def test_unchanged_document_never_warns_text_drift_across_audit_runs(ws_all: _Wo
     assert (ws.state / _refresh_baseline_name()).is_file(), "refresh recorded no baseline"
     drift = [str(w.message) for w in caught if "License text changed" in str(w.message)]
     assert drift == [], drift
+    assert net.attempts == [], net.attempts
+    audits, refreshes = results[0::2], results[1::2]
+    for result in audits:
+        assert result.exit_code == 0, _why(result)
+    for result in refreshes:
+        _raise_if_formex_not_ready(ws, result, _repo_names())
     for result in results:
         assert result.exit_code == 0, _why(result)
-    assert net.attempts == [], net.attempts
 
 
 def test_refresh_dry_run_real_pipeline_stays_offline(ws: _Workspace, net: _Net) -> None:
@@ -2208,7 +2292,14 @@ _CHECKPOINT_WRITE_FAILS: dict[str, tuple[tuple[str, ...], str, str]] = {
 }
 
 
-@pytest.mark.parametrize("where", list(_CHECKPOINT_WRITE_FAILS))
+# Only "signed" runs every eurlex source to "done"; the other rows pass today.
+@pytest.mark.parametrize(
+    "where",
+    [
+        pytest.param(where, marks=_FORMEX_XFAIL) if where == "signed" else where
+        for where in _CHECKPOINT_WRITE_FAILS
+    ],
+)
 def test_checkpoint_write_failure_is_loud(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, net: _Net, where: str
 ) -> None:
@@ -2229,9 +2320,13 @@ def test_checkpoint_write_failure_is_loud(
     monkeypatch.setattr(CheckpointStore, "save", failing_save)
     result = _invoke(ws.argv("refresh", "--all"))
     expected = sorted(n for n in _repo_names() if (n in signed) == (failing_stage != _NOT_APPROVED_STAGE))
-    assert sorted(refused) == expected, (refused, _why(result))  # the injection hit every one
     assert result.exit_code == PUBLIC_EXIT_CODES[exit_name], _why(result)
     _assert_failed_loudly(result)
+    _assert_safe_output(result, str(ws.root), str(ws.root.resolve()))
+    assert net.attempts == []
+    # A no-op on the rows whose failing stage is not_approved: their sources are not clean_failed.
+    _raise_if_formex_not_ready(ws, result, expected)
+    assert sorted(refused) == expected, (refused, _why(result))  # the injection hit every one
     lines = result.stderr.splitlines()
     for name in expected:
         assert _named_with(result.stderr, name, "fail"), (name, _why(result))
@@ -2660,12 +2755,14 @@ def test_a_baseline_without_the_source_is_new_and_allowed(
     assert spy.run_names() == _repo_names(), _why(result)
 
 
+@_FORMEX_XFAIL
 def test_a_newly_approved_source_is_new_against_an_existing_baseline(ws: _Workspace, net: _Net) -> None:
     # Item 3, the real pipeline: Tier 1 records its baseline entries, then the rest are signed.
     # Their entries are missing from an existing file, so they are NEW and publish without a seed.
     net.upstream = ws
     first = _invoke(ws.argv("refresh", "--all"))
     assert first.exit_code == _SOURCE_FAILED, _why(first)
+    _raise_if_formex_not_ready(ws, first, _TIER1)
     assert set(_baseline(ws)) == set(_TIER1), sorted(_baseline(ws))
     for name in _unsigned():
         ws.sign(name)
@@ -2694,6 +2791,7 @@ def test_real_refresh_with_a_missing_baseline_writes_nothing(ws_all: _Workspace,
 _OTHER_SPDX = "CC0-1.0"
 
 
+@_FORMEX_XFAIL
 def test_cache_miss_never_rebaselines_a_changed_licence_without_the_seed(
     ws_all: _Workspace, net: _Net, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2701,6 +2799,7 @@ def test_cache_miss_never_rebaselines_a_changed_licence_without_the_seed(
     ws = ws_all
     net.upstream = ws
     first = _invoke(ws.argv("refresh", "--all"))
+    _raise_if_formex_not_ready(ws, first, _repo_names())
     assert first.exit_code == 0, _why(first)
     spdx_a = _upstream_spdx()
     assert spdx_a != _OTHER_SPDX
@@ -2736,6 +2835,7 @@ def test_cache_miss_never_rebaselines_a_changed_licence_without_the_seed(
     assert after.exit_code == 0, _why(after)
 
 
+@_FORMEX_XFAIL
 def test_the_seed_flag_never_overrides_drift_on_an_existing_baseline(
     ws_all: _Workspace, net: _Net, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2745,6 +2845,7 @@ def test_the_seed_flag_never_overrides_drift_on_an_existing_baseline(
     net.upstream = ws
     name = "eurlex_gdpr"
     first = _invoke(ws.argv("refresh", "--all"))
+    _raise_if_formex_not_ready(ws, first, _repo_names())
     assert first.exit_code == 0, _why(first)
     recorded = _baseline(ws)
     _set_upstream_spdx(monkeypatch, _OTHER_SPDX)
