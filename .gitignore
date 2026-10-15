@@ -32,3 +32,6 @@ tests/fixtures/cassettes/*/pii-scrub.log
 
 # Agent worktrees (terms-analysis#123; roots: .claude/governance/worktree-roots.txt)
 /.claude/worktrees/
+
+# Evidence logs stay local; tracked evidence blocks the terms-analysis monorepo import (#120)
+/docs/evidence/
