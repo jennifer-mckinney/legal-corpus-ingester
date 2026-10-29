@@ -25,6 +25,8 @@ from pathlib import Path
 
 import yaml
 
+# One or more approvals are EXPIRED or invalid: a real problem.
+EXIT_APPROVAL_FAILED: int = 1
 # Config problem: distinct from 1 (expired/invalid approval) so the cause is visible.
 EXIT_CONFIG: int = 2
 
@@ -493,7 +495,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if any_expired:
         print("ERROR: one or more approvals are EXPIRED or invalid.", file=sys.stderr)
-        return 1
+        return EXIT_APPROVAL_FAILED
 
     return 0
 
