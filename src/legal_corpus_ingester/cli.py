@@ -45,7 +45,7 @@ from legal_corpus_ingester.sources.registry import (
     resolve_stage_class,
 )
 from legal_corpus_ingester.sources.schema import SourceConfig
-from legal_corpus_ingester.pipeline.state import STAGE_NOT_APPROVED, CheckpointState, CheckpointStore
+from legal_corpus_ingester.pipeline.state import STAGE_NOT_APPROVED, CheckpointState, CheckpointStore, checkpoint_problem
 from legal_corpus_ingester.types import Corpus, FetchResult
 from legal_corpus_ingester.provenance.license_audit import (
     DEFAULT_STATE_FILE,
@@ -110,6 +110,8 @@ EXIT_LICENSE_BASELINE_MISSING: int = 9
 # each source declares today as the baseline, so the person seeding confirms each licence first.
 # It never overrides SPDX drift against a baseline file that exists.
 REFRESH_SEED_FLAG = "--seed-license-baseline"
+# A checkpoint file is corrupt or malformed (#102).
+_EXIT_CORRUPT_STATE: int = 4
 # Help text for each public exit code, rendered as "<code> when <meaning>" clauses by
 # _exit_code_clauses into the top-level epilog and the status help. A meaning must not contain
 # ";" (the clause separator) or square brackets (rich markup).
@@ -902,7 +904,20 @@ def status(
     any_recorded = False
     for name in registry:
         # Registry names passed SourceConfig's name_is_safe allowlist, so echoing them is safe.
-        state = store.load(name)
+        checkpoint_path = state_dir / f"{name}.checkpoint.json"
+        try:
+            state = store.load(name)
+            if state is not None:
+                raw_data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+                problem = checkpoint_problem(raw_data)
+                if problem:
+                    raise ValueError(problem)
+        except Exception:
+            typer.echo(
+                f"Error: Checkpoint file is corrupt ({checkpoint_path}); see logs for details.",
+                err=True,
+            )
+            raise typer.Exit(code=_EXIT_CORRUPT_STATE)
         if state:
             any_recorded = True
             typer.echo(f"{name}: {state.stage}")
@@ -1437,3 +1452,9 @@ def main(argv: list[str] | None = None) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def __getattr__(name: str) -> object:
+    if name == "EXIT_CORRUPT_STATE":
+        return _EXIT_CORRUPT_STATE
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
