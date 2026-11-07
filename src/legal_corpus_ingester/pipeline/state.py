@@ -16,6 +16,9 @@ STAGE_NOT_APPROVED = "not_approved"
 # (SPDX changed; terms-analysis#93 ruling Q).
 STAGE_LICENSE_FAILED = "license_failed"
 
+# Exit code for corrupt or malformed checkpoint files (#102).
+EXIT_CORRUPT_STATE: int = 4
+
 
 @dataclass
 class CheckpointState:
